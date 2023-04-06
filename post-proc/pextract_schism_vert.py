@@ -8,18 +8,18 @@ import time
 #-----------------------------------------------------------------------------
 #Input
 #-----------------------------------------------------------------------------
-run='../run/RUN12a-subset'
-#svars=['zcor','hvel_x','hvel_y','temp','salt','rho']
-svars=['zcor','temp']
+run='../run/RUN13b'
+svars=['zcor','hvel_x','hvel_y','temp','salt','rho']
+#svars=['zcor','temp']
 #txy=[[[-1200500.0, -1103900.0], [3051700.0, 3051700.0]]]      # epsg:32632 coordinate 1st transect: [xi,yi]
-txy=['Vert/TRAN/FL.bp','Vert/TRAN/GA.bp','Vert/TRAN/FL.bp']
+txy=['Vert/TRAN/NC.bp','Vert/TRAN/GA.bp','Vert/TRAN/FL.bp']
 #txy=[[[99321.235,-521.402671], [3000000, 3000000]]] # UTM 18
 
 
-sname='RUN12a_vert'
+sname='RUN13b_vert'
 
 #optional
-stacks=[15,25]    #output stacks
+stacks=[15,45]    #output stacks
 #nspool=12       #sub-sampling frequency within each stack (1 means all)
 #dx=3000          #interval of sub-section, used to divide transect
 #prj='cpp'      #projection that convert lon&lat to local project when ics=2
@@ -34,7 +34,7 @@ qname='short'    #partition name
 account='MHK_MODELING'   #stampede2: NOAA_CSDL_NWI,TG-OCE140024; levante: gg0028
 
 brun=os.path.basename(run); jname='Rd_'+brun #job name 
-ibatch=0; scrout='screen2.out'+brun; bdir=os.path.abspath(os.path.curdir)
+ibatch=1; scrout='screen2.out'+brun; bdir=os.path.abspath(os.path.curdir)
 #-----------------------------------------------------------------------------
 #on front node: 1). submit jobs first (qsub), 2) running parallel jobs (mpirun) 
 #-----------------------------------------------------------------------------
@@ -104,34 +104,24 @@ for istack in stacks:
     print('reading stack {} on rank {}: {:0.2f}'.format(istack,myrank,time.time()-t00)); sys.stdout.flush()
 #S.time=array(S.time)
 sys.exit()
-#for svar in svars:
-#    for m,npt in enumerate(nps):
-#        exec('S.{}[m]=array(S.{}[m])'.format(svar,svar))
-
-
-#for svar in svars:
-#    for m,npt in enumerate(nps):
-#        exec('S.{}=array(S.{},dtype=object,)'.format(svar,svar))
 
 #gather profiles for all ranks
 data=comm.gather(S,root=0)
-C=zdata(); C.nps=array(nps); C.xy=pxy; C.xy0=txy; C.time=[]; [exec('C.{}=[[] for i in txy]'.format(i)) for i in svars] #[exec('C.{}=ones(ns).astype("O")'.format(i)) for i in svars]; #[exec('C.{}=[]'.format(i)) for i in svars] #C.flux=[]; #tflux=[]
+C=zdata(); C.nps=array(nps); C.xy=pxy; C.xy0=txy; C.time=[]; [exec('C.{}=empty((ns,),dtype=object)'.format(i)) for i in svars];#[exec('C.{}=[[] for i in txy]'.format(i)) for i in svars] #[exec('C.{}=ones(ns).astype("O")'.format(i)) for i in svars]; #[exec('C.{}=[]'.format(i)) for i in svars] #C.flux=[]; #tflux=[]
+for svar in svars:
+    for m,npt in enumerate(nps):
+        exec('C.{}[m]=[]'.format(svar,svar))
 
 if myrank==0:
    for i in data: 
        C.time.extend(i.time); #C.flux.extend(i.flux); tflux.extend(i.tflux)
        for svar in svars: 
            for m,npt in enumerate(nps):
-               #exec('C.{}[m]=column_stack((C.{}[m],i.{}[m]))'.format(svar,svar,svar))
                exec('C.{}[m].extend(i.{}[m])'.format(svar,svar))
    it=argsort(C.time); C.time=array(C.time)[it]; #C.flux=array(C.flux)[it].T.astype('float32') 
    for svar in svars:
-       exec('C.{}=array(C.{},dtype=object)[:,it]'.format(svar,svar))
-       #for m,npt in enumerate(nps):
-       #    exec('C.{}[m]=array(C.{}[m],dtype=object,)[it]'.format(svar,svar))
-
-#   for i,rvar in enumerate(rvars): 
-#       C.__dict__['flux_'+rvar]=array(tflux)[it][...,i].T.astype('float32')
+    for m,npt in enumerate(nps):
+        exec('C.{}[m]=array(C.{}[m])[it]'.format(svar,svar))
 
    #save
    sdir=os.path.dirname(os.path.abspath(sname))

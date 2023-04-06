@@ -2,11 +2,18 @@ from pylib import *
 import pandas as pd
 
 dir_obs='/rcfs/projects/mhk_modeling/dataset/NOAA/FloridaCurrent/FC_cable_transport_2016.dat'
-StartT=datenum('2016-9-8')
-st=datenum(2016,9,24); se=datenum(2016,10,21)
-runs=['RUN06f_flux.out','CMEMS_flux.npz','HYCOM_FLUX.npz']
-ym=[0,40.0]
-colors='kgbcm'
+StartT=[datenum('2016-9-8'),datenum('2016-9-8'),datenum('1950-1-1'),datenum('2000-1-1')]
+st=datenum(2016,9,15);se=datenum(2016,10,24) #time window for plot
+sst=datenum(2016,9,15);sse=datenum(2016,10,24) #time window for stat
+dmean=1 # daily mean
+# plot control
+ym=[15,40]
+lw=[3,1,1,1];colors='kgbcm'; lstyle=['-','-','-','-','None','None','None','None']; markers=['None','None','None','None','*','^','o','None']
+
+# model result
+runs=['./flux/RUN13b_flux.out','./flux/Paper_flux_2016.npz','./flux/CMEMS_flux_2016.npz','./flux/HYCOM_flux_2016.npz']
+tags=['SCHISM','Paper','CMEMS','HYCOM']
+##########################################################################################################################################################
 
 #font size
 SMALL_SIZE = 15
@@ -27,6 +34,7 @@ obs=npz_data(); Data=loadtxt(dir_obs,skiprows=35); obs.fc=Data[:,3]
 obs.time=[]
 for n in arange(len(Data)):
     obs.time.append(datenum(str(Data[n,0].astype('int'))+'-'+str(Data[n,1].astype('int'))+'-'+str(Data[n,2].astype('int'))))
+obs.time=array(obs.time); obs.fc=array(obs.fc)
 
 #read model results
 Model=[]
@@ -34,39 +42,39 @@ for m, run in enumerate(runs):
     if run.endswith('.npz'):
        if m==len(runs)-1: Si=loadz('{}'.format(run)); Si.time=Si.time/24+StartT[m]; Si.flux=-squeeze(Si.flux)/1000000
        elif m==len(runs)-2: Si=loadz('{}'.format(run)); Si.time=Si.time/24+StartT[m]; Si.flux=-squeeze(Si.flux)/1000000
-       else: Si=loadz('{}'.format(run)); Si.time=Si.time+StartT[m]; Si.flux=-squeeze(Si.flux)/1000000
+       else: Si=loadz('{}'.format(run)); Si.time=Si.time+StartT[m]; Si.flux=-squeeze(Si.flux)/1000000; #Si.flux=lpfilt(Si.flux,1/36/24,13/24)
     elif run.endswith('.out'):
        Si=npz_data(); Data=loadtxt(run); Si.time=Data[:,0]+StartT[m]; Si.flux=Data[:,1:]/1000000
     else: print('Wrong data type')
     Model.append(Si)
 
 #daily mean
-for m, run in enumerate(runs):
-    times=array([num2date(i).strftime('%Y-%m-%d %H:%M:%S') for i in Model[m].time])
-    times=pd.to_datetime(times); data=Model[m].flux
-    df = pd.DataFrame(data=data,index=times); means=df.groupby(df.index.floor('D')).mean()
-    times=array(datenum(means.index.astype(str))); mfc=means.values
-    Model[m].time=times; Model[m].flux=mfc
-
+if dmean==1:
+    for m, run in enumerate(runs):
+        times=array([num2date(i).strftime('%Y-%m-%d %H:%M:%S') for i in Model[m].time])
+        times=pd.to_datetime(times); data=Model[m].flux
+        df = pd.DataFrame(data=data,index=times); means=df.groupby(df.index.floor('D')).mean()
+        times=array(datenum(means.index.astype(str))); mfc=means.values
+        Model[m].time=times; Model[m].flux=mfc
 
 #plot
 figure(1,figsize=[18,9])
 clf()
-plot(obs.time,obs.fc,'r',lw=3)
+plot(obs.time,obs.fc,'r',lw=lw[0])
 for n, run in enumerate(runs):
     mti=Model[n].time; myi=Model[n].flux
     fpt=(mti>=sst)*(mti<=sse); mti=mti[fpt]; myi=squeeze(myi[fpt])
-    fpt = (obs.time >= mti.min()) * (obs.time <= mti.max()); obs.time = obs.time[fpt]; obs.fc = obs.fc[fpt]
-    myii = interpolate.interp1d(mti, myi)(obs.time)
-    stv=get_stat(myii,obs.fc); MEi=mean(myii)-mean(obs.fc)
+    fpt = (obs.time >= mti.min()) * (obs.time <= mti.max()); oti = obs.time[fpt]; oyi = obs.fc[fpt]
+    myii = interpolate.interp1d(mti, myi)(oti)
+    stv=get_stat(myii,oyi); MEi=mean(myii)-mean(oyi)
     plot(Model[n].time,Model[n].flux,linestyle=lstyle[n],color=colors[n],marker=markers[n],lw=lw[n])
-    text(st, (ylim()[1]+1.) + n*0.04 * diff(ylim()),'{}--> R: {:.2f}, RMSE: {:.2f}, ME: {:.2f}'.format(tags[n], stv.R, stv.RMSD, MEi), color='k')
-
+    text(st, (ylim()[1]+1.) + n*0.04 * diff(ylim()),'{}--> R: {:.2f}, RMSE: {:.2f}, ME: {:.2f}'.format(tags[n], stv.R, stv.RMSD, MEi), color='k') 
 gca().xaxis.grid('on')
 gca().yaxis.grid('on')
-xts, xls = get_xtick(fmt=2, xts=arange(st, se+15,15), str='%m/%d')
+xts, xls = get_xtick(fmt=2, xts=arange(st, se+2,5), str='%m/%d')
 setp(gca(), xticks=xts, xticklabels=xls, xlim=[st, se],ylim=ym)
-legend(['NOAA cable',*runs])
-xlabel('Date (2020)')
+legend(['NOAA cable',*tags])
+xlabel('Date (2016)')
 ylabel('Sv')
+gcf().tight_layout()
 show()

@@ -2,20 +2,22 @@ from pylib import *
 
 
 #######################################################################################################################
-StartT=datenum(2020,1,16); EndT=datenum(2020,2,28)
+StartT=datenum(2016,9,20); EndT=datenum(2016,10,22)
 
+bp=read_shapefile_data('./08_bnd.shp')
+px,py=bp.xy.T
 lw=1.5
 fs=7
 
 # Argo info
-dir_argo='/rcfs/projects/mhk_modeling/dataset/ARGO/2020/'
+dir_argo='/rcfs/projects/mhk_modeling/dataset/ARGO/Matthew/'
 refTime_argo=datenum(1950,1,1)
 
 # SCHISM info
-run='../run/RUN04a'
+run='../run/RUN13b'
 svars=['temp','salt']
-refdate_sch=datenum('2020-1-1')
-stacks=[15,60]
+refdate_sch=datenum('2016-9-8')
+stacks=[15,45]
 stacks=arange(stacks[0],stacks[1]+1,1/24)
 mti_sch=stacks-1+refdate_sch
 
@@ -33,7 +35,7 @@ tags=['CMEMS','SCHISM']
 #tags=['HYCOM','SCHISM']
 
 #######################################################################################################################
-
+# control font size in plot
 SMALL_SIZE = 8
 MEDIUM_SIZE = 8
 BIGGER_SIZE = 8
@@ -44,9 +46,7 @@ rc('ytick', labelsize=SMALL_SIZE)  # fontsize of the tick labels
 rc('legend', fontsize=SMALL_SIZE)  # legend fontsize
 rc('axes', labelsize=MEDIUM_SIZE)  # fontsize of the x and y labels
 rc('figure', titlesize=BIGGER_SIZE)  # fontsize of the figure title
-
-bp=read_shapefile_data('./NAO_bnd.shp')
-px,py=bp.xy.T
+#######################################################################################################################
 
 fnames_mdl=array([i for i in os.listdir(dir_mdl) if i.endswith('.nc')])
 mti_mdl=array([datenum(*array(i.replace('.','_').split('_')[1:5]).astype('int')) for i in fnames_mdl])
