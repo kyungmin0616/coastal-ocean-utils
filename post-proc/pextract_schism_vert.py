@@ -8,11 +8,11 @@ import time
 #-----------------------------------------------------------------------------
 #Input
 #-----------------------------------------------------------------------------
-run='../run/RUN13b'
-svars=['zcor','hvel_x','hvel_y','temp','salt','rho']
-#svars=['zcor','temp']
+run='../run/RUN12a-subset'
+#svars=['zcor','hvel_x','hvel_y','temp','salt','rho']
+svars=['zcor','temp']
 #txy=[[[-1200500.0, -1103900.0], [3051700.0, 3051700.0]]]      # epsg:32632 coordinate 1st transect: [xi,yi]
-txy=['Vert/TRAN/NC.bp','Vert/TRAN/GA.bp','Vert/TRAN/FL.bp']
+txy=['Vert/TRAN/FL.bp']
 #txy=[[[99321.235,-521.402671], [3000000, 3000000]]] # UTM 18
 
 
@@ -26,7 +26,7 @@ stacks=[15,45]    #output stacks
 #rvars=['g1','g2','g3',] #rname the varibles
 
 #resource requst 
-walltime='04:00:00'
+walltime='02:00:00'
 qnode='frontera'; nnode=1; ppn=10  #frontera, ppn=56 (flex,normal)
 
 #additional information:  frontera,levante,stampede2
@@ -34,7 +34,7 @@ qname='short'    #partition name
 account='MHK_MODELING'   #stampede2: NOAA_CSDL_NWI,TG-OCE140024; levante: gg0028
 
 brun=os.path.basename(run); jname='Rd_'+brun #job name 
-ibatch=1; scrout='screen2.out'+brun; bdir=os.path.abspath(os.path.curdir)
+ibatch=0; scrout='screen2.out'+brun; bdir=os.path.abspath(os.path.curdir)
 #-----------------------------------------------------------------------------
 #on front node: 1). submit jobs first (qsub), 2) running parallel jobs (mpirun) 
 #-----------------------------------------------------------------------------
