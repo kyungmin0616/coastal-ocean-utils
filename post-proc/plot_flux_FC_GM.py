@@ -2,9 +2,9 @@ from pylib import *
 import pandas as pd
 
 dir_obs='/rcfs/projects/mhk_modeling/dataset/NOAA/FloridaCurrent/FC_cable_transport_2016.dat'
-StartT=datenum('2016-9-8')
-st=datenum(2016,9,24); se=datenum(2016,10,21)
-runs=['RUN06f_flux.out','CMEMS_flux.npz','HYCOM_FLUX.npz']
+StartT=[datenum('2016-9-8'),datenum(1950,1,1),datenum(2000,1,1)]
+st=datenum(2016,1,1); se=datenum(2016,10,21)
+runs=['npz/CMEMS_flux.npz','npz/HYCOM_flux_2016.npz']
 ym=[0,40.0]
 colors='kgbcm'
 

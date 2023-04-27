@@ -2,17 +2,18 @@ from pylib import *
 import pandas as pd
 
 dir_obs='/rcfs/projects/mhk_modeling/dataset/NOAA/FloridaCurrent/FC_cable_transport_2016.dat'
-StartT=[datenum('2016-9-8'),datenum('2016-9-8'),datenum('1950-1-1'),datenum('2000-1-1')]
-st=datenum(2016,9,15);se=datenum(2016,10,24) #time window for plot
+StartT=[datenum('2016-9-8'),datenum('1950-1-1'),datenum('2000-1-1')]
+st=datenum(2016,5,15);se=datenum(2016,11,1) #time window for plot
 sst=datenum(2016,9,15);sse=datenum(2016,10,24) #time window for stat
 dmean=1 # daily mean
+csta=0 # statistical analysis
 # plot control
 ym=[15,40]
 lw=[3,1,1,1];colors='kgbcm'; lstyle=['-','-','-','-','None','None','None','None']; markers=['None','None','None','None','*','^','o','None']
 
 # model result
-runs=['./flux/RUN13b_flux.out','./flux/Paper_flux_2016.npz','./flux/CMEMS_flux_2016.npz','./flux/HYCOM_flux_2016.npz']
-tags=['SCHISM','Paper','CMEMS','HYCOM']
+runs=['./flux/Paper_flux_2016.npz','./npz/CMEMS_flux_2016.npz','./npz/HYCOM_flux_2016.npz']
+tags=['Paper','CMEMS','HYCOM']
 ##########################################################################################################################################################
 
 #font size
@@ -40,8 +41,8 @@ obs.time=array(obs.time); obs.fc=array(obs.fc)
 Model=[]
 for m, run in enumerate(runs):
     if run.endswith('.npz'):
-       if m==len(runs)-1: Si=loadz('{}'.format(run)); Si.time=Si.time/24+StartT[m]; Si.flux=-squeeze(Si.flux)/1000000
-       elif m==len(runs)-2: Si=loadz('{}'.format(run)); Si.time=Si.time/24+StartT[m]; Si.flux=-squeeze(Si.flux)/1000000
+       if m==len(runs)-1: Si=loadz('{}'.format(run)); Si.time=Si.time/24+StartT[m]; Si.flux=squeeze(Si.flux)/1000000
+       elif m==len(runs)-2: Si=loadz('{}'.format(run)); Si.time=Si.time/24+StartT[m]; Si.flux=squeeze(Si.flux)/1000000
        else: Si=loadz('{}'.format(run)); Si.time=Si.time+StartT[m]; Si.flux=-squeeze(Si.flux)/1000000; #Si.flux=lpfilt(Si.flux,1/36/24,13/24)
     elif run.endswith('.out'):
        Si=npz_data(); Data=loadtxt(run); Si.time=Data[:,0]+StartT[m]; Si.flux=Data[:,1:]/1000000
@@ -62,13 +63,14 @@ figure(1,figsize=[18,9])
 clf()
 plot(obs.time,obs.fc,'r',lw=lw[0])
 for n, run in enumerate(runs):
-    mti=Model[n].time; myi=Model[n].flux
-    fpt=(mti>=sst)*(mti<=sse); mti=mti[fpt]; myi=squeeze(myi[fpt])
-    fpt = (obs.time >= mti.min()) * (obs.time <= mti.max()); oti = obs.time[fpt]; oyi = obs.fc[fpt]
-    myii = interpolate.interp1d(mti, myi)(oti)
-    stv=get_stat(myii,oyi); MEi=mean(myii)-mean(oyi)
+    if csta==1:
+        mti=Model[n].time; myi=Model[n].flux
+        fpt=(mti>=sst)*(mti<=sse); mti=mti[fpt]; myi=squeeze(myi[fpt])
+        fpt = (obs.time >= mti.min()) * (obs.time <= mti.max()); oti = obs.time[fpt]; oyi = obs.fc[fpt]
+        myii = interpolate.interp1d(mti, myi)(oti)
+        stv=get_stat(myii,oyi); MEi=mean(myii)-mean(oyi)
     plot(Model[n].time,Model[n].flux,linestyle=lstyle[n],color=colors[n],marker=markers[n],lw=lw[n])
-    text(st, (ylim()[1]+1.) + n*0.04 * diff(ylim()),'{}--> R: {:.2f}, RMSE: {:.2f}, ME: {:.2f}'.format(tags[n], stv.R, stv.RMSD, MEi), color='k') 
+    if csta==1: text(st, (ylim()[1]+1.) + n*0.04 * diff(ylim()),'{}--> R: {:.2f}, RMSE: {:.2f}, ME: {:.2f}'.format(tags[n], stv.R, stv.RMSD, MEi), color='k') 
 gca().xaxis.grid('on')
 gca().yaxis.grid('on')
 xts, xls = get_xtick(fmt=2, xts=arange(st, se+2,5), str='%m/%d')
