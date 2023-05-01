@@ -27,28 +27,25 @@ grdout='hgrid.ll.new' #grid name with depth loaded
 #headers=("etopo1","crm_3arcs","cdem13_",
 #         "cb_ll","db_ll","new_england_topobathy_dem_3m_dd","Tile3_R3_DEMv2","cb_bay_dem_v3.1_ll",
 #         "ncei19_2019v1")
-headers=("GEBCO_NAO")
+headers=("ETOPO_2022_v1_60s_N90W180_bed",)
 regions=None
 
+lc_regions=['./ETOPO_20M_50M.shp']
+lc_headers=['/people/park075/mhk_modeling/dataset/DEM/npz/ETOPO_2022_v1_15s_WNAO.npz']
+
+ocor='epsg:4326'
+fcor='epsg:26920'
 sdir=r'/people/park075/mhk_modeling/dataset/DEM/npz/'  #directory of DEM data
 reverse_sign=1  #invert depth sign
 ####################################################################
 
 #resource requst 
-walltime='02:00:00'
-#qnode='x5672'; nnode=4; ppn=4       #hurricane, ppn=8
-#qnode='bora'; nnode=2; ppn=20      #bora, ppn=20
-qnode='inferno'; nnode=2; ppn=4    #vortex, ppn=12
-#qnode='femto'; nnode=2; ppn=12     #femto,ppn=32
-#qnode='potomac'; nnode=4; ppn=8    #ches, ppn=12
-#qnode='james'; nnode=5; ppn=20     #james, ppn=20
-#qnode='frontera'; nnode=1; ppn=56  #frontera, ppn=56 (flex,normal)
-#qnode='mistral'; nnode=1; ppn=36   #mistral, ppn=36 
-#qnode='stampede2'; nnode=1; ppn=48 #stampede2, ppn=48 (skx-normal,skx-dev,normal,etc)
+walltime='01:00:00'
+qnode='deception'; nnode=1; ppn=10    #vortex, ppn=12
 
 #additional information:  frontera,mistral,stampede2
-qname='flex'                        #partition name
-account='GT-ed70-atlas'              #stampede2: NOAA_CSDL_NWI,TG-OCE140024; mistral: gg0028
+qname='short'                        #partition name
+account='MHK_MODELING'              #stampede2: NOAA_CSDL_NWI,TG-OCE140024; mistral: gg0028
 
 jname='load_dem' #job name
 ibatch=0; scrout='screen.out'; bdir=os.path.abspath(os.path.curdir)
@@ -59,7 +56,7 @@ if ibatch==0: os.environ['job_on_node']='1'; os.environ['bdir']=bdir #run locall
 if os.getenv('job_on_node')==None:
    if os.getenv('param')==None: fmt=0; bcode=sys.argv[0]
    if os.getenv('param')!=None: fmt=1; bdir,bcode=os.getenv('param').split(); os.chdir(bdir)
-   scode=get_hpc_command(bcode,bdir,jname,qnode,nnode,ppn,walltime,scrout,fmt=fmt,qname=qname,account=account)
+   scode=get_hpc_command(bcode,bdir,jname,qnode,nnode,ppn,walltime,scrout,fmt=fmt,qname=qname)
    print(scode); os.system(scode); os._exit(0)
 
 #-----------------------------------------------------------------------------
@@ -149,10 +146,6 @@ if myrank==0:
        gd.dp[sind]=dp; did[sind]=i+1
        dnamei=[k for k in fnames0 if k.startswith(fname)][0]; dname.append(dnamei) 
 
-   #reverse depth sign
-   if reverse_sign==1:
-      gd.dp=-gd.dp
-
    #applying minimum depth
    if regions is not None:
       for i, region in enumerate(regions):
@@ -162,6 +155,24 @@ if myrank==0:
           sind=inside_polygon(c_[gd.x,gd.y], bp.x,bp.y)
           fp=(sind==1)*(gd.dp<depth_min); gd.dp[fp]=depth_min
           print('finished applying min depth={}: {}'.format(depth_min,region)); sys.stdout.flush()
+
+   #applying differnt DEM source in target regions
+   if lc_regions is not None:
+      for i, lc_region in enumerate(lc_regions):
+          if not os.path.exists(lc_region): continue
+          bp=read_shapefile_data(lc_region)
+          px,py=bp.xy.T
+          sindp=inside_polygon(c_[gd.x,gd.y],px,py)
+          fpt=sindp==1
+          ndp=gd.dp[fpt].copy()
+          dpi,fpt2=load_bathymetry(gd.x[fpt],gd.y[fpt],'{}'.format(lc_headers[i]),fmt=1)
+          ndp[fpt2]=dpi
+          gd.dp[fpt]=ndp
+          print('finished applying {} in {}'.format(os.path.basename(lc_headers[i]),os.path.basename(lc_region))); sys.stdout.flush() 
+
+   #reverse depth sign
+   if reverse_sign==1:
+      gd.dp=-gd.dp
 
    #save grid
    if grdout.endswith('npz'): 
@@ -176,6 +187,6 @@ if myrank==0:
 #-----------------------------------------------------------------------------
 comm.Barrier()
 if myrank==0: dt=time.time()-t0; print('total time used: {} s'.format(dt)); sys.stdout.flush()
-proj('./hgrid.ll.new',0,'epsg:4326','./hgrid.utm',0,'epsg:26918')
+proj(grdout,0,ocor,'./hgrid.utm',0,fcor)
 sys.exit(0) if qnode in ['bora'] else os._exit(0)
 
