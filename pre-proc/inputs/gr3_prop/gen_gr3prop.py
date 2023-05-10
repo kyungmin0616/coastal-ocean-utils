@@ -1,8 +1,7 @@
 from pylib import *
 
 #####################
-grd='../../../grid/22/hgrid.gr3'
-grdu='../../../grid/22/hgrid.utm'
+grd='../../../grid/01/hgrid.gr3'
 ### *.ic
 icf=0 # 1: make *.ic, 0: don't
 
@@ -24,11 +23,10 @@ i_set_add_s=None  # 0: set; 1: add
 
 ## Property
 #fluxflag
-f_regions=['GS.reg'] 
+f_regions=None 
 
 #####################
 gd=read_schism_hgrid(grd)
-gdu=read_schism_hgrid(grdu)
 dp=gd.dp.copy()
 
 # *.gr3
@@ -64,11 +62,11 @@ if m_depths is not None:
     gd.dp=mval
     gd.write_hgrid('manning.gr3')
 
+gd.dp=dp
 # Shapiro coef
 if shapiro_max is not None:
-    gd=read_schism_hgrid(grdu)
     # compute bathymetry gradient on each node
-    _, _, slope = gdu.compute_gradient(fmt=2)
+    _, _, slope = gd.compute_gradient(fmt=2,cpp=1)
 
     # compute shapiro coefficients
     shapiro=shapiro_max*tanh(2*slope/threshold_slope)

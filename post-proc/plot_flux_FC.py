@@ -3,6 +3,7 @@ import pandas as pd
 
 dir_obs='/rcfs/projects/mhk_modeling/dataset/NOAA/FloridaCurrent/FC_cable_transport_2016.dat'
 StartT=[datenum('2016-9-8'),datenum('1950-1-1'),datenum('2000-1-1')]
+td=[1,1,24] # make days for times
 st=datenum(2016,5,15);se=datenum(2016,11,1) #time window for plot
 sst=datenum(2016,9,15);sse=datenum(2016,10,24) #time window for stat
 dmean=1 # daily mean
@@ -41,9 +42,7 @@ obs.time=array(obs.time); obs.fc=array(obs.fc)
 Model=[]
 for m, run in enumerate(runs):
     if run.endswith('.npz'):
-       if m==len(runs)-1: Si=loadz('{}'.format(run)); Si.time=Si.time/24+StartT[m]; Si.flux=squeeze(Si.flux)/1000000
-       elif m==len(runs)-2: Si=loadz('{}'.format(run)); Si.time=Si.time/24+StartT[m]; Si.flux=squeeze(Si.flux)/1000000
-       else: Si=loadz('{}'.format(run)); Si.time=Si.time+StartT[m]; Si.flux=-squeeze(Si.flux)/1000000; #Si.flux=lpfilt(Si.flux,1/36/24,13/24)
+       Si=loadz('{}'.format(run)); Si.time=(Si.time/td[m])+StartT[m]; Si.flux=-squeeze(Si.flux)/1000000; #Si.flux=lpfilt(Si.flux,1/36/24,13/24)
     elif run.endswith('.out'):
        Si=npz_data(); Data=loadtxt(run); Si.time=Data[:,0]+StartT[m]; Si.flux=Data[:,1:]/1000000
     else: print('Wrong data type')
