@@ -1,11 +1,11 @@
 from pylib import *
 
-dir_files='../HRRR'
-sfno='2'
-StartT,EndT=datenum(2016,9,8),datenum(2016,11,1)
+dir_files='../gfs'
+sfno='1'
+StartT,EndT=datenum(2021,6,1),datenum(2021,12,1)
 
 fnames=array([i for i in os.listdir(dir_files) if i.endswith('.nc')])
-mti=array([datenum(i.replace('.','_').split('_')[1]) for i in fnames])
+mti=array([datenum(i.replace('.','_').split('_')[1][0:4]+'-'+i.replace('.','_').split('_')[1][4:6]+'-'+i.replace('.','_').split('_')[1][6:8]) for i in fnames])
 fpt=(mti>=(StartT-1))*(mti<(EndT+1));fnames=fnames[fpt]; mti=mti[fpt]
 sind=argsort(mti); mti=mti[sind]; fnames=fnames[sind]
 
