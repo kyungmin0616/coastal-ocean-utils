@@ -39,12 +39,12 @@ np.savetxt('{}'.format(sname),newset,fmt='%f')
 
 #check flux.th
 
-fs=loadtxt('flux.th_2022');
-fs2=loadtxt('flux.th_2022_kp')
+#fs=loadtxt('flux.th_2022');
+#fs2=loadtxt('flux.th_2022_kp')
 
 
-for nn in arange(shape(fs)[1]-1):
-    plot(fs[:,0],fs[:,nn+1],'r')
-    plot(fs2[:,0],fs2[:,nn+1],'b')
+#for nn in arange(shape(fs)[1]-1):
+#    plot(fs[:,0],fs[:,nn+1],'r')
+#    plot(fs2[:,0],fs2[:,nn+1],'b')
 
-show()
+#show()

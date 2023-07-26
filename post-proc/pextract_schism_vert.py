@@ -8,33 +8,31 @@ import time
 #-----------------------------------------------------------------------------
 #Input
 #-----------------------------------------------------------------------------
-run='../run/RUN12a-subset'
+run='../run/RUN05f'
 #svars=['zcor','hvel_x','hvel_y','temp','salt','rho']
-svars=['zcor','temp']
-#txy=[[[-1200500.0, -1103900.0], [3051700.0, 3051700.0]]]      # epsg:32632 coordinate 1st transect: [xi,yi]
-txy=['Vert/TRAN/FL.bp']
-#txy=[[[99321.235,-521.402671], [3000000, 3000000]]] # UTM 18
+svars=['zcor','hvel']
+txy=['./transect.bp']
 
 
-sname='RUN13b_vert'
+sname='RUN05f-vert-FC'
 
 #optional
-stacks=[15,45]    #output stacks
+stacks=[30,140]    #output stacks
 #nspool=12       #sub-sampling frequency within each stack (1 means all)
 #dx=3000          #interval of sub-section, used to divide transect
 #prj='cpp'      #projection that convert lon&lat to local project when ics=2
 #rvars=['g1','g2','g3',] #rname the varibles
 
 #resource requst 
-walltime='02:00:00'
-qnode='frontera'; nnode=1; ppn=10  #frontera, ppn=56 (flex,normal)
+walltime='04:00:00'
+qnode='deception'; nnode=1; ppn=16  #frontera, ppn=56 (flex,normal)
 
 #additional information:  frontera,levante,stampede2
-qname='short'    #partition name
+qname='slurm'    #partition name
 account='MHK_MODELING'   #stampede2: NOAA_CSDL_NWI,TG-OCE140024; levante: gg0028
 
 brun=os.path.basename(run); jname='Rd_'+brun #job name 
-ibatch=0; scrout='screen2.out'+brun; bdir=os.path.abspath(os.path.curdir)
+ibatch=1; scrout='screen.out'+brun; bdir=os.path.abspath(os.path.curdir)
 #-----------------------------------------------------------------------------
 #on front node: 1). submit jobs first (qsub), 2) running parallel jobs (mpirun) 
 #-----------------------------------------------------------------------------
@@ -42,7 +40,7 @@ if ibatch==0: os.environ['job_on_node']='1'; os.environ['bdir']=bdir #run locall
 if os.getenv('job_on_node')==None:
    if os.getenv('param')==None: fmt=0; bcode=sys.argv[0]
    if os.getenv('param')!=None: fmt=1; bdir,bcode=os.getenv('param').split(); os.chdir(bdir)
-   scode=get_hpc_command(bcode,bdir,jname,qnode,nnode,ppn,walltime,scrout,fmt=fmt,qname=qname)
+   scode=get_hpc_command(bcode,bdir,jname,qnode,nnode,ppn,walltime,scrout,fmt=fmt,qname=qname,account=account)
    print(scode); os.system(scode); os._exit(0)
 
 #-----------------------------------------------------------------------------
