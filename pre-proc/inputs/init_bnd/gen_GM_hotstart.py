@@ -6,20 +6,21 @@ close("all")
 #------------------------------------------------------------------------------
 #input
 #------------------------------------------------------------------------------
-StartT=datenum(2020,1,1)
-grd='../../../grid/04/grid.npz'
-dir_data='/rcfs/projects/mhk_modeling/dataset/CMEMS/NAO/reanalysis'
+StartT=datenum(2021,6,1)
+grd='./grid.npz'
+dir_data='/rcfs/projects/mhk_modeling/dataset/HYCOM/NY'
+#dir_data='/rcfs/projects/mhk_modeling/dataset/HYCOM/global/2014'
 
 #variables to be interpolated
 #CMEMS
-svars=['thetao','so'] 
-coor=['longitude','latitude','depth']
-reftime=datenum(1950,1,1)
+#svars=['thetao','so'] 
+#coor=['longitude','latitude','depth']
+#reftime=datenum(1950,1,1)
 
 #HYCOM
-#svars=['water_temp','salinity']
-#coor=['lon','lat','depth']
-#reftime=datenum(2000,1,1)
+svars=['water_temp','salinity']
+coor=['lon','lat','depth']
+reftime=datenum(2000,1,1)
 
 mvars=['temp','salt']
 #------------------------------------------------------------------------------
@@ -44,6 +45,7 @@ ctime=array(C.variables['time'])/24+reftime; sx=array(C.variables[coor[0]][:])
 sy=array(C.variables[coor[1]][:]); sz=array(C.variables[coor[2]][:]);
 if sz[0] != 0: sz[0]=0
 if sx.max()>180:
+    print('Convert [0, 360] to [-180, 180]')
     sx=(sx+180)%360-180; lonidx=argsort(sx); sx=sx[lonidx]
 else:
     lonidx=None
