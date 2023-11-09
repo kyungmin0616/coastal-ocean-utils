@@ -6,21 +6,20 @@ close("all")
 #------------------------------------------------------------------------------
 #input
 #------------------------------------------------------------------------------
-StartT=datenum(2021,6,1)
-grd='./grid.npz'
-dir_data='/rcfs/projects/mhk_modeling/dataset/HYCOM/NY'
-#dir_data='/rcfs/projects/mhk_modeling/dataset/HYCOM/global/2014'
+StartT=datenum(2015,1,1)
+run='../../../grid/08/'
+dir_data='/rcfs/projects/mhk_modeling/dataset/CMEMS/HAWAII/'
 
 #variables to be interpolated
 #CMEMS
-#svars=['thetao','so'] 
-#coor=['longitude','latitude','depth']
-#reftime=datenum(1950,1,1)
+svars=['thetao','so'] 
+coor=['longitude','latitude','depth']
+reftime=datenum(1950,1,1)
 
 #HYCOM
-svars=['water_temp','salinity']
-coor=['lon','lat','depth']
-reftime=datenum(2000,1,1)
+#svars=['water_temp','salinity']
+#coor=['lon','lat','depth']
+#reftime=datenum(2000,1,1)
 
 mvars=['temp','salt']
 #------------------------------------------------------------------------------
@@ -32,8 +31,12 @@ fnames=array([i for i in os.listdir(dir_data) if i.endswith('.nc')])
 mti=array([datenum(*array(i.replace('.','_').split('_')[1:5]).astype('int')) for i in fnames])
 fpt=nonzero(abs(mti-StartT)==min(abs(mti-StartT)))[0][0]; fname=fnames[fpt]
 
-#read hgrid
-gd=loadz(grd).hgrid; vd=loadz(grd).vgrid; gd.x,gd.y=gd.lon,gd.lat
+#read grid
+if fexist(run+'/grid.npz'):
+   gd=loadz(run+'/grid.npz').hgrid; vd=loadz(run+'/grid.npz').vgrid
+else:
+   gd=read_schism_hgrid(run+'/hgrid.gr3'); vd=read_schism_vgrid(run+'/vgrid.in')
+
 ne,np,ns,nvrt=gd.ne,gd.np,gd.ns,vd.nvrt
 
 #get node xyz

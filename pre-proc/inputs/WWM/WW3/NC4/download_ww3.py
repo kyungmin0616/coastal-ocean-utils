@@ -8,7 +8,7 @@ import os
 wdir = './'
 schism_start_time = datetime(2019, 8, 20)
 #schism_end_time = datetime(2019, 9, 19) + timedelta(days=60)
-schism_end_time = datetime(2019, 9, 19)
+schism_end_time = datetime(2019, 8, 22)
 
 effective_end_time = schism_end_time + relativedelta(day=1)
 download_times = [dt for dt in rrule(MONTHLY, dtstart=schism_start_time, until=effective_end_time)]

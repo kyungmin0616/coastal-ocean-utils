@@ -6,31 +6,36 @@ close("all")
 #------------------------------------------------------------------------------
 #input
 #------------------------------------------------------------------------------
-StartT=datenum(2021,6,1); EndT=datenum(2021,10,5)
-grd='./grid.npz'
-dir_data='/rcfs/projects/mhk_modeling/dataset/HYCOM/NY'
+StartT=datenum(2015,1,1); EndT=datenum(2019,12,31)
+grd='../../../grid/08/'
+dir_data='/rcfs/projects/mhk_modeling/dataset/CMEMS/HAWAII/'
 
 # bnd control
-ibnds=[1]           #open boundary to be selected for *.nc
+ibnds=[1]           # select open boundary for *.th.nc, check your boundary information in hgrid.gr3
+
+# nudge info
+rlmax=0.20
+rnu_day=0.25
+
+ifix=1  #ifix=0: fix GM nan 1st, then interp;  ifix=1: interp 1st, then fixed nan
 
 #parameters to each files
-iflags=[1,1,1,1,0,0]                    #if iflag=0: skip generating file 
+iflags=[1,1,1,1,1,1]                    #if iflag=0: skip generating file 
 dts=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0]    #time steps for each file (day)
 iLP=[0,0,0,0,0,0];   fc=0.25            #iLP=1: remove tidal signal with cutoff frequency fc (day)
 snames=['elev2D.th.nc','TEM_3D.th.nc','SAL_3D.th.nc','uv3D.th.nc','TEM_nu.nc','SAL_nu.nc']
 mvars=['elev','temp','salt',['u','v'],'temp','salt']
 
 # CMEMS
-#svars=['zos','thetao','so',['uo','vo'],'thetao','so']
-#coor=['longitude','latitude','depth']
-#reftime=datenum(1950,1,1) 
+svars=['zos','thetao','so',['uo','vo'],'thetao','so']
+coor=['longitude','latitude','depth']
+reftime=datenum(1950,1,1) 
 
 # HYCOM
-svars=['surf_el','water_temp','salinity',['water_u','water_v'],'water_temp','salinity']
-coor=['lon','lat','depth']
-reftime=datenum(2000,1,1)
+#svars=['surf_el','water_temp','salinity',['water_u','water_v'],'water_temp','salinity']
+#coor=['lon','lat','depth']
+#reftime=datenum(2000,1,1)
 
-ifix=0  #ifix=0: fix GM nan 1st, then interp;  ifix=1: interp 1st, then fixed nan
 #------------------------------------------------------------------------------
 #interpolate GM data to boundary
 #------------------------------------------------------------------------------
@@ -40,8 +45,13 @@ mti=array([datenum(*array(i.replace('.','_').split('_')[1:5]).astype('int')) for
 fpt=(mti>=(StartT-1))*(mti<(EndT+1)); fnames=fnames[fpt]; mti=mti[fpt]
 sind=argsort(mti); mti=mti[sind]; fnames=fnames[sind]
 
-#read hgrid
-gd=loadz(grd).hgrid; vd=loadz(grd).vgrid; gd.x,gd.y=gd.lon,gd.lat; nvrt=vd.nvrt
+#read grid
+if fexist(grd+'/grid.npz'):
+   gd=loadz(grd+'/grid.npz').hgrid; vd=loadz(grd+'/grid.npz').vgrid
+   gd.x,gd.y=gd.lon,gd.lat
+else:
+   gd=read_schism_hgrid(grd+'/hgrid.ll'); vd=read_schism_vgrid(grd+'/vgrid.in')
+nvrt=vd.nvrt
 
 #for each variables
 for n,[sname,svar,mvar,dt,iflag] in enumerate(zip(snames,svars,mvars,dts,iflags)):
@@ -50,19 +60,16 @@ for n,[sname,svar,mvar,dt,iflag] in enumerate(zip(snames,svars,mvars,dts,iflags)
     print('Making {}'.format(sname))
     #get bnd or nugding nodes
     if sname.endswith('_nu.nc'):
-      # generate *_nudge.gr3
-       #if not os.path.isfile('TEM_nudge.gr3') or os.path.isfile('SAL_nudge.gr3'):
-           #nudge_coeff = np.zeros(len(gd.x), dtype=float)
-           #rnu_max = 1.0 / rnu_day / 86400.0
-           #for i in arange(shape(gd.nobn)[0]):
-               #dis = abs((gd.x + 1j*gd.y)[:, None] - (gd.x[gd.iobn[i]] + 1j*gd.y[gd.iobn[i]])[None, :]).min(axis=1)
-               #out = (1-dis/rlmax)*rnu_max
-               #out[out<0] = 0
-               #out[out>rnu_max] = rnu_max
-               #fp = out>0
-               #nudge_coeff[fp] = out[fp]
-           #gd.write_hgrid('./TEM_nudge.gr3',value=nudge_coeff)
-           #gd.write_hgrid('./SAL_nudge.gr3',value=nudge_coeff)
+       # generate *_nudge.gr3
+       if not os.path.isfile('TEM_nudge.gr3') or os.path.isfile('SAL_nudge.gr3'):
+           nudge_coeff = np.zeros(len(gd.x), dtype=float)
+           rnu_max = 1.0 / rnu_day / 86400.0
+           for ibnd in ibnds:
+               dis = abs((gd.x + 1j*gd.y)[:, None] - (gd.x[gd.iobn[ibnd-1]] + 1j*gd.y[gd.iobn[ibnd-1]])[None, :]).min(axis=1)
+               tmp = (1-dis/rlmax)*rnu_max; tmp[tmp<0] = 0; tmp[tmp>rnu_max] = rnu_max; fp = tmp>0
+               nudge_coeff[fp] = tmp[fp]
+           gd.write_hgrid('./TEM_nudge.gr3',value=nudge_coeff)
+           gd.write_hgrid('./SAL_nudge.gr3',value=nudge_coeff)
 
        if sname.startswith('TEM'): gdn=read_schism_hgrid('TEM_nudge.gr3')
        if sname.startswith('SAL'): gdn=read_schism_hgrid('SAL_nudge.gr3')
@@ -90,7 +97,6 @@ for n,[sname,svar,mvar,dt,iflag] in enumerate(zip(snames,svars,mvars,dts,iflags)
         ctime=array(C.variables['time'])/24+reftime 
         sx=array(C.variables[coor[0]][:]); sy=array(C.variables[coor[1]][:]); sz=array(C.variables[coor[2]][:]); nz=len(sz); 
         if sz[0] != 0: sz[0]=0
-#        if any(clon>180 for clon in sx):
         if sx.max()>180: # convert lon if lon is 0 ~ 360 deg
             print('Convert [0, 360] to [-180, 180]')
             sx=(sx+180)%360-180; lonidx=argsort(sx); sx=sx[lonidx]
