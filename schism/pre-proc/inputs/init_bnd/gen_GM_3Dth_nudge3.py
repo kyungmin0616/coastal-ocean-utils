@@ -20,6 +20,7 @@ import glob
 import argparse
 import logging
 import numpy as np
+import time
 from numpy import array, arange, argsort, meshgrid, c_, nonzero
 from scipy import interpolate
 import builtins as _bi  # ensure scalar-safe max/min
@@ -50,7 +51,7 @@ USER_CFG = {
     'start': '2021-06-01',
     'end':   '2021-10-5',
     'dt': 1.0,                 # days
-    'ibnds': [1,2,3],              # 1-based boundary IDs
+    'ibnds': [1,],              # 1-based boundary IDs
     'ifix': 1,                 # 0: fix parents first, 1: repair after gather
     'rlmax_m': 20000.0,        # nudging radius (meters)
     'rnu_day': 0.25,           # nudging timescale (days)
@@ -58,7 +59,7 @@ USER_CFG = {
     'svars':  ['zos', 'thetao', 'so', ['uo','vo'], 'thetao', 'so'],
     'snames': ['elev2D.th.nc', 'TEM_3D.th.nc', 'SAL_3D.th.nc', 'uv3D.th.nc', 'TEM_nu.nc', 'SAL_nu.nc'],
     'mvars':  ['elev',         'temp',         'salt',        ['u','v'],      'temp',     'salt'],
-    'iflags': [0, 0, 0, 1, 1, 1],
+    'iflags': [1, 1, 1, 1, 0, 0],
     'iLP': [0, 0, 0, 0, 0, 0], # optional low-pass per stream
     'fc': 0.25,                # day cutoff for lpfilt
     'coor': ['longitude', 'latitude', 'depth'],
@@ -239,6 +240,7 @@ def _get_zcor_safe(gd, vd):
 # ---------------------------------------------------------------------
 # Resolve time window & vars
 # ---------------------------------------------------------------------
+run_t0 = time.time()
 StartT = datenum(int(cfg.start[0:4]), int(cfg.start[5:7]), int(cfg.start[8:10]))
 EndT   = datenum(int(cfg.end[0:4]),   int(cfg.end[5:7]),   int(cfg.end[8:10]))
 iflags = cfg.iflags
@@ -364,6 +366,7 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
 
     if RANK == 0:
         logging.info(f'Building {sname} (MPI ranks={SIZE})')
+    logging.info(f'Rank {RANK}: start {sname} nobn={nobn} nvrt={nvrt}')
 
     local_time = []
     local_series = {mv: [] for mv in mvar}
@@ -384,10 +387,11 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
         if (RANK % phases) != phase:
             COMM.barrier()
             continue
-        for fname in my_files:
-            fp = f'{dir_data}/{fname}'
-            try:
-                C = ReadNC(fp, 1)
+    for fname in my_files:
+        logging.info(f'Rank {RANK}: file {fname} for {sname}')
+        fp = f'{dir_data}/{fname}'
+        try:
+            C = ReadNC(fp, 1)
             except Exception as e:
                 if RANK == 0:
                     logging.error(f'Rank {RANK}: failed to open {fname}: {e}')
@@ -418,10 +422,10 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
 
             # Rebuild weights / repair maps if grid changed
             if (sx0 is None) or (not np.array_equal(sx, sx0)) or (not np.array_equal(sy, sy0)) or (not np.array_equal(sz, sz0)):
-            sxi, syi = meshgrid(sx, sy)
-            sxy = c_[sxi.ravel(), syi.ravel()]
-            bxy = c_[lxi, lyi]
-            bxyz_flat = c_[np.repeat(lxi, nvrt), np.repeat(lyi, nvrt), lzi_clamped.ravel()]
+                sxi, syi = meshgrid(sx, sy)
+                sxy = c_[sxi.ravel(), syi.ravel()]
+                bxy = c_[lxi, lyi]
+                bxyz_flat = c_[np.repeat(lxi, nvrt), np.repeat(lyi, nvrt), lzi_clamped.ravel()]
 
                 sindns = sindps = None
                 if len(svar) > 1:
@@ -459,9 +463,11 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
                 raty2 = np.broadcast_to(raty[:, None], lzi_clamped.shape)
 
             # Iterate times
-            for i, cti in enumerate(ctime):
-                for svari, mvari in zip(svar, mvar):
-                    cv = array(C.variables[svari][i])
+        for i, cti in enumerate(ctime):
+            for svari, mvari in zip(svar, mvar):
+                if i == 0 or i % 10 == 0:
+                    logging.info(f'Rank {RANK}: {sname} var={mvari} time_idx={i} nobn={nobn} nvrt={nvrt}')
+                cv = array(C.variables[svari][i])
                     # Orient lon/lat
                     if lonidx is not None:
                         if mvari == 'elev':
@@ -630,3 +636,4 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
 
 if RANK == 0:
     logging.info('All done.')
+    logging.info(f'Total runtime: {time.time()-run_t0:.2f} s')

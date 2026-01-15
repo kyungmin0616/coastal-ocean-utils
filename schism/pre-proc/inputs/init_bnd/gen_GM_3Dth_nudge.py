@@ -2,6 +2,7 @@
 #create 3D boundary condition/nudging files based on GM data
 from pylib import *
 close("all")
+import time
 
 def _interp_weights(axis_nodes, targets):
     import numpy as _np
@@ -60,6 +61,7 @@ reftime=datenum(2000,1,1)
 #------------------------------------------------------------------------------
 #interpolate GM data to boundary
 #------------------------------------------------------------------------------
+t0=time.time()
 #find all GM files
 fnames=array([i for i in os.listdir(dir_data) if i.endswith('.nc')])
 mti=array([datenum(*array(i.replace('.','_').split('_')[1:5]).astype('int')) for i in fnames])
@@ -239,3 +241,5 @@ for n,[sname,svar,mvar,dt,iflag] in enumerate(zip(snames,svars,mvars,dts,iflags)
        z=zdata(); z.dimname=('time','node','nLevels','one'); z.val=vi.astype('float32'); nd.tracer_concentration=z
 
     WriteNC(sname,nd)
+
+print('Total runtime: {:.2f} s'.format(time.time()-t0))
