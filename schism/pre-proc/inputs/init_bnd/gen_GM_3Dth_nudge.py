@@ -27,9 +27,9 @@ def _interp_weights(axis_nodes, targets):
 #------------------------------------------------------------------------------
 #input
 #------------------------------------------------------------------------------
-StartT=datenum(2022,1,2); EndT=datenum(2022,4,30)
-grd='../../../grid/02/'
-dir_data='/storage/home/hcoda1/4/kpark350/data/dataset/CMEMS/EastAsia/'
+StartT=datenum(2021,6,1); EndT=datenum(2021,10,5)
+grd='./'
+dir_data='/scratch3/projects/CATUFS/KyungminPark/dataset/init_bnd/CMEMS/part1/'
 
 # bnd control
 ibnds=[1]           # select open boundary for *.th.nc, check your boundary information in hgrid.gr3

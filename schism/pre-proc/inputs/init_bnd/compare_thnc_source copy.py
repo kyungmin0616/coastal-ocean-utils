@@ -2,42 +2,14 @@
 """
 Compare SCHISM *.th.nc files against source data (CMEMS/HYCOM).
 
-Required options:
-  --src_dir   Directory with source NetCDF files.
-  --grid      Path to SCHISM hgrid.gr3.
-  --vgrid     Path to SCHISM vgrid.in.
-  --ibnds     Open boundary IDs (1-based).
-  --start     Start date of th.nc time (YYYY-MM-DD).
-
-Input selection:
-  --files     Specific th.nc files to compare.
-  --thnc_dir  Directory containing th.nc files (compare all).
-
-Evaluation modes (interpolation behavior):
-  --mode interp   Trilinear interpolation (default, same as gen_GM_3Dth_nudge).
-  --mode nearest  Nearest neighbor in each axis (lon/lat/depth) with no weighting.
-  --mode closest  Closest horizontal grid point (KDTree) + nearest depth. No interpolation.
-
-Source selection:
-  --source cmems  Use CMEMS variable names/time origin.
-  --source hycom  Use HYCOM variable names/time origin.
+Usage:
+  python compare_thnc_source.py --thnc_dir ./ --src_dir /path/to/src \
+      --grid ../../../grid/02/hgrid.gr3 --vgrid ../../../grid/02/vgrid.in \
+      --ibnds 1 2 --start 2022-01-02 --source cmems
 
 Examples:
-  # Compare all th.nc in current dir against CMEMS
-  python compare_thnc_source.py --thnc_dir ./ --src_dir /data/CMEMS/EastAsia \
-      --grid ../../../grid/02/hgrid.gr3 --vgrid ../../../grid/02/vgrid.in \
-      --ibnds 1 --start 2022-01-02 --source cmems
-
-  # Compare only specific files against HYCOM using nearest neighbors
-  python compare_thnc_source.py --files elev2D.th.nc TEM_3D.th.nc SAL_3D.th.nc \
-      --src_dir /data/HYCOM --grid ../../../grid/02/hgrid.gr3 \
-      --vgrid ../../../grid/02/vgrid.in --ibnds 1 2 --start 2022-01-02 \
-      --source hycom --mode nearest
-
-  # Closest-point comparison (no interpolation)
-  python compare_thnc_source.py --thnc_dir ./ --src_dir /data/CMEMS/EastAsia \
-      --grid ../../../grid/02/hgrid.gr3 --vgrid ../../../grid/02/vgrid.in \
-      --ibnds 1 --start 2022-01-02 --source cmems --mode closest
+  python compare_thnc_source.py --files elev2D.th.nc TEM_3D.th.nc \
+      --src_dir /data/CMEMS/EastAsia --ibnds 1 --start 2022-01-02 --source cmems
 """
 from pylib import *
 import argparse
@@ -59,17 +31,6 @@ def _interp_weights(axis_nodes, targets):
         w = np.where(targets <= axis_nodes[0], 0.0, w)
         w = np.where(targets >= axis_nodes[-1], 1.0, w)
     return idx, w
-
-def _nearest_indices(axis_nodes, targets):
-    axis_nodes = np.asarray(axis_nodes)
-    targets = np.asarray(targets)
-    idx = np.searchsorted(axis_nodes, targets, side='right') - 1
-    idx = np.clip(idx, 0, max(len(axis_nodes) - 2, 0))
-    left = axis_nodes[idx]
-    right = axis_nodes[idx + 1]
-    use_right = np.abs(right - targets) < np.abs(targets - left)
-    idx = np.where(use_right, idx + 1, idx)
-    return idx
 
 def _parse_time_units(nc_time_var, fallback_reftime):
     vals = np.array(nc_time_var[:], dtype=float)
@@ -169,8 +130,6 @@ def main():
     parser.add_argument('--start', required=True, help='start date (YYYY-MM-DD) for th.nc time')
     parser.add_argument('--source', choices=['cmems','hycom'], default='cmems', help='source dataset')
     parser.add_argument('--bad_val', type=float, default=1e3, help='bad value threshold')
-    parser.add_argument('--mode', choices=['interp', 'nearest', 'closest'], default='interp',
-                        help='interp=trilinear, nearest=nearest in each axis, closest=closest horizontal point')
     args = parser.parse_args()
 
     if args.files:
@@ -227,37 +186,15 @@ def main():
         lxi = (lxi + 180) % 360 - 180
     else:
         lonidx = None
-    idx = idy = idz = ratx = raty = ratz = None
-    idx2 = idy2 = ratx2 = raty2 = None
-    ix_nn = iy_nn = iz_nn = None
-    ix2d = iy2d = None
-
-    if args.mode == 'interp':
-        idx, ratx = _interp_weights(sx, lxi)
-        idy, raty = _interp_weights(sy, lyi)
-        idz, ratz = _interp_weights(sz, lzi.ravel())
-        idz = idz.reshape(lzi.shape)
-        ratz = ratz.reshape(lzi.shape)
-        idx2 = np.broadcast_to(idx[:, None], lzi.shape)
-        idy2 = np.broadcast_to(idy[:, None], lzi.shape)
-        ratx2 = np.broadcast_to(ratx[:, None], lzi.shape)
-        raty2 = np.broadcast_to(raty[:, None], lzi.shape)
-    elif args.mode == 'nearest':
-        ix_nn = _nearest_indices(sx, lxi)
-        iy_nn = _nearest_indices(sy, lyi)
-        iz_nn = _nearest_indices(sz, lzi.ravel()).reshape(lzi.shape)
-    else:
-        try:
-            from scipy.spatial import cKDTree
-        except Exception:
-            raise SystemExit('closest mode requires scipy.spatial.cKDTree')
-        sxi, syi = np.meshgrid(sx, sy)
-        sxy = np.c_[sxi.ravel(), syi.ravel()]
-        tree = cKDTree(sxy)
-        dist, flat_idx = tree.query(np.c_[lxi, lyi], k=1)
-        iy2d = flat_idx // len(sx)
-        ix2d = flat_idx % len(sx)
-        iz_nn = _nearest_indices(sz, lzi.ravel()).reshape(lzi.shape)
+    idx, ratx = _interp_weights(sx, lxi)
+    idy, raty = _interp_weights(sy, lyi)
+    idz, ratz = _interp_weights(sz, lzi.ravel())
+    idz = idz.reshape(lzi.shape)
+    ratz = ratz.reshape(lzi.shape)
+    idx2 = np.broadcast_to(idx[:, None], lzi.shape)
+    idy2 = np.broadcast_to(idy[:, None], lzi.shape)
+    ratx2 = np.broadcast_to(ratx[:, None], lzi.shape)
+    raty2 = np.broadcast_to(raty[:, None], lzi.shape)
     C0.close()
 
     start_parts = [int(x) for x in args.start.split('-')]
@@ -293,22 +230,38 @@ def main():
                 cv = np.array(cache_nc.variables[src_var][ti])
                 if lonidx is not None:
                     cv = cv[:, lonidx]
-                if args.mode == 'interp':
-                    v0 = np.array([cv[idy, idx], cv[idy, idx+1], cv[idy+1, idx], cv[idy+1, idx+1]])
-                    v1 = v0[0]*(1-ratx) + v0[1]*ratx
-                    v2 = v0[2]*(1-ratx) + v0[3]*ratx
-                    vi = v1*(1-raty) + v2*raty
-                elif args.mode == 'nearest':
-                    vi = cv[iy_nn, ix_nn]
-                else:
-                    vi = cv[iy2d, ix2d]
+                v0 = np.array([cv[idy, idx], cv[idy, idx+1], cv[idy+1, idx], cv[idy+1, idx+1]])
+                v1 = v0[0]*(1-ratx) + v0[1]*ratx
+                v2 = v0[2]*(1-ratx) + v0[3]*ratx
+                vi = v1*(1-raty) + v2*raty
                 diff = ts[it, :, 0, 0] - vi
                 diff_all.append(diff)
             elif vtype == '3d':
                 cv = np.array(cache_nc.variables[src_var][ti])
                 if lonidx is not None:
                     cv = cv[:, :, lonidx]
-                if args.mode == 'interp':
+                v0 = np.array([
+                    cv[idz,     idy2,     idx2    ], cv[idz,     idy2,     idx2 + 1],
+                    cv[idz,     idy2 + 1, idx2    ], cv[idz,     idy2 + 1, idx2 + 1],
+                    cv[idz + 1, idy2,     idx2    ], cv[idz + 1, idy2,     idx2 + 1],
+                    cv[idz + 1, idy2 + 1, idx2    ], cv[idz + 1, idy2 + 1, idx2 + 1],
+                ])
+                v1 = v0[0]*(1-ratx2) + v0[1]*ratx2
+                v2 = v0[2]*(1-ratx2) + v0[3]*ratx2
+                v3 = v0[4]*(1-ratx2) + v0[5]*ratx2
+                v4 = v0[6]*(1-ratx2) + v0[7]*ratx2
+                v5 = v1*(1-raty2) + v2*raty2
+                v6 = v3*(1-raty2) + v4*raty2
+                vi = v5*(1-ratz) + v6*ratz
+                diff = ts[it, :, :, 0] - vi
+                diff_all.append(diff)
+            elif vtype == '3d_uv':
+                ctu = np.array(cache_nc.variables[src_var[0]][ti])
+                ctv = np.array(cache_nc.variables[src_var[1]][ti])
+                if lonidx is not None:
+                    ctu = ctu[:, :, lonidx]
+                    ctv = ctv[:, :, lonidx]
+                def _interp3d(cv):
                     v0 = np.array([
                         cv[idz,     idy2,     idx2    ], cv[idz,     idy2,     idx2 + 1],
                         cv[idz,     idy2 + 1, idx2    ], cv[idz,     idy2 + 1, idx2 + 1],
@@ -321,37 +274,7 @@ def main():
                     v4 = v0[6]*(1-ratx2) + v0[7]*ratx2
                     v5 = v1*(1-raty2) + v2*raty2
                     v6 = v3*(1-raty2) + v4*raty2
-                    vi = v5*(1-ratz) + v6*ratz
-                elif args.mode == 'nearest':
-                    vi = cv[iz_nn, iy_nn[:, None], ix_nn[:, None]]
-                else:
-                    vi = cv[iz_nn, iy2d[:, None], ix2d[:, None]]
-                diff = ts[it, :, :, 0] - vi
-                diff_all.append(diff)
-            elif vtype == '3d_uv':
-                ctu = np.array(cache_nc.variables[src_var[0]][ti])
-                ctv = np.array(cache_nc.variables[src_var[1]][ti])
-                if lonidx is not None:
-                    ctu = ctu[:, :, lonidx]
-                    ctv = ctv[:, :, lonidx]
-                def _interp3d(cv):
-                    if args.mode == 'interp':
-                        v0 = np.array([
-                            cv[idz,     idy2,     idx2    ], cv[idz,     idy2,     idx2 + 1],
-                            cv[idz,     idy2 + 1, idx2    ], cv[idz,     idy2 + 1, idx2 + 1],
-                            cv[idz + 1, idy2,     idx2    ], cv[idz + 1, idy2,     idx2 + 1],
-                            cv[idz + 1, idy2 + 1, idx2    ], cv[idz + 1, idy2 + 1, idx2 + 1],
-                        ])
-                        v1 = v0[0]*(1-ratx2) + v0[1]*ratx2
-                        v2 = v0[2]*(1-ratx2) + v0[3]*ratx2
-                        v3 = v0[4]*(1-ratx2) + v0[5]*ratx2
-                        v4 = v0[6]*(1-ratx2) + v0[7]*ratx2
-                        v5 = v1*(1-raty2) + v2*raty2
-                        v6 = v3*(1-raty2) + v4*raty2
-                        return v5*(1-ratz) + v6*ratz
-                    if args.mode == 'nearest':
-                        return cv[iz_nn, iy_nn[:, None], ix_nn[:, None]]
-                    return cv[iz_nn, iy2d[:, None], ix2d[:, None]]
+                    return v5*(1-ratz) + v6*ratz
                 ui = _interp3d(ctu)
                 vi = _interp3d(ctv)
                 diff_u = ts[it, :, :, 0] - ui

@@ -45,10 +45,10 @@ except Exception:
 # USER CONFIG (edit here) + CLI overrides
 # ---------------------------------------------------------------------
 USER_CFG = {
-    'grd': '../../../grid/01/',
-    'dir_data': '/storage/home/hcoda1/4/kpark350/data/dataset/CMEMS/NorthPacific',
-    'start': '2022-01-02',
-    'end':   '2022-04-30',
+    'grd': './',
+    'dir_data': '/scratch3/projects/CATUFS/KyungminPark/dataset/init_bnd/CMEMS/part1/',
+    'start': '2021-06-01',
+    'end':   '2021-10-5',
     'dt': 1.0,                 # days
     'ibnds': [1,2,3],              # 1-based boundary IDs
     'ifix': 1,                 # 0: fix parents first, 1: repair after gather
@@ -330,9 +330,11 @@ if RANK == 0:
         bind = np.r_[bind, gd.iobn[ib - 1]]
     nobn = len(bind)
     lxi = gd.x[bind]; lyi = gd.y[bind]
-    # Vertical target depths
-    zcor = _get_zcor_safe(gd, vd)
-    lzi = zcor[bind]
+    # Vertical target depths (match gen_GM_3Dth_nudge.py)
+    if vd.ivcor == 2:
+        lzi = abs(compute_zcor(vd.sigma, gd.dp[bind], ivcor=2, vd=vd))
+    else:
+        lzi = abs(compute_zcor(vd.sigma[bind], gd.dp[bind]))
 
     root_payload = {
         'bind': bind, 'nobn': nobn, 'lxi': lxi, 'lyi': lyi, 'lzi': lzi, 'nvrt': nvrt,
@@ -372,6 +374,7 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
     idx = idy = idz = None
     ratx = raty = ratz = None
     sxy = bxy = None
+    bxyz_flat = None
 
     # Distribute files across ranks
     my_files = fnames[RANK::SIZE]
@@ -415,9 +418,10 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
 
             # Rebuild weights / repair maps if grid changed
             if (sx0 is None) or (not np.array_equal(sx, sx0)) or (not np.array_equal(sy, sy0)) or (not np.array_equal(sz, sz0)):
-                sxi, syi = meshgrid(sx, sy)
-                sxy = c_[sxi.ravel(), syi.ravel()]
-                bxy = c_[lxi, lyi]
+            sxi, syi = meshgrid(sx, sy)
+            sxy = c_[sxi.ravel(), syi.ravel()]
+            bxy = c_[lxi, lyi]
+            bxyz_flat = c_[np.repeat(lxi, nvrt), np.repeat(lyi, nvrt), lzi_clamped.ravel()]
 
                 sindns = sindps = None
                 if len(svar) > 1:
@@ -515,17 +519,16 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
                             cv[idz + 1, idy2 + 1, idx2    ], cv[idz + 1, idy2 + 1, idx2 + 1]
                         ])
                         if cfg.ifix == 1:
+                            # match gen_GM_3Dth_nudge.py: repair in 3D xyz space
                             for ii in range(8):
-                                parent = v0[ii]
-                                bad2d = np.abs(parent) > cfg.bad_val
-                                if np.any(bad2d):
-                                    for kk in range(parent.shape[1]):
-                                        mask = bad2d[:, kk]
-                                        if np.any(mask) and np.any(~mask):
-                                            parent[mask, kk] = interpolate.griddata(
-                                                bxy[~mask, :], parent[~mask, kk], bxy[mask, :], method='nearest'
-                                            )
-                                v0[ii] = parent
+                                parent = v0[ii].ravel()
+                                fpn = np.abs(parent) > cfg.bad_val
+                                if np.any(fpn) and np.any(~fpn):
+                                    parent[fpn] = interpolate.griddata(
+                                        bxyz_flat[~fpn, :], parent[~fpn], bxyz_flat[fpn, :],
+                                        method='nearest', rescale=True
+                                    )
+                                v0[ii] = parent.reshape(v0[ii].shape)
                         v1 = v0[0] * (1 - ratx2) + v0[1] * ratx2
                         v2 = v0[2] * (1 - ratx2) + v0[3] * ratx2
                         v3 = v0[4] * (1 - ratx2) + v0[5] * ratx2
