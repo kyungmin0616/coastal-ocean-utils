@@ -387,11 +387,11 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
         if (RANK % phases) != phase:
             COMM.barrier()
             continue
-    for fname in my_files:
-        logging.info(f'Rank {RANK}: file {fname} for {sname}')
-        fp = f'{dir_data}/{fname}'
-        try:
-            C = ReadNC(fp, 1)
+        for fname in my_files:
+            logging.info(f'Rank {RANK}: file {fname} for {sname}')
+            fp = f'{dir_data}/{fname}'
+            try:
+                C = ReadNC(fp, 1)
             except Exception as e:
                 if RANK == 0:
                     logging.error(f'Rank {RANK}: failed to open {fname}: {e}')
