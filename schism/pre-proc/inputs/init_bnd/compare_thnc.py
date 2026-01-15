@@ -76,6 +76,8 @@ def _time_days(nc):
     return None
 
 def _pick_level(ts, level_idx):
+    if ts.ndim >= 4 and ts.shape[-1] == 1:
+        ts = ts[..., 0]
     if ts.ndim < 3:
         return ts
     nlev = ts.shape[2]
@@ -106,6 +108,9 @@ def _plot_diff(nc, ref, outdir, level_idx):
     ncomp = ts.shape[-1] if ts.ndim >= 4 else 1
 
     if ncomp == 1:
+        if ts.ndim >= 4 and ts.shape[-1] == 1:
+            ts = ts[..., 0]
+            rs = rs[..., 0]
         d = _pick_level(ts - rs, level_idx)
         _plot_ts(times, bnd_idx, d, 'diff comp=0', os.path.join(outdir, 'diff_comp0.png'))
     else:

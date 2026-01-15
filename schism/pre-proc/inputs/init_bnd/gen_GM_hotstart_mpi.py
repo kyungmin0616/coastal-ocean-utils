@@ -115,10 +115,9 @@ except Exception:
 t0=time.time()
 
 # find GM file
-#fnames=array([i for i in os.listdir(dir_data) if i.endswith('.nc')])
-#mti=array([datenum(*array(i.replace('.','_').split('_')[1:5]).astype('int')) for i in fnames])
-#fpt=nonzero(abs(mti-StartT)==min(abs(mti-StartT)))[0][0]; fname=fnames[fpt]
-fname='mercatorglorys12v1_gl12_mean_202002.nc'
+fnames=array([i for i in os.listdir(dir_data) if i.endswith('.nc')])
+mti=array([datenum(*array(i.replace('.','_').split('_')[1:5]).astype('int')) for i in fnames])
+fpt=nonzero(abs(mti-StartT)==min(abs(mti-StartT)))[0][0]; fname=fnames[fpt]
 
 # read grid
 if fexist(run+'/grid.npz'):
