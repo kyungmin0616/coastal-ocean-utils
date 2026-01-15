@@ -59,7 +59,7 @@ USER_CFG = {
     'svars':  ['zos', 'thetao', 'so', ['uo','vo'], 'thetao', 'so'],
     'snames': ['elev2D.th.nc', 'TEM_3D.th.nc', 'SAL_3D.th.nc', 'uv3D.th.nc', 'TEM_nu.nc', 'SAL_nu.nc'],
     'mvars':  ['elev',         'temp',         'salt',        ['u','v'],      'temp',     'salt'],
-    'iflags': [1, 1, 1, 1, 0, 0],
+    'iflags': [1, 1, 1, 1, 1, 1],
     'iLP': [0, 0, 0, 0, 0, 0], # optional low-pass per stream
     'fc': 0.25,                # day cutoff for lpfilt
     'coor': ['longitude', 'latitude', 'depth'],
