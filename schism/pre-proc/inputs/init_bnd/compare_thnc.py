@@ -118,6 +118,35 @@ def _plot_diff(nc, ref, outdir, level_idx):
             d = _pick_level(ts[..., c] - rs[..., c], level_idx)
             _plot_ts(times, bnd_idx, d, f'diff comp={c}', os.path.join(outdir, f'diff_comp{c}.png'))
 
+def _plot_diff_all_levels(nc, ref, outdir):
+    if not hasattr(nc, 'time_series') or not hasattr(ref, 'time_series'):
+        return
+    ts = nc.time_series.val
+    rs = ref.time_series.val
+    times = _time_days(nc)
+    if times is None:
+        return
+    bnd_idx = arange(ts.shape[1])
+    if ts.ndim >= 4 and ts.shape[-1] == 1:
+        ts = ts[..., 0]
+        rs = rs[..., 0]
+    if ts.ndim < 3:
+        d = ts - rs
+        _plot_ts(times, bnd_idx, d, 'diff comp=0', os.path.join(outdir, 'diff_comp0.png'))
+        return
+    nlev = ts.shape[2]
+    ncomp = ts.shape[-1] if ts.ndim >= 4 else 1
+    if ncomp == 1:
+        for k in range(nlev):
+            d = ts[:, :, k] - rs[:, :, k]
+            _plot_ts(times, bnd_idx, d, f'diff level={k}', os.path.join(outdir, f'diff_level{k}.png'))
+    else:
+        for c in range(ncomp):
+            for k in range(nlev):
+                d = ts[:, :, k, c] - rs[:, :, k, c]
+                _plot_ts(times, bnd_idx, d, f'diff comp={c} level={k}',
+                         os.path.join(outdir, f'diff_comp{c}_level{k}.png'))
+
 def _per_bnd_stats(nc, ref, bad_val, limit):
     if not hasattr(nc, 'time_series') or not hasattr(ref, 'time_series'):
         print("per_bnd: time_series not present")
@@ -140,6 +169,7 @@ def main():
     parser.add_argument('files', nargs='*', help='*.th.nc files (first is reference)')
     parser.add_argument('--bad_val', type=float, default=1e3, help='bad value threshold')
     parser.add_argument('--plot', action='store_true', help='save diff plots')
+    parser.add_argument('--plot_all_levels', action='store_true', help='plot all vertical levels for 3D files')
     parser.add_argument('--outdir', default='thnc_compare', help='output directory for plots')
     parser.add_argument('--level', type=int, default=-1, help='level index for plots (default: surface)')
     parser.add_argument('--per_bnd', action='store_true', help='print per-boundary diff stats')
@@ -172,7 +202,10 @@ def main():
             if args.plot:
                 outdir = os.path.join(args.outdir, fname.replace('.th.nc', ''))
                 os.makedirs(outdir, exist_ok=True)
-                _plot_diff(cur, ref, outdir, args.level)
+                if args.plot_all_levels:
+                    _plot_diff_all_levels(cur, ref, outdir)
+                else:
+                    _plot_diff(cur, ref, outdir, args.level)
             print('-' * 60)
         return
 
@@ -194,7 +227,10 @@ def main():
             _per_bnd_stats(cur, ref, args.bad_val, args.per_bnd_limit)
         if args.plot:
             os.makedirs(args.outdir, exist_ok=True)
-            _plot_diff(cur, ref, args.outdir, args.level)
+            if args.plot_all_levels:
+                _plot_diff_all_levels(cur, ref, args.outdir)
+            else:
+                _plot_diff(cur, ref, args.outdir, args.level)
         print('-' * 60)
 
 if __name__ == '__main__':
