@@ -463,11 +463,11 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
                 raty2 = np.broadcast_to(raty[:, None], lzi_clamped.shape)
 
             # Iterate times
-        for i, cti in enumerate(ctime):
-            for svari, mvari in zip(svar, mvar):
-                if i == 0 or i % 10 == 0:
-                    logging.info(f'Rank {RANK}: {sname} var={mvari} time_idx={i} nobn={nobn} nvrt={nvrt}')
-                cv = array(C.variables[svari][i])
+            for i, cti in enumerate(ctime):
+                for svari, mvari in zip(svar, mvar):
+                    if i == 0 or i % 10 == 0:
+                        logging.info(f'Rank {RANK}: {sname} var={mvari} time_idx={i} nobn={nobn} nvrt={nvrt}')
+                    cv = array(C.variables[svari][i])
                     # Orient lon/lat
                     if lonidx is not None:
                         if mvari == 'elev':
