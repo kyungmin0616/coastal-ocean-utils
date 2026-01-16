@@ -39,8 +39,13 @@ reftime=datenum(1950,1,1)
 #------------------------------------------------------------------------------
 #interpolate GM data to boundary
 #------------------------------------------------------------------------------
-#find all GM files
-fnames=array([i for i in os.listdir(dir_data) if i.endswith('.nc')])
+#find all GM files (support nested year folders)
+fnames=[]
+for root, _, files in os.walk(dir_data):
+    for f in files:
+        if f.endswith('.nc'):
+            fnames.append(os.path.join(root, f))
+fnames=array(fnames)
 mti=array([datenum(*array(i.replace('.','_').split('_')[1:5]).astype('int')) for i in fnames])
 fpt=(mti>=(StartT-1))*(mti<(EndT+1)); fnames=fnames[fpt]; mti=mti[fpt]
 sind=argsort(mti); mti=mti[sind]; fnames=fnames[sind]
@@ -93,7 +98,7 @@ for n,[sname,svar,mvar,dt,iflag] in enumerate(zip(snames,svars,mvars,dts,iflags)
     for i in ['time',*mvar]: sdict[i]=[]
     sx0,sy0,sz0=None,None,None #used for check whether GM files have the same dimensions
     for m,fname in enumerate(fnames):
-        C=ReadNC('{}/{}'.format(dir_data,fname),1); print(fname)
+        C=ReadNC(fname,1); print(fname)
         ctime=array(C.variables['time'])/24+reftime 
         sx=array(C.variables[coor[0]][:]); sy=array(C.variables[coor[1]][:]); sz=array(C.variables[coor[2]][:]); nz=len(sz); 
         if sz[0] != 0: sz[0]=0
