@@ -265,7 +265,7 @@ else:
         logging.warning('dates.out/files.out not found; scanning *.nc to infer chronology (slower).')
         fnames = []
         ftimes = []
-        for f in sorted(glob.glob(os.path.join(dir_data, '*.nc'))):
+        for f in sorted(glob.glob(os.path.join(dir_data, '**', '*.nc'), recursive=True)):
             try:
                 C = ReadNC(f, 1)
                 ctime, _ = _parse_time_units(C.variables['time'])
@@ -389,7 +389,7 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
             continue
         for fname in my_files:
             logging.info(f'Rank {RANK}: file {fname} for {sname}')
-            fp = f'{dir_data}/{fname}'
+            fp = fname
             try:
                 C = ReadNC(fp, 1)
             except Exception as e:
