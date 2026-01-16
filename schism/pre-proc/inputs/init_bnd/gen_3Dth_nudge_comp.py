@@ -259,18 +259,21 @@ dir_data = cfg.dir_data
 if os.path.isfile(f'{dir_data}/dates.out'):
     mti = array(loadtxt(f'{dir_data}/dates.out'))
     fid = open(f'{dir_data}/files.out').read().split()
-    fnames = np.array(fid, dtype=object)
+    fnames = []
+    for f in fid:
+        fnames.append(f if os.path.isabs(f) else os.path.join(dir_data, f))
+    fnames = np.array(fnames, dtype=object)
 else:
     if RANK == 0:
         logging.warning('dates.out/files.out not found; scanning *.nc to infer chronology (slower).')
         fnames = []
         ftimes = []
-        for f in sorted(glob.glob(os.path.join(dir_data, '*.nc'))):
+        for f in sorted(glob.glob(os.path.join(dir_data, '**', '*.nc'), recursive=True)):
             try:
                 C = ReadNC(f, 1)
                 ctime, _ = _parse_time_units(C.variables['time'])
                 ftimes.append(ctime)
-                fnames.append(os.path.basename(f))
+                fnames.append(f)
                 C.close()
             except Exception as e:
                 logging.error(f'Skip {f}: {e}')
