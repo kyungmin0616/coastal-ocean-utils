@@ -26,7 +26,16 @@ from scipy import interpolate
 import builtins as _bi  # ensure scalar-safe max/min
 
 # --------------------------- MPI setup ---------------------------
+def _mpi_env_size():
+    for key in ("OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "SLURM_NTASKS", "MV2_COMM_WORLD_SIZE"):
+        val = os.environ.get(key)
+        if val and val.isdigit():
+            return int(val)
+    return 1
+
 try:
+    if _mpi_env_size() <= 1:
+        raise RuntimeError("MPI disabled for serial run")
     from mpi4py import MPI
     COMM = MPI.COMM_WORLD
     RANK = COMM.Get_rank()
