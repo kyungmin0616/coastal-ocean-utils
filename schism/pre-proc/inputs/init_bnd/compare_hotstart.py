@@ -299,8 +299,8 @@ def main():
                 v6 = v3*(1-raty2) + v4*raty2
                 return v5*(1-ratz) + v6*ratz
             if args.mode == 'nearest':
-                return cv[iz_nn, iy_nn[:, None], ix_nn[:, None]]
-            return cv[iz_nn, iy2d[:, None], ix2d[:, None]]
+                return cv[iz_nn, iy_nn[None, :], ix_nn[None, :]]
+            return cv[iz_nn, iy2d[None, :], ix2d[None, :]]
 
         if vssh is not None:
             if args.mode == 'interp':
