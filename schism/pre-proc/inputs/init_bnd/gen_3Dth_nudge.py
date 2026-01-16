@@ -392,7 +392,7 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
             continue
         for fname in my_files:
             logging.info(f'Rank {RANK}: file {os.path.basename(fname)} for {sname}')
-            fp = fname
+            fp = fname if os.path.isabs(fname) else os.path.join(dir_data, fname)
             try:
                 C = ReadNC(fp, 1)
             except Exception as e:
