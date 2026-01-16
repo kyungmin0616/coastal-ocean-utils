@@ -388,7 +388,7 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
             COMM.barrier()
             continue
         for fname in my_files:
-            logging.info(f'Rank {RANK}: file {fname} for {sname}')
+            logging.info(f'Rank {RANK}: file {os.path.basename(fname)} for {sname}')
             fp = fname
             try:
                 C = ReadNC(fp, 1)
