@@ -26,15 +26,27 @@ from scipy import interpolate
 import builtins as _bi  # ensure scalar-safe max/min
 
 # --------------------------- MPI setup ---------------------------
-def _mpi_env_size():
-    for key in ("OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "SLURM_NTASKS", "MV2_COMM_WORLD_SIZE"):
-        val = os.environ.get(key)
+def _mpi_context_active():
+    if os.environ.get("FORCE_SERIAL", "0") == "1":
+        return False
+    if os.environ.get("USE_MPI", "0") == "1":
+        return True
+    # Only trust MPI launcher vars (not generic SLURM vars)
+    size_keys = ("OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MV2_COMM_WORLD_SIZE")
+    rank_keys = ("OMPI_COMM_WORLD_RANK", "PMI_RANK", "MV2_COMM_WORLD_RANK")
+    ctx_keys = ("OMPI_MCA_orte_hnp_uri", "PMI_FD", "PMI_PORT")
+    size_val = 1
+    for k in size_keys:
+        val = os.environ.get(k)
         if val and val.isdigit():
-            return int(val)
-    return 1
+            size_val = int(val)
+            break
+    has_rank = any(os.environ.get(k) not in (None, "") for k in rank_keys)
+    has_ctx = any(os.environ.get(k) not in (None, "") for k in ctx_keys)
+    return size_val > 1 and has_rank and has_ctx
 
 try:
-    if _mpi_env_size() <= 1:
+    if not _mpi_context_active():
         raise RuntimeError("MPI disabled for serial run")
     from mpi4py import MPI
     COMM = MPI.COMM_WORLD
