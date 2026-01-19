@@ -5,12 +5,13 @@ Generate SCHISM VQS vgrid.in from hgrid.gr3.
 Usage examples:
   python gen_vqs_ufs.py --hgrid hgrid.gr3
   python gen_vqs_ufs.py --hgrid hgrid.gr3 --transect
+  python gen_vqs_ufs.py --hgrid hgrid.gr3 --transect transect_a.bp --transect transect_b.bp
   python gen_vqs_ufs.py --hgrid hgrid.gr3 --transect --plot-transect
   python gen_vqs_ufs.py --hgrid hgrid.gr3 --compare /path/to/fortran/outputs
 
 Options:
   --hgrid      Path to hgrid.gr3 (default: hgrid.gr3)
-  --transect   Enable transect output; uses transect.bp unless a path is given
+  --transect   Enable transect output; repeatable or comma-separated list
   --compare    Directory holding Fortran outputs for numeric diff
   --plot-transect  Plot vgrids on transect using generated outputs
   --plot-prefix    Output prefix for plots (default: vgrid_transect)
@@ -246,7 +247,7 @@ def write_debug_outputs(debug_lines):
         f.writelines(debug_lines)
 
 
-def write_transect(transect_path, gd, kbp, dp, znd):
+def write_transect(transect_path, gd, kbp, dp, znd, out_path):
     bp = read_schism_bpfile(transect_path)
 
     dist = np.zeros(bp.nsta, dtype=float)
@@ -257,7 +258,7 @@ def write_transect(transect_path, gd, kbp, dp, znd):
 
     sindp = near_pts(np.c_[bp.x, bp.y], np.c_[gd.x, gd.y])
 
-    with open("transect1.out", "w", encoding="utf-8") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         for i, nd in enumerate(sindp):
             parts = [
                 f"{i + 1:6d}",
@@ -393,26 +394,27 @@ def plot_transect_vgrid(
     out_prefix="vgrid_transect",
 ):
     import matplotlib.pyplot as plt
+    try:
+        import cartopy.crs as ccrs
+    except Exception:
+        ccrs = None
 
-    if not os.path.exists(master_path) or not os.path.exists(transect_path):
-        raise FileNotFoundError("Missing vgrid_master.out or transect1.out")
+    if not os.path.exists(transect_path):
+        raise FileNotFoundError("Missing transect output")
 
-    z_m = np.loadtxt(master_path)
-    if z_m.ndim == 1:
-        z_m = z_m[None, :]
-    nvrt_m = z_m.shape[1] - 3
-    zcor_m = z_m[:, 3:].copy()
-    for i in range(z_m.shape[0]):
-        kbp_m = int(round(z_m[i, 1]))
-        if kbp_m < nvrt_m:
-            zcor_m[i, kbp_m:] = np.nan
+    nvrt_m = None
+    if os.path.exists(master_path):
+        z_m = np.loadtxt(master_path)
+        if z_m.ndim == 1:
+            z_m = z_m[None, :]
+        nvrt_m = z_m.shape[1] - 3
 
     z1 = np.loadtxt(transect_path)
     if z1.ndim == 1:
         z1 = z1[None, :]
     header_count = None
     for hc in (6, 7):
-        if z1.shape[1] - hc == nvrt_m:
+        if nvrt_m is not None and z1.shape[1] - hc == nvrt_m:
             header_count = hc
             break
     if header_count is None:
@@ -421,36 +423,79 @@ def plot_transect_vgrid(
     dist = z1[:, 4]
     depth = z1[:, 5]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 9))
-    ax1.plot(z_m[:, 0], zcor_m, "k-", linewidth=0.5)
-    ax1.plot(z_m[:, 0], -z_m[:, 2], "r.", markersize=6)
-    for i in range(z_m.shape[0]):
-        ax1.plot(z_m[i, 0] * np.ones(nvrt_m), zcor_m[i, :], "k", linewidth=0.5)
-    ax1.set_title("Master grid")
-    ax1.set_xlabel("Grid #")
-    ax1.set_ylabel("Depth (m)")
-
-    for i in range(z1.shape[0]):
-        ax2.plot(dist[i] * np.ones(zcor1.shape[1]), zcor1[i, :], "k", linewidth=0.5)
-    ax2.plot(dist, zcor1, "k-", linewidth=0.5)
-    ax2.plot(dist, -depth, "r.", markersize=6)
-    ax2.set_title("Transect")
-    ax2.set_xlabel("Along transect distance (m)")
-    ax2.set_ylabel("Depth (m)")
-    fig.tight_layout()
-    fig.savefig(f"{out_prefix}.png", dpi=200)
-    plt.close(fig)
-
+    gd = None
+    bp = None
+    is_lonlat = False
+    xvals = None
+    yvals = None
     if os.path.exists(hgrid_path) and os.path.exists(bp_path):
         gd = read_schism_hgrid(hgrid_path)
         bp = read_schism_bpfile(bp_path)
-        fig2, ax = plt.subplots(figsize=(7, 6))
-        gd.plot_bnd(ax=ax)
-        ax.plot(bp.x, bp.y, "r.")
-        ax.set_title("Transect map")
-        fig2.tight_layout()
-        fig2.savefig(f"{out_prefix}_map.png", dpi=200)
-        plt.close(fig2)
+        xvals = np.asarray(bp.x if bp.nsta > 0 else gd.x)
+        yvals = np.asarray(bp.y if bp.nsta > 0 else gd.y)
+        is_lonlat = (
+            np.nanmin(xvals) >= -360.0
+            and np.nanmax(xvals) <= 360.0
+            and np.nanmin(yvals) >= -90.0
+            and np.nanmax(yvals) <= 90.0
+        )
+
+    fig = plt.figure(figsize=(10, 9))
+    gs = fig.add_gridspec(2, 1)
+    use_cartopy = ccrs is not None and is_lonlat
+    if ccrs is None and is_lonlat:
+        print("cartopy is not available; using a simple lon/lat aspect correction.", file=sys.stderr)
+    if use_cartopy:
+        ax_map = fig.add_subplot(gs[0, 0], projection=ccrs.PlateCarree())
+        map_crs = ccrs.PlateCarree()
+    else:
+        ax_map = fig.add_subplot(gs[0, 0])
+        map_crs = None
+    ax_tran = fig.add_subplot(gs[1, 0])
+
+    if gd is not None and bp is not None:
+        if use_cartopy:
+            xy1, xy2 = gd.lines(1, xy=0)
+            ax_map.plot(xy1[:, 0], xy1[:, 1], "k", lw=0.5, transform=map_crs)
+            ax_map.plot(xy2[:, 0], xy2[:, 1], "k", lw=0.5, transform=map_crs)
+            ax_map.plot(bp.x, bp.y, "r.", transform=map_crs)
+            xmin, xmax = float(np.nanmin(gd.x)), float(np.nanmax(gd.x))
+            ymin, ymax = float(np.nanmin(gd.y)), float(np.nanmax(gd.y))
+            padx = (xmax - xmin) * 0.05 if xmax > xmin else 1.0
+            pady = (ymax - ymin) * 0.05 if ymax > ymin else 1.0
+            ax_map.set_extent([xmin - padx, xmax + padx, ymin - pady, ymax + pady], crs=map_crs)
+        else:
+            gd.plot_bnd(ax=ax_map)
+            ax_map.plot(bp.x, bp.y, "r.")
+            if is_lonlat:
+                lat0 = float(np.nanmean(yvals))
+                lat0 = np.clip(lat0, -89.0, 89.0)
+                aspect = 1.0 / np.cos(np.deg2rad(lat0))
+                ax_map.set_aspect(aspect, adjustable="datalim")
+            else:
+                ax_map.set_aspect("equal", adjustable="datalim")
+            xmin, xmax = float(np.nanmin(gd.x)), float(np.nanmax(gd.x))
+            ymin, ymax = float(np.nanmin(gd.y)), float(np.nanmax(gd.y))
+            padx = (xmax - xmin) * 0.05 if xmax > xmin else 1.0
+            pady = (ymax - ymin) * 0.05 if ymax > ymin else 1.0
+            ax_map.set_xlim(xmin - padx, xmax + padx)
+            ax_map.set_ylim(ymin - pady, ymax + pady)
+        ax_map.set_title("Transect map")
+    else:
+        ax_map.text(0.5, 0.5, "Missing hgrid or transect bp file", ha="center", va="center")
+        ax_map.set_axis_off()
+
+    for i in range(z1.shape[0]):
+        ax_tran.plot(dist[i] * np.ones(zcor1.shape[1]), zcor1[i, :], "k", linewidth=0.5)
+    ax_tran.plot(dist, zcor1, "k-", linewidth=0.5)
+    ax_tran.plot(dist, -depth, "r.", markersize=6)
+    ax_tran.set_title("Transect")
+    ax_tran.set_xlabel("Along transect distance (m)")
+    ax_tran.set_ylabel("Depth (m)")
+
+    fig.tight_layout()
+    fig.savefig(f"{out_prefix}.png", dpi=200)
+    plt.close(fig)
 
 
 def main():
@@ -460,10 +505,11 @@ def main():
     parser.add_argument("--hgrid", default="hgrid.gr3", help="Path to hgrid.gr3")
     parser.add_argument(
         "--transect",
+        action="append",
         nargs="?",
         const="transect.bp",
         default=None,
-        help="Optional transect bp file (default: transect.bp)",
+        help="Transect bp file; repeat for multiple transects or use comma-separated list.",
     )
     parser.add_argument(
         "--compare",
@@ -493,11 +539,24 @@ def main():
     vgrid_data = compute_vgrid(gd, params)
     write_debug_outputs(vgrid_data["debug_lines"])
 
+    transects = []
     if args.transect:
-        if not os.path.exists(args.transect):
-            print(f"Missing transect file: {args.transect}", file=sys.stderr)
-            return 1
-        write_transect(args.transect, gd, vgrid_data["kbp"], vgrid_data["dp"], vgrid_data["znd"])
+        for entry in args.transect:
+            for part in str(entry).split(","):
+                part = part.strip()
+                if part:
+                    transects.append(part)
+
+    transect_outputs = []
+    if transects:
+        for idx, bp_path in enumerate(transects, start=1):
+            if not os.path.exists(bp_path):
+                print(f"Missing transect file: {bp_path}", file=sys.stderr)
+                return 1
+            out_path = f"transect{idx}.out"
+            write_transect(bp_path, gd, vgrid_data["kbp"], vgrid_data["dp"], vgrid_data["znd"], out_path)
+            transect_outputs.append((bp_path, out_path))
+            print(f"Transect output: {out_path} <- {bp_path}")
 
     nprism = 0
     for i in range(gd.ne):
@@ -516,11 +575,16 @@ def main():
     if args.compare:
         compare_outputs(args.compare, os.getcwd())
     if args.plot_transect:
-        plot_transect_vgrid(
-            hgrid_path=args.hgrid,
-            bp_path=args.transect or "transect.bp",
-            out_prefix=args.plot_prefix,
-        )
+        if not transect_outputs:
+            print("No transect outputs available for plotting.", file=sys.stderr)
+            return 1
+        for idx, (bp_path, out_path) in enumerate(transect_outputs, start=1):
+            plot_transect_vgrid(
+                hgrid_path=args.hgrid,
+                bp_path=bp_path,
+                transect_path=out_path,
+                out_prefix=f"{args.plot_prefix}_{idx}",
+            )
     return 0
 
 
