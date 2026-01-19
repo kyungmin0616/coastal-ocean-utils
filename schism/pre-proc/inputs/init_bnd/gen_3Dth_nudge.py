@@ -26,7 +26,28 @@ from scipy import interpolate
 import builtins as _bi  # ensure scalar-safe max/min
 
 # --------------------------- MPI setup ---------------------------
+def _mpi_context_active():
+    if os.environ.get("FORCE_SERIAL", "0") == "1":
+        return False
+    if os.environ.get("USE_MPI", "0") == "1":
+        return True
+    # Only trust MPI launcher vars (not generic SLURM vars)
+    size_keys = ("OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MV2_COMM_WORLD_SIZE")
+    rank_keys = ("OMPI_COMM_WORLD_RANK", "PMI_RANK", "MV2_COMM_WORLD_RANK")
+    ctx_keys = ("OMPI_MCA_orte_hnp_uri", "PMI_FD", "PMI_PORT")
+    size_val = 1
+    for k in size_keys:
+        val = os.environ.get(k)
+        if val and val.isdigit():
+            size_val = int(val)
+            break
+    has_rank = any(os.environ.get(k) not in (None, "") for k in rank_keys)
+    has_ctx = any(os.environ.get(k) not in (None, "") for k in ctx_keys)
+    return size_val > 1 and has_rank and has_ctx
+
 try:
+    if not _mpi_context_active():
+        raise RuntimeError("MPI disabled for serial run")
     from mpi4py import MPI
     COMM = MPI.COMM_WORLD
     RANK = COMM.Get_rank()
@@ -46,10 +67,10 @@ except Exception:
 # USER CONFIG (edit here) + CLI overrides
 # ---------------------------------------------------------------------
 USER_CFG = {
-    'grd': './',
-    'dir_data': '/scratch3/projects/CATUFS/KyungminPark/dataset/init_bnd/CMEMS/part1/',
-    'start': '2021-06-01',
-    'end':   '2021-10-5',
+    'grd': '/S/data00/G6008/d1041/Projects/SendaiOnagawa/pre-proc/grid/01/',
+    'dir_data': '/S/data00/G6008/d1041/dataset/CMEMS/daily/EastAsia/',
+    'start': '2022-01-02',
+    'end':   '2022-04-30',
     'dt': 1.0,                 # days
     'ibnds': [1,],              # 1-based boundary IDs
     'ifix': 1,                 # 0: fix parents first, 1: repair after gather

@@ -1,7 +1,7 @@
 from pylib import *
 import matplotlib.pyplot as plt
 
-gd=read_schism_hgrid('./hgrid.gr3')
+gd=read_schism_hgrid('/S/data00/G6008/d1041/Projects/SendaiOnagawa/pre-proc/grid/01/hgrid.gr3')
 hot='./hotstart.nc'
 
 

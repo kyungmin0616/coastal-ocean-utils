@@ -1,7 +1,7 @@
 from pylib import *
 
 # regions to be selected
-gd=read('./hgrid.gr3')
+gd=read('/S/data00/G6008/d1041/Projects/SendaiOnagawa/pre-proc/grid/01/hgrid.gr3')
 bp=read('reg3.reg')
 sindp=inside_polygon(c_[gd.x,gd.y],bp.x,bp.y)==1
 

@@ -12,9 +12,9 @@ import time
 # -----------------------------------------------------------------------------
 # input
 # -----------------------------------------------------------------------------
-StartT=datenum(2021,6,1)
-run='./'
-dir_data='./CMEMS'
+StartT=datenum(2022,1,2)
+run='/S/data00/G6008/d1041/Projects/SendaiOnagawa/pre-proc/grid/01/'
+dir_data='/S/data00/G6008/d1041/dataset/CMEMS/daily/EastAsia/'
 bad_val=1e3
 qc=True
 # bad_val: threshold for invalid values; qc: print basic min/max and bad fraction.
