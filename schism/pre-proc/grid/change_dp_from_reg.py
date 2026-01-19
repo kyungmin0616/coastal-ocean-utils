@@ -32,7 +32,7 @@ regions = [
     'min_h_north_bound6.reg',
 ]
 vals = [0.5, 5, 5, 5, 5, 5, 20, 55, 5, 5, 38, 62, 50, 58, 58]
-# mode: 0 => set dp to rvalue when dp<=0; nonzero => enforce min depth (dp<rvalue)
+# mode: 0 => set dp to rvalue when dp<=0; 1 => enforce min depth (dp<rvalue); 2 => set dp=rvalue
 modes = [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1]
 
 # blending across boundaries
@@ -94,6 +94,8 @@ def _assign_regions(gd, regions, vals, modes):
         if int(mode) == 0:
             fpt = dp <= 0
             dp[fpt] = rvalue
+        elif int(mode) == 2:
+            dp[:] = rvalue
         else:
             fpt = dp < rvalue
             dp[fpt] = rvalue
