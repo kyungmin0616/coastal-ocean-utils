@@ -84,12 +84,45 @@ def _load_station(folder: str, start: str | None, end: str | None):
     return station_code, times, values
 
 
-def _build_bp(station_ids, station_names):
+def _read_bp(bp_path: str):
+    if not os.path.isfile(bp_path):
+        return {}
+    with open(bp_path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+    if len(lines) < 3:
+        return {}
+    try:
+        nsta = int(lines[1].split()[0])
+    except Exception:
+        return {}
+    meta = {}
+    for ln in lines[2:2 + nsta]:
+        parts = ln.split("!")
+        left = parts[0].split()
+        if len(left) < 4:
+            continue
+        try:
+            sid = int(left[0])
+            lon = float(left[1])
+            lat = float(left[2])
+        except Exception:
+            continue
+        name = parts[1].strip() if len(parts) > 1 else str(sid)
+        meta[str(sid)] = {"lon": lon, "lat": lat, "name": name}
+    return meta
+
+def _build_bp(station_ids, station_names, bp_meta):
     bp = zdata()
     bp.station_id = np.array(station_ids, dtype=int)
     bp.station_name = np.array(station_names, dtype="U64")
-    bp.lon = np.full(len(station_ids), np.nan, dtype=float)
-    bp.lat = np.full(len(station_ids), np.nan, dtype=float)
+    lons = []
+    lats = []
+    for sid in station_ids:
+        meta = bp_meta.get(str(sid), {})
+        lons.append(meta.get("lon", np.nan))
+        lats.append(meta.get("lat", np.nan))
+    bp.lon = np.array(lons, dtype=float)
+    bp.lat = np.array(lats, dtype=float)
     bp.country = np.array([""] * len(station_ids), dtype="U1")
     bp.resolution = np.array(["hourly"] * len(station_ids), dtype="U16")
     bp.nsta = len(station_ids)
@@ -117,6 +150,7 @@ def main():
     records_time = []
     records_value = []
     records_station = []
+    bp_meta = _read_bp(os.path.join(base, "station_jodc.bp"))
     station_id_map = {}
     station_names = []
 
@@ -127,12 +161,20 @@ def main():
         station_code, times, values = _load_station(folder, args.start, args.end)
         if times.size == 0:
             continue
-        station_id_map[code] = idx
+        # Match station code to bp meta by name or code; fallback to sequential
+        sid = None
+        for k, meta in bp_meta.items():
+            if meta.get("name", "").split()[0] == code or meta.get("name", "").endswith(code):
+                sid = int(k)
+                break
+        if sid is None:
+            sid = idx
+        station_id_map[code] = sid
         station_names.append(code)
         tnum = date2num(list(times))
         records_time.extend(tnum)
         records_value.extend(values.tolist())
-        records_station.extend([idx] * len(values))
+        records_station.extend([station_id_map[code]] * len(values))
 
     if len(records_time) == 0:
         raise SystemExit("No data found for the selection.")
@@ -146,7 +188,7 @@ def main():
     bundle.time = times[order]
     bundle.elev = values[order]
     bundle.station = stations[order]
-    bundle.bp = _build_bp(list(station_id_map.values()), station_names)
+    bundle.bp = _build_bp(list(station_id_map.values()), station_names, bp_meta)
 
     os.makedirs(args.outdir, exist_ok=True)
     if args.out:
