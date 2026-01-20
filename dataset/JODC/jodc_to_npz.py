@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""
+Convert JODC hourly tide observations to NPZ with UHSLC-like structure.
+
+Output bundle fields:
+  - time: float days (matplotlib date number)
+  - elev: tidal height values
+  - station: integer station_id (mapped from station code)
+  - bp: zdata with station_id, station_name, lon, lat, country, resolution, nsta
+
+Usage:
+  python jodc_to_npz.py --station 0112
+  python jodc_to_npz.py --all --start 2001-01-01 --end 2001-12-31
+"""
+from __future__ import annotations
+import argparse
+import os
+from datetime import datetime, timedelta
+
+import numpy as np
+from pylib import zdata, savez, date2num
+
+MISSING = 9999.0
+
+
+def _parse_line(line: str):
+    parts = [p.strip() for p in line.split(",")]
+    if len(parts) < 3:
+        return None
+    station = parts[0]
+    try:
+        day = datetime.strptime(parts[1], "%Y/%m/%d")
+    except Exception:
+        return None
+    vals = []
+    for v in parts[2:]:
+        try:
+            fv = float(v)
+        except Exception:
+            fv = np.nan
+        if fv == MISSING:
+            fv = np.nan
+        vals.append(fv)
+    if len(vals) != 24:
+        vals = (vals + [np.nan] * 24)[:24]
+    return station, day, vals
+
+
+def _load_station(folder: str, start: str | None, end: str | None):
+    files = sorted([f for f in os.listdir(folder) if f.endswith(".txt")])
+    times = []
+    values = []
+    station_code = None
+    for fname in files:
+        path = os.path.join(folder, fname)
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.lower().startswith("moved"):
+                    continue
+                parsed = _parse_line(line)
+                if parsed is None:
+                    continue
+                station, day, vals = parsed
+                station_code = station_code or station
+                for h, v in enumerate(vals):
+                    ts = day + timedelta(hours=h)
+                    times.append(ts)
+                    values.append(v)
+    if len(times) == 0:
+        return station_code, np.array([]), np.array([])
+    times = np.array(times)
+    values = np.array(values, dtype=float)
+    if start:
+        t0 = datetime.strptime(start, "%Y-%m-%d")
+        mask = times >= t0
+        times = times[mask]
+        values = values[mask]
+    if end:
+        t1 = datetime.strptime(end, "%Y-%m-%d") + timedelta(days=1)
+        mask = times < t1
+        times = times[mask]
+        values = values[mask]
+    return station_code, times, values
+
+
+def _build_bp(station_ids, station_names):
+    bp = zdata()
+    bp.station_id = np.array(station_ids, dtype=int)
+    bp.station_name = np.array(station_names, dtype="U64")
+    bp.lon = np.full(len(station_ids), np.nan, dtype=float)
+    bp.lat = np.full(len(station_ids), np.nan, dtype=float)
+    bp.country = np.array([""] * len(station_ids), dtype="U1")
+    bp.resolution = np.array(["hourly"] * len(station_ids), dtype="U16")
+    bp.nsta = len(station_ids)
+    return bp
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert JODC tide data to NPZ.")
+    parser.add_argument("--station", default=None, help="Single station code (e.g., 0112, 2003, MA11)")
+    parser.add_argument("--all", action="store_true", help="Process all station folders")
+    parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD")
+    parser.add_argument("--end", default=None, help="End date YYYY-MM-DD")
+    parser.add_argument("--out", default=None, help="Output NPZ filename")
+    parser.add_argument("--outdir", default=".", help="Output directory")
+    args = parser.parse_args()
+
+    base = os.path.dirname(os.path.abspath(__file__))
+    if args.all:
+        stations = [d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))]
+    else:
+        if not args.station:
+            raise SystemExit("Provide --station or --all.")
+        stations = [args.station]
+
+    records_time = []
+    records_value = []
+    records_station = []
+    station_id_map = {}
+    station_names = []
+
+    for idx, code in enumerate(sorted(stations), start=1):
+        folder = os.path.join(base, code)
+        if not os.path.isdir(folder):
+            continue
+        station_code, times, values = _load_station(folder, args.start, args.end)
+        if times.size == 0:
+            continue
+        station_id_map[code] = idx
+        station_names.append(code)
+        tnum = date2num(list(times))
+        records_time.extend(tnum)
+        records_value.extend(values.tolist())
+        records_station.extend([idx] * len(values))
+
+    if len(records_time) == 0:
+        raise SystemExit("No data found for the selection.")
+
+    times = np.array(records_time, dtype=float)
+    values = np.array(records_value, dtype=float)
+    stations = np.array(records_station, dtype=int)
+    order = np.argsort(times)
+
+    bundle = zdata()
+    bundle.time = times[order]
+    bundle.elev = values[order]
+    bundle.station = stations[order]
+    bundle.bp = _build_bp(list(station_id_map.values()), station_names)
+
+    os.makedirs(args.outdir, exist_ok=True)
+    if args.out:
+        out_path = os.path.join(args.outdir, args.out)
+    else:
+        tag = "all" if args.all else station_names[0]
+        out_path = os.path.join(args.outdir, f"jodc_tide_{tag}.npz")
+    savez(out_path, bundle)
+    print(f"[OK] wrote NPZ: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
