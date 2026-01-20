@@ -17,15 +17,7 @@ close("all")
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-StartT_model = [
-    datenum(2021, 6, 1), datenum(2021, 6, 1), datenum(2021, 6, 1),
-    datenum(2021, 6, 1), datenum(2021, 6, 1), datenum(2021, 6, 1),
-    datenum(2021, 6, 1), datenum(2021, 6, 1), datenum(2021, 6, 1),
-    datenum(2021, 6, 1), datenum(2021, 6, 1), datenum(2021, 6, 1),
-    datenum(2021, 6, 1), datenum(2021, 6, 1), datenum(2021, 6, 1),
-    datenum(2021, 6, 1), datenum(2021, 6, 1), datenum(2021, 6, 1)
-]  # plot start time, model start time
-
+StartT_model = [datenum(2021, 6, 1)]  # plot start time, model start time
 ontr = 0
 mntr = 0
 omean = 1  # 1: mean obs data
@@ -36,8 +28,7 @@ mfreq = 'H'  # if mmean=1, define frequency. T:minutely, H:hourly, D:daily, W:we
 compare_velocity_mode = 'pcd'  # options: 'magnitude', 'pcd'
 
 # choose which variables to compare
-compare_variables = ['WL', 'VEL', 'TEMP', 'SALT']
-#compare_variables = ['WL']
+compare_variables = ['WL']
 # y-axis limits (set to None to use automatic scaling)
 axis_limits = {
     'WL': [-1, 1],
@@ -52,14 +43,14 @@ cutoff_period_hours = 34  # set to None to disable filtering when ontr/mntr are 
 butterworth_order = 4
 filter_pad_days = 60
 
-runs = ['npz/RUN12l_schism.npz']
+runs = ['npz/RUN01a.npz']
 lw = 2
 
-tags = ['RUN12l']
-bpfile = './stations/stationExp'
-stts = [datenum('2021-7-1'), datenum('2021-6-24'), datenum('2021-7-1'), datenum('2021-7-1')]
-edts = [datenum('2021-10-1'), datenum('2021-7-18'), datenum('2021-10-1'), datenum('2021-10-1')]
-sname = os.path.expanduser('images/all_RUN12l_mpi')
+tags = ['RUN01a']
+bpfile = './station_jodc.bp'
+stts = [datenum('2022-1-2'), datenum('2021-6-24'), datenum('2021-7-1'), datenum('2021-7-1')]
+edts = [datenum('2022-1-18'), datenum('2021-7-18'), datenum('2021-10-1'), datenum('2021-10-1')]
+sname = os.path.expanduser('images/RUN01a_WL')
 
 _obs_dir = os.getenv('SCHISM_OBS_DIR')
 if _obs_dir:
@@ -68,7 +59,7 @@ else:
     _obs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'npz')
 
 obs_paths = {
-    'WL': os.path.join(_obs_dir, 'twl-ufs-2021.npz'),
+    'WL': os.path.join(_obs_dir, 'jodc_tide_all.npz'),
     'VEL': os.path.join(_obs_dir, 'current-ufs-2021.npz'),
     'TEMP': os.path.join(_obs_dir, 'temp-ufs.npz'),
     'SALT': os.path.join(_obs_dir, 'salt-ufs.npz'),

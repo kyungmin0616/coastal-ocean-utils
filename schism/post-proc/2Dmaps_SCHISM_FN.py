@@ -51,9 +51,9 @@ USER_CONFIG = {
     "enable": True,
 
     # --- Experiment-driven paths ---
-    "exp": "RUN03b",                                # e.g., RUN01a/RUN01b/...
-    "base_run_dir": "/storage/coda1/p-ed70/0/kpark350/Projects/OTEC_GUAM/run/", # parent dir for runs
-    "base_outdir": "./images/RUN03b",                      # parent dir for images
+    "exp": "RUN01a",                                # e.g., RUN01a/RUN01b/...
+    "base_run_dir": "/scratch2/08924/kmpark/", # parent dir for runs
+    "base_outdir": "./images/",                      # parent dir for images
 
     # If any are None, they'll be derived from exp:
     "hgrid": None,   # -> {base_run_dir}/{exp}/hgrid.gr3
@@ -61,16 +61,16 @@ USER_CONFIG = {
     "outdir": None,  # -> {base_outdir}/{exp}
 
     # Range & time
-    "start": 3000,
-    "end": 4140,
-    "refdate": "2011-04-02",
+    "start": 1,
+    "end": 117,
+    "refdate": "2022-01-02",
 
     # Layer & intra-file aggregation
     "layer": -1,              # -1 = surface
     "agg": "file-mean",       # or "inst"
 
     # Layout & variables
-    "layout": "TS",          # EC, TS, ALL, SINGLE
+    "layout": "ALL",          # EC, TS, ALL, SINGLE
     "vars": None,
 
     # Plot
@@ -98,8 +98,8 @@ USER_CONFIG = {
 VAR_DEFAULTS = {
     "ssh":  {"cmap": "cmocean.balance", "clim": (-1.5, 1.5), "title": "Sea Surface Height (m)"},
     "uv":   {"cmap": "cmocean.speed",   "clim": (0.0, 1.0),   "title": "Surface Current Speed (m s$^{-1}$)"},
-    "temp": {"cmap": "cmocean.thermal", "clim": (19.0, 32.0),  "title": "Temperature (°C)"},
-    "salt": {"cmap": "cmocean.haline",  "clim": (0.0, 36.0),  "title": "Salinity (psu)"},
+    "temp": {"cmap": "cmocean.thermal", "clim": (7.0, 15.0),  "title": "Temperature (°C)"},
+    "salt": {"cmap": "cmocean.haline",  "clim": (32.0, 34.0),  "title": "Salinity (psu)"},
 }
 
 LAYOUT_TO_VARS = {

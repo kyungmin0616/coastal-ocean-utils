@@ -2,21 +2,18 @@
 '''
   extract time series of points@xyz or transects@xy from SCHISM outputs
 '''
-import os
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
 from pylib import *
 import time
+from mpi4py import MPI
 
 #-----------------------------------------------------------------------------
 #Input
 #-----------------------------------------------------------------------------
-#runs=['RUN12a','RUN12l','RUN12p','RUN12n','RUN12c','RUN12d','RUN12e','RUN12f']
-#runs=['RUN12g','RUN12m','RUN12q','RUN12o','RUN12h','RUN12i','RUN12j','RUN12k']
-runs=['RUN19a','RUN19b','RUN19c','RUN19d','RUN19e','RUN19f','RUN19g','RUN19h','RUN19i','RUN19j','RUN19k','RUN19l','RUN19m','RUN19n','RUN19o','RUN19p']
+runs=['RUN01a']
 
 #svars=('elev','hvel','temp','salt') #variables to be extracted
 svars=('elev',)
-bpfile='stations/station_TC.in' 
+bpfile='./station_jodc.in' 
 
 #optional
 #itype=1         #0: time series of points @xyz;  1: time series of trasects @xy
@@ -33,8 +30,8 @@ qnode='frontera'; nnode=1; ppn=56  #frontera, ppn=56 (flex,normal)
 #additional information:  frontera for MPI
 qname='development'                   #partition name
 account='OCE22003'              #account name
-brun=os.path.basename('../../run/{}'.format(runs[0])); jname='Rd_'+brun #job name
-ibatch=1; scrout='screen_{}.out'.format(brun); bdir=os.path.abspath(os.path.curdir)
+brun=os.path.basename('../{}'.format(runs[0])); jname='Rd_'+brun #job name
+ibatch=0; scrout='screen_{}.out'.format(brun); bdir=os.path.abspath(os.path.curdir)
 #-----------------------------------------------------------------------------
 #on front node: 1). submit jobs first (qsub), 2) running parallel jobs (mpirun) 
 #-----------------------------------------------------------------------------
@@ -69,7 +66,6 @@ for run in runs:
     odir=os.path.dirname(os.path.abspath(sname))
     if myrank==0 and (not fexist(odir)): os.mkdir(odir)
 
-    run='../../run/'+run
     if myrank==0: print('Working on {}-------------'.format(run))
     sdir=run+'/outputs'                                              #output directory
     modules, outfmt, dstacks, dvars, dvars_2d = get_schism_output_info(sdir,1)     #schism outputs information
