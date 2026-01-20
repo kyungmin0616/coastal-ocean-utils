@@ -67,8 +67,8 @@ except Exception:
 # USER CONFIG (edit here) + CLI overrides
 # ---------------------------------------------------------------------
 USER_CFG = {
-    'grd': '/S/data00/G6008/d1041/Projects/SendaiOnagawa/pre-proc/grid/01/',
-    'dir_data': '/S/data00/G6008/d1041/dataset/CMEMS/daily/EastAsia/',
+    'grd': './',
+    'dir_data': '/scratch2/08924/kmpark/CMEMS/EastAsia/',
     'start': '2022-01-02',
     'end':   '2022-04-30',
     'dt': 1.0,                 # days

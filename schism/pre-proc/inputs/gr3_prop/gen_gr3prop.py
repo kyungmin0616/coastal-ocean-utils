@@ -1,7 +1,7 @@
 from pylib import *
 
 #####################
-grd='/S/data00/G6008/d1041/Projects/SendaiOnagawa/pre-proc/grid/01/hgrid.gr3'
+grd='./hgrid.gr3'
 ### *.ic
 icf=0 # 1: make *.ic, 0: don't
 

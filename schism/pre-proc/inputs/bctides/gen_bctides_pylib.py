@@ -8,12 +8,12 @@ from pylib import *
 tnames=['O1','K1','Q1','P1','M2','S2','K2','N2']
 StartT=[2022,1,2,0]  #year,month,day,hour
 nday=140             #number of days
-ibnds=[1,2,3,]           #order of open boundaries (starts from 1)
-flags=[[5,5,4,4],[5,5,4,4],[5,5,4,4]]   #SCHISM bnd flags for each boundary
+ibnds=[1,]           #order of open boundaries (starts from 1)
+flags=[[5,5,4,4],]   #SCHISM bnd flags for each boundary
 Z0=0.0               #add Z0 constant if Z0!=0.0
 
-grd='../../../grid/01/hgrid.ll'       #hgrid.ll (includes bndinfo), or grid.npz (include lon,lat)
-bdir=r'/storage/coda1/p-ed70/0/kpark350/dataset/FES2014'   #FES2014 database 
+grd='./hgrid.ll'       #hgrid.ll (includes bndinfo), or grid.npz (include lon,lat)
+bdir=r'/scratch3/projects/CATUFS/KyungminPark/dataset/FES2014'   #FES2014 database 
 #---------------------------------------------------------------------
 #read bndinfo, amp, freq, nodal factor and tear
 #---------------------------------------------------------------------

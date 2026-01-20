@@ -13,8 +13,8 @@ import time
 # input
 # -----------------------------------------------------------------------------
 StartT=datenum(2022,1,2)
-run='/S/data00/G6008/d1041/Projects/SendaiOnagawa/pre-proc/grid/01/'
-dir_data='/S/data00/G6008/d1041/dataset/CMEMS/daily/EastAsia/'
+run='./'
+dir_data='/scratch2/08924/kmpark/CMEMS/EastAsia/'
 bad_val=1e3
 qc=True
 # bad_val: threshold for invalid values; qc: print basic min/max and bad fraction.

@@ -10,33 +10,17 @@ import numpy as np
 # inputs (edit here)
 # -----------------------------------------------------------------------------
 # source grid and output grid
-hgrid_in = 'hgrid.ll.new'
-hgrid_out = 'hgrid.ll'
+hgrid_in = 'hgrid.ll'
+hgrid_out = 'hgrid.ll.new'
 
 # regions and values (order matters)
-regions = [
-    'min_h_harlem.reg',
-    'min_h_BronxKill.reg',
-    'min_h_Hudson.reg',
-    'min_h_Passaic_Hackensack.reg',
-    'min_h_Rah.reg',
-    'min_h_rari.reg',
-    'min_h_south_bound.reg',
-    'min_h_north_bound.reg',
-    'tri1.reg',
-    'tri2_permont.reg',
-    'min_h_north_bound2.reg',
-    'min_h_north_bound3.reg',
-    'min_h_north_bound4.reg',
-    'min_h_north_bound5.reg',
-    'min_h_north_bound6.reg',
-]
-vals = [0.5, 5, 5, 5, 5, 5, 20, 55, 5, 5, 38, 62, 50, 58, 58]
+regions = ['river1.reg','river2.reg','river3.reg','river4.reg']
+vals = [15, 15, 15, 15]
 # mode: 0 => set dp to rvalue when dp<=0; 1 => enforce min depth (dp<rvalue); 2 => set dp=rvalue
-modes = [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+modes = [2,2,2,2]
 
 # blending across boundaries
-blend_dist = 2000.0  # meters for lon/lat, or map units for projected coords
+blend_dist = 1000.0  # meters for lon/lat, or map units for projected coords
 blend_mode = 'cosine'  # 'linear' or 'cosine'
 dist_mode = 'auto'  # 'auto', 'xy', or 'meters'
 
