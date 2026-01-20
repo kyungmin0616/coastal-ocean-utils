@@ -151,6 +151,14 @@ def main():
     records_value = []
     records_station = []
     bp_meta = _read_bp(os.path.join(base, "station_jodc.bp"))
+    code_to_id = {}
+    id_to_code = {}
+    for sid, meta in bp_meta.items():
+        name = meta.get("name", "")
+        code = name.split()[0] if name else None
+        if code:
+            code_to_id[code] = int(sid)
+            id_to_code[int(sid)] = code
     station_id_map = {}
     station_names = []
 
@@ -161,14 +169,8 @@ def main():
         station_code, times, values = _load_station(folder, args.start, args.end)
         if times.size == 0:
             continue
-        # Match station code to bp meta by name or code; fallback to sequential
-        sid = None
-        for k, meta in bp_meta.items():
-            if meta.get("name", "").split()[0] == code or meta.get("name", "").endswith(code):
-                sid = int(k)
-                break
-        if sid is None:
-            sid = idx
+        # Match station code to bp meta; fallback to sequential
+        sid = code_to_id.get(code, idx)
         station_id_map[code] = sid
         station_names.append(code)
         tnum = date2num(list(times))
@@ -187,8 +189,12 @@ def main():
     bundle = zdata()
     bundle.time = times[order]
     bundle.elev = values[order]
-    bundle.station = stations[order]
-    bundle.bp = _build_bp(list(station_id_map.values()), station_names, bp_meta)
+    code_lookup = {sid: code for code, sid in station_id_map.items()}
+    bundle.station = np.array([code_lookup.get(int(s), str(s)) for s in stations[order]], dtype="U16")
+    # Keep station_name as station code (e.g., MA11, 0112, 2003)
+    ordered_ids = sorted(set(station_id_map.values()))
+    ordered_names = [id_to_code.get(sid, str(sid)) for sid in ordered_ids]
+    bundle.bp = _build_bp(ordered_ids, ordered_names, bp_meta)
 
     os.makedirs(args.outdir, exist_ok=True)
     if args.out:
