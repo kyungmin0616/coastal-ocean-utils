@@ -46,7 +46,7 @@ def _parse_line(line: str):
     return station, day, vals
 
 
-def _load_station(folder: str, start: str | None, end: str | None):
+def _load_station(folder: str, start: str | None, end: str | None, tz_offset_hours: float, scale: float):
     files = sorted([f for f in os.listdir(folder) if f.endswith(".txt")])
     times = []
     values = []
@@ -64,9 +64,9 @@ def _load_station(folder: str, start: str | None, end: str | None):
                 station, day, vals = parsed
                 station_code = station_code or station
                 for h, v in enumerate(vals):
-                    ts = day + timedelta(hours=h)
+                    ts = day + timedelta(hours=h) - timedelta(hours=tz_offset_hours)
                     times.append(ts)
-                    values.append(v)
+                    values.append(v * scale if np.isfinite(v) else v)
     if len(times) == 0:
         return station_code, np.array([]), np.array([])
     times = np.array(times)
@@ -135,6 +135,8 @@ def main():
     parser.add_argument("--all", action="store_true", help="Process all station folders")
     parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD")
     parser.add_argument("--end", default=None, help="End date YYYY-MM-DD")
+    parser.add_argument("--tz_offset", type=float, default=0.0, help="Hours to shift timestamps (local -> UTC)")
+    parser.add_argument("--scale", type=float, default=1.0, help="Scale factor (e.g., 0.01 for cm->m)")
     parser.add_argument("--out", default=None, help="Output NPZ filename")
     parser.add_argument("--outdir", default=".", help="Output directory")
     args = parser.parse_args()
@@ -166,7 +168,7 @@ def main():
         folder = os.path.join(base, code)
         if not os.path.isdir(folder):
             continue
-        station_code, times, values = _load_station(folder, args.start, args.end)
+        station_code, times, values = _load_station(folder, args.start, args.end, args.tz_offset, args.scale)
         if times.size == 0:
             continue
         # Match station code to bp meta; fallback to sequential
