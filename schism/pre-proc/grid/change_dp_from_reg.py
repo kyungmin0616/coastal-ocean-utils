@@ -11,13 +11,13 @@ import numpy as np
 # -----------------------------------------------------------------------------
 # source grid and output grid
 hgrid_in = 'hgrid.ll'
-hgrid_out = 'hgrid.ll.new'
+hgrid_out = 'hgrid_new.ll'
 
 # regions and values (order matters)
 regions = ['river1.reg','river2.reg','river3.reg','river4.reg']
 vals = [15, 15, 15, 15]
-# mode: 0 => set dp to rvalue when dp<=0; 1 => enforce min depth (dp<rvalue); 2 => set dp=rvalue
-modes = [2,2,2,2]
+# mode: 0 => set dp to rvalue when dp<=0; nonzero => enforce min depth (dp<rvalue)
+modes = [2, 2, 2, 2]
 
 # blending across boundaries
 blend_dist = 1000.0  # meters for lon/lat, or map units for projected coords
