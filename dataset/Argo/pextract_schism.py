@@ -2,18 +2,25 @@
 '''
   extract time series of points@xyz or transects@xy from SCHISM outputs
 '''
+import os
+
 from pylib import *
-from mpi4py import MPI
+
+if 'HOST' not in os.environ:
+   os.environ['HOST']=os.uname().nodename
+
+# avoid attempting to use InfiniBand on nodes with Ethernet-only networking
+os.environ.setdefault('OMPI_MCA_btl', '^openib')
 
 #-----------------------------------------------------------------------------
 #Input
 #hpc: kuro, femto, bora, potomac, james, frontera, levante, stampede2
 #ppn:  64,   32,    20,    12,     20,     56,      128,      48
 #-----------------------------------------------------------------------------
-run='../run/RUN01a'
+run='/storage/coda1/p-ed70/0/kpark350/Projects/NorthPacific/run/RUN01c'
 svars=('elev',) #variables to be extracted
-bpfile='./station_jodc.bp'  #station file
-sname='./npz/RUN01a'
+bpfile='./station_eastasia.in'  #station file
+sname='./npz'
 
 #optional
 #itype=1         #0: time series of points @xyz;  1: time series of trasects @xy
@@ -28,11 +35,26 @@ sname='./npz/RUN01a'
 walltime='00:10:00'; nnode=1;  ppn=4
 
 #optional: (frontera,levante,stampede2,etc.)
-ibatch     =0              #0: serial mode;  1: parallel mode
+ibatch     =0             #0: serial mode;  1: parallel mode
 qnode      =None           #specify node name, or default qnode based on HOST will be used
 qname      =None           #partition name
 account    =None           #account name
 reservation=None           #reservation information
+
+# auto-enable MPI when launched through srun/mpirun without editing ibatch
+mpi_size=os.getenv('OMPI_COMM_WORLD_SIZE') or os.getenv('PMI_SIZE') or os.getenv('SLURM_NTASKS')
+if ibatch==0 and mpi_size not in [None,'1','0']:
+   ibatch=1
+
+if ibatch==1:
+   from mpi4py import MPI
+else:
+   MPI=None
+
+# treat SLURM-launched runs as already on a compute node so we don't resubmit
+if os.getenv('job_on_node') is None and (os.getenv('SLURM_JOB_ID') or mpi_size not in [None,'1','0']):
+   os.environ['job_on_node']='1'
+   os.environ.setdefault('bdir', os.path.abspath(os.curdir))
 
 #-----------------------------------------------------------------------------
 #on front node: 1). submit jobs first (qsub), 2) running parallel jobs (mpirun) 

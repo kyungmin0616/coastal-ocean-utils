@@ -5,6 +5,7 @@ import sys
 import time
 
 import matplotlib
+matplotlib.use('Agg')
 from pylib import *
 import numpy as np
 import pandas as pd
@@ -16,27 +17,26 @@ close("all")
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-StartT_model = [datenum(2022, 1, 2)]  # plot start time, model start time
+StartT_model = [
+    datenum(2022, 1, 2), datenum(2021, 6, 1), datenum(2021, 6, 1),
+    datenum(2022, 1, 2), datenum(2021, 6, 1), datenum(2021, 6, 1)
+]  # plot start time, model start time
+
 ontr = 0
 mntr = 0
 omean = 1  # 1: mean obs data
-ofreq = 'h'  # if omean=1, define frequency. T:minutely, H:hourly, D:daily, W:weekly, M:monthly
+ofreq = 'H'  # if omean=1, define frequency. T:minutely, H:hourly, D:daily, W:weekly, M:monthly
 mmean = 1  # 1: mean model data
-mfreq = 'h'  # if mmean=1, define frequency. T:minutely, H:hourly, D:daily, W:weekly, M:monthly
+mfreq = 'H'  # if mmean=1, define frequency. T:minutely, H:hourly, D:daily, W:weekly, M:monthly
 
 compare_velocity_mode = 'pcd'  # options: 'magnitude', 'pcd'
-demean_series = {
-    'WL': 1,
-    'VEL': 0,
-    'TEMP': 0,
-    'SALT': 0,
-}  # per-variable mean removal before comparison
 
 # choose which variables to compare
+#compare_variables = ['WL', 'VEL', 'TEMP', 'SALT']
 compare_variables = ['WL']
 # y-axis limits (set to None to use automatic scaling)
 axis_limits = {
-    'WL': [-1.5, 1.5],
+    'WL': [-2, 2],
     'VEL_magnitude': [0, 1.4],
     'VEL_pcd': [-1.5, 1.5],
     'TEMP': [14, 30],
@@ -48,14 +48,14 @@ cutoff_period_hours = 34  # set to None to disable filtering when ontr/mntr are 
 butterworth_order = 4
 filter_pad_days = 60
 
-runs = ['npz/RUN01a.npz']
+runs = ['npz/RUN01c_WL.npz']
 lw = 2
 
-tags = ['RUN01a']
-bpfile = './station_jodc.bp'
+tags = ['RUN01c']
+bpfile = './station_eastasia.bp'
 stts = [datenum('2022-1-14'), datenum('2021-6-24'), datenum('2021-7-1'), datenum('2021-7-1')]
-edts = [datenum('2022-3-30'), datenum('2021-7-18'), datenum('2021-10-1'), datenum('2021-10-1')]
-sname = os.path.expanduser('images/RUN01a_WL')
+edts = [datenum('2022-4-1'), datenum('2021-7-18'), datenum('2021-10-1'), datenum('2021-10-1')]
+sname = os.path.expanduser('images/WL_RUN01c')
 
 _obs_dir = os.getenv('SCHISM_OBS_DIR')
 if _obs_dir:
@@ -64,7 +64,7 @@ else:
     _obs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'npz')
 
 obs_paths = {
-    'WL': os.path.join(_obs_dir, 'jodc_tide_all.npz'),
+    'WL': os.path.join(_obs_dir, 'uhslc_water_levels_hourly_rqds.npz'),
     'VEL': os.path.join(_obs_dir, 'current-ufs-2021.npz'),
     'TEMP': os.path.join(_obs_dir, 'temp-ufs.npz'),
     'SALT': os.path.join(_obs_dir, 'salt-ufs.npz'),
@@ -97,23 +97,12 @@ if _cfg_raw:
     sname = os.path.expanduser(_cfg.get('sname', sname))
 
     lw = _cfg.get('lw', lw)
-    _demean_cfg = _cfg.get('demean_series', None)
-    if isinstance(_demean_cfg, dict):
-        demean_series.update({k: int(bool(v)) for k, v in _demean_cfg.items()})
-    elif isinstance(_demean_cfg, (list, tuple, set)):
-        for key in _demean_cfg:
-            demean_series[str(key)] = 1
-    elif _demean_cfg is not None:
-        for key in demean_series:
-            demean_series[key] = int(bool(_demean_cfg))
 
     if 'obs_paths' in _cfg:
         obs_paths.update({k: v for k, v in _cfg['obs_paths'].items() if v})
 
-colors = [
-    "black", "blue", "green", "red", "cyan", "magenta", "yellow",
-    "orange", "purple", "brown", "pink", "gray", "olive", "teal", "navy"
-]
+
+colors = 'kgbcm'
 lstyle = ['-'] * len(colors)
 markers = ['None'] * len(colors)
 
@@ -298,7 +287,8 @@ ensure_dir(sname)
 # Station metadata
 # --------------------------------------------------------------------------
 bp = read_schism_bpfile(bpfile)
-bp.staid = array([entry.split(' ')[0] for entry in bp.station])
+bp.staid = array([entry.split(' ')[0].split('UHSLC')[1] for entry in bp.station])
+bp.staid = bp.staid.astype(int)
 bp.var = array([entry.split(' ')[1] for entry in bp.station])
 
 # --------------------------------------------------------------------------
@@ -380,6 +370,9 @@ for idx in arange(bp.nsta):
         stan = station_id
         wlc += 1
         obs = loadz(resolve_obs_path('WL'))
+        station_name = obs.bp.station_name[idx]
+        station_country = obs.bp.country[idx]
+
         stt, edt = stts[0], edts[0]
         buffer_days = filter_pad_days if (ontr == 1 or mntr == 1) else 0
         filter_start = stt - buffer_days
@@ -390,7 +383,7 @@ for idx in arange(bp.nsta):
             * (obs.time <= filter_end)
         )
         oti = obs.time[selector]
-        oyi = obs.elev[selector]
+        oyi = obs.elev[selector]/1000
     elif var == 'VEL':
         stan = station_id.split('_')[1] + '_' + station_id.split('_')[0]
         cc += 1
@@ -495,12 +488,9 @@ for idx in arange(bp.nsta):
     if len(oyi) == 0:
         print(f'No observational data in target window after filtering at {station_id}')
         continue
-    if demean_series.get(var, 0):
-        obs_mean = nanmean(oyi)
-        if np.isfinite(obs_mean):
-            oyi = oyi - obs_mean
 
     ax = gca()
+    oyi=oyi-nanmean(oyi)
     ax.plot(oti, oyi, linestyle=lstyle[0], color='r', marker=markers[0], ms=3, alpha=0.85, lw=lw)
 
     for nn, run in enumerate(runs):
@@ -553,13 +543,9 @@ for idx in arange(bp.nsta):
 
         plot_mask_model = (mti >= stt) & (mti <= edt)
         mti = mti[plot_mask_model]
-        myi = myi[plot_mask_model]
+        myi = myi[plot_mask_model]; myi=myi-nanmean(myi)
         if len(mti) == 0:
             continue
-        if demean_series.get(var, 0):
-            model_mean = nanmean(myi)
-            if np.isfinite(model_mean):
-                myi = myi - model_mean
 
         valid_obs = ~isnan(oyi)
         oti_valid = oti[valid_obs]
@@ -619,17 +605,12 @@ for idx in arange(bp.nsta):
             )
         else:
             text_str = (
-                f'No.{sno} ({stan}-{var}), {tag}---> R: {st.R:.2f}, RMSE: {st.RMSD:.2f}, Bias: {st.ME:.2f}'
+                f'No.{sno}, ({stan}-{var}), {station_name}-{station_country}, {tag}---> R: {st.R:.2f}, RMSE: {st.RMSD:.2f}, Bias: {st.ME:.2f}'
             )
 
-        x0, x1 = ax.get_xlim()
-        y0, y1 = ax.get_ylim()
-        dx = x1 - x0
-        dy = y1 - y0
-
         ax.text(
-            x0 + 0.00 * dx,
-            y0 + (1.1 + nn * 0.1) * dy,
+            ax.get_xlim()[0] + 0.00 * diff(ax.get_xlim()),
+            ax.get_ylim()[0] + (1.1 + nn * 0.1) * diff(ax.get_ylim()),
             text_str,
             color='k',
             fontweight='bold'
@@ -640,7 +621,7 @@ for idx in arange(bp.nsta):
     ylabel(yname)
     ax.xaxis.grid('on')
     ax.yaxis.grid('on')
-#    gcf().tight_layout()
+    gcf().tight_layout()
 
     savefig(f'{sname}/{var}_station_{stan}.png', bbox_inches='tight')
     close()

@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 '''
-  extract time series of points@xyz or transects@xy from SCHISM outputs
+  extract SCHISM slab outputs
 '''
 from pylib import *
-from mpi4py import MPI
+#from mpi4py import MPI
 
 #-----------------------------------------------------------------------------
 #Input
 #hpc: kuro, femto, bora, potomac, james, frontera, levante, stampede2
 #ppn:  64,   32,    20,    12,     20,     56,      128,      48
 #-----------------------------------------------------------------------------
-run='../run/RUN01a'
-svars=('elev',) #variables to be extracted
-bpfile='./station_jodc.bp'  #station file
-sname='./npz/RUN01a'
+run='../run/RUN01c'  #run dir containing outputs
+svars=('elev',)                 #variables to be extracted
+levels=[1,]        #schism level indices (1-nvrt: surface-bottom; (>nvrt): kbp level)
+sname='./npz/RUN01c_elev'  #name for saving the resutls
 
 #optional
-#itype=1         #0: time series of points @xyz;  1: time series of trasects @xy
-#ifs=0           #0: refer to free surface; 1: fixed depth
-#stacks=[1,3]    #outputs stacks to be extracted
-#nspool=12       #sub-sampling frequency within each stack (1 means all)
-#mdt=1           #time window (day) for averaging output
-#rvars=['elev','salt','hvel','NO3'] #rname the varibles 
-#prj=['epsg:26918','epsg:4326']  #projections used to transform coord. in station.bp
+stacks=[1,75]   #outputs stacks to be extracted
+#nspool=12      #sub-sampling frequency within each stack (1 means all)
+#mdt=1          #time window (day) for averaging output
+#rvars=['elev','hvel','G1'] #rname the varibles 
+#reg=None       #region for subsetting reslts (*.reg, or *.bp, or gd_subgrid)
 
-#hpc resource requst
+#resource requst 
 walltime='00:10:00'; nnode=1;  ppn=4
 
 #optional: (frontera,levante,stampede2,etc.)
@@ -58,21 +56,20 @@ if myrank==0 and (not fexist(odir)): os.mkdir(odir)
 #-----------------------------------------------------------------------------
 #do MPI work on each core
 #-----------------------------------------------------------------------------
-add_var(['itype','ifs','nspool','rvars','prj','mdt'],[0,0,1,svars,None,None],locals()) #add default values
-modules, outfmt, dstacks, dvars, dvars_2d = schout_info(run+'/outputs',1)   #schism outputs information
+add_var(['nspool','rvars','mdt','reg'],[1,svars,None,None],locals()) #add default values
+modules, outfmt, dstacks, dvars, dvars_2d = get_schism_output_info(run+'/outputs',1)  #schism outputs information
 stacks=arange(stacks[0],stacks[1]+1) if ('stacks' in locals()) else dstacks #check stacks
-gd,vd=grd(run,fmt=2); gd.compute_bnd()                                      #read model grid
 
 #extract results
 irec=0; oname=odir+'/.schout_'+os.path.basename(os.path.abspath(sname))
 for svar in svars: 
-   ovars=schvar_info(svar,modules,fmt=outfmt)
+   ovars=get_schism_var_info(svar,modules,fmt=outfmt)
    if ovars[0][1] not in dvars: continue 
    for istack in stacks:
-       fname='{}_{}_{}'.format(oname,svar,istack); irec=irec+1; t00=time.time()
+       fn='{}_{}_{}_slab'.format(oname,svar,istack); irec=irec+1; t00=time.time()
        if irec%nproc==myrank: 
           try:
-             read_schism_output(run,svar,bpfile,istack,ifs,nspool,fname=fname,hgrid=gd,vgrid=vd,fmt=itype,prj=prj,mdt=mdt)
+             read_schism_slab(run,svar,levels,istack,nspool,mdt,fname=fn,reg=reg)
              dt=time.time()-t00; print('finishing reading {}_{}.nc on myrank={}: {:.2f}s'.format(svar,istack,myrank,dt)); sys.stdout.flush()
           except:
              pass
@@ -80,14 +77,13 @@ for svar in svars:
 #combine results
 if ibatch==1: comm.Barrier()
 if myrank==0:
-   S=zdata(); S.bp=read(bpfile); S.time=[]; fnss=[]
-   for i,[k,m] in enumerate(zip(svars,rvars)):
-       fns=['{}_{}_{}.npz'.format(oname,k,n) for n in stacks]; fnss.extend(fns)
-       data=[read(fn,k).astype('float32') for fn in fns if fexist(fn)]; mtime=[read(fn,'time') for fn in fns if fexist(fn)]
-       if len(data)>0: S.attr(m,concatenate(data,axis=1)); mtime=concatenate(mtime)
+   S=zdata(); S.time=[]; fnss=[]
+   for i,[svar,rvar] in enumerate(zip(svars,rvars)):
+       fns=['{}_{}_{}_slab.npz'.format(oname,svar,k) for k in stacks]; fnss.extend(fns)
+       data=[read(fn,svar).astype('float32') for fn in fns if fexist(fn)]; mtime=[read(fn,'time') for fn in fns if fexist(fn)]
+       if len(data)>0: S.attr(rvar,concatenate(data)); mtime=concatenate(mtime)
        if len(mtime)>len(S.time): S.time=array(mtime)
-   [S.attr(pn,read('{}/{}.nml'.format(run,pn),3)) for pn in ['param','icm','sediment','cosine','wwminput'] if fexist('{}/{}.nml'.format(run,pn))]
-   S.save(sname); [os.remove(fn) for fn in fnss if fexist(fn)] 
+   S.save(sname); [os.remove(fn) for fn in fnss if fexist(fn)]
 
 #-----------------------------------------------------------------------------
 #finish MPI jobs

@@ -3,17 +3,17 @@
   extract time series of points@xyz or transects@xy from SCHISM outputs
 '''
 from pylib import *
-from mpi4py import MPI
+#from mpi4py import MPI
 
 #-----------------------------------------------------------------------------
 #Input
 #hpc: kuro, femto, bora, potomac, james, frontera, levante, stampede2
 #ppn:  64,   32,    20,    12,     20,     56,      128,      48
 #-----------------------------------------------------------------------------
-run='../run/RUN01a'
+run='/storage/coda1/p-ed70/0/kpark350/Projects/NorthPacific/run/RUN01c'
 svars=('elev',) #variables to be extracted
-bpfile='./station_jodc.bp'  #station file
-sname='./npz/RUN01a'
+bpfile='./station_eastasia.bp'  #station file
+sname='./npz'
 
 #optional
 #itype=1         #0: time series of points @xyz;  1: time series of trasects @xy
