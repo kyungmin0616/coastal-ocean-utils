@@ -421,7 +421,15 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
                     logging.error(f'Rank {RANK}: failed to open {fname}: {e}')
                 continue
 
-            ctime, _ = _parse_time_units(C.variables['time'])
+            try:
+                ctime, _ = _parse_time_units(C.variables['time'])
+            except Exception as e:
+                logging.error(f'Rank {RANK}: failed reading time from {fp}: {e}')
+                try:
+                    C.close()
+                except Exception:
+                    pass
+                continue
             local_time.extend(ctime)
 
             # Coords
