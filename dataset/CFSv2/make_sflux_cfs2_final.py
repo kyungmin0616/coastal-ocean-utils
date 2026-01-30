@@ -113,7 +113,7 @@ CONFIG = dict(
     STREAM_MODE="month",  # "all" or "month"
     MISSING_POLICY="error",  # "error", "fill", or "skip"
     MISSING_FILL=np.nan,     # used when MISSING_POLICY="fill"
-    PROGRESS=False,          # print per-file open progress
+    PROGRESS=True,          # print per-file open progress
     PROGRESS_EVERY=10,       # print every N files when PROGRESS is True
     PROGRESS_RANK0_ONLY=True,  # only rank 0 prints per-file progress
     PATH_GLOBS=dict(
