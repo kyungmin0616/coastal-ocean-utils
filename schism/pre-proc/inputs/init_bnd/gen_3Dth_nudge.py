@@ -68,9 +68,9 @@ except Exception:
 # ---------------------------------------------------------------------
 USER_CFG = {
     'grd': './',
-    'dir_data': '/scratch2/08924/kmpark/CMEMS/EastAsia/',
-    'start': '2022-01-02',
-    'end':   '2022-04-30',
+    'dir_data': '/scratch2/08924/kmpark/CMEMS/Japan/',
+    'start': '2012-01-01',
+    'end':   '2024-12-31',
     'dt': 1.0,                 # days
     'ibnds': [1,],              # 1-based boundary IDs
     'ifix': 1,                 # 0: fix parents first, 1: repair after gather
@@ -88,6 +88,7 @@ USER_CFG = {
     'bad_val': 1e3,
     'io_group': 0,             # limit concurrent readers: 0=off, N=phases
     'qc': False,               # log basic QC stats per variable
+    'strict_time': False,      # stop on bad time reads or large time gaps
 }
 
 # CLI (flags override USER_CFG)
@@ -105,6 +106,7 @@ parser.add_argument('--log', default=None)
 parser.add_argument('--bad_val', type=float, default=None)
 parser.add_argument('--io_group', type=int, default=None)
 parser.add_argument('--qc', action='store_true', default=None)
+parser.add_argument('--strict-time', action='store_true', default=None)
 args = parser.parse_args()
 
 from types import SimpleNamespace
@@ -429,6 +431,8 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
                     C.close()
                 except Exception:
                     pass
+                if cfg.strict_time:
+                    raise
                 continue
             local_time.extend(ctime)
 
@@ -604,6 +608,16 @@ for n, (sname, svar, mvar, dt, iflag) in enumerate(zip(snames, svars, mvars, dts
     sdict['time'] = sdict['time'][sind]
     for mv in mvar:
         sdict[mv] = sdict[mv][sind]
+
+    # Report or stop on large time gaps (linear interp will fill by default)
+    if len(sdict['time']) > 1:
+        gaps = np.diff(sdict['time'])
+        max_gap = float(np.max(gaps))
+        if max_gap > dt * 1.5:
+            msg = f'Large time gap detected: max_gap={max_gap:.6f} days (dt={dt:.6f})'
+            if cfg.strict_time:
+                raise RuntimeError(msg)
+            logging.warning(msg)
 
     # Time interpolation → mtime (with overlap clipping)
     mtime = arange(StartT, EndT + dt + 1e-9, dt)
