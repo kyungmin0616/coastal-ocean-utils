@@ -1,8 +1,14 @@
+#!/usr/bin/env python3
+"""
+Compare SCHISM profiles against TEAMS CTD observations stored in NPZ.
+"""
+
 import os
+import sys
 from pylib import *
 import numpy as np
-import numpy.ma as ma
-import sys
+
+NaN = np.nan
 
 MPI = None
 COMM = None
@@ -34,17 +40,29 @@ CONFIG = {
     },
     "date_range": {
         "start": (2017, 1, 1),
-        "end": (2017, 12, 31),
+        "end": (2019, 12, 31),
+    },
+    "compare": {
+        "location_only": True,  # True: ignore observation time and use a fixed SCHISM time
+        "location_only_time": None,  # datenum or None to use first SCHISM time
+        "station_ids": ["4", "5","6", "7","8"],  # list of station_id strings to include, or None for all
+        "station_names": None,  # list of station_name strings to include, or None for all
     },
     "region": {
-        "shapefile": "hgrid_bnd.shp",  # set to None to skip shapefile filtering
-        "use_shapefile": False,
-        # (lon_min, lon_max, lat_min, lat_max); set to None to skip bounding-box filtering
-        "subset_bbox": None,#(80,100,22,30),
+        "shapefile": "SO_bnd.shp",  # set to None to skip shapefile filtering
+        "use_shapefile": True,
+        "subset_bbox": None, #(141.48767,141.56841,38.41906,38.43688),  # (lon_min, lon_max, lat_min, lat_max)
     },
-    "argo": {
-        "dir": "/storage/coda1/p-ed70/0/kpark350/dataset/ARGO/NP/2022/",
-        "reference_time": (1950, 1, 1),
+    "teams": {
+        "npz_path": "/S/data00/G6008/d1041/Projects/SendaiOnagawa/post-proc/npz/onagawa_d2_ctd.npz",
+        "lon_name": "lon",
+        "lat_name": "lat",
+        "time_name": "time",
+        "depth_name": "depth",
+        "temp_name": "temp",
+        "salt_name": "sal",
+        "station_id_name": "station_id",
+        "station_name_name": "station_name",
     },
     "schism": {
         "enabled": True,
@@ -53,15 +71,15 @@ CONFIG = {
         "run_dir": "/S/data00/G6008/d1041/Projects/SendaiOnagawa/run/RUN01a",
         "variables": ["temp", "salt"],
         "refdate": datenum("2017-4-1"),
-        "stack_range": (1, 120),
+        "stack_range": (1, 118),
         "stack_step": 1 / 24,
         "lon_mode": "180",  # set to "360" if SCHISM output uses 0-360 longitudes
     },
     "global_model": {
-        "enabled": False,
+        "enabled": True,  # set True to compare against a global model
         "label": "CMEMS",
         "color": "k",
-        "data_dir": "/storage/coda1/p-ed70/0/kpark350/dataset/CMEMS/EastAsia/",
+        "data_dir": "/S/data00/G6008/d1041/dataset/CMEMS/daily/Japan",
         "file_suffix": ".nc",
         "variables": {
             "lon": "longitude",
@@ -72,20 +90,21 @@ CONFIG = {
         },
         "fill_value": -3e4,
         "lon_mode": "auto",  # "auto", "180", or "360"
+        "search_radius": 1,  # grid cells to search for nearest wet point if target is all-NaN
     },
     "output": {
-        "dir": "./argo_schism/each_profile/SCHISMvsCMEMSvsARGO/RUN02a",
+        "dir": "./SCHISMvsCMEMSvsTEAMS",
     },
     "plot": {
         "linewidth": 1.5,
         "font_size": 7,
         "obs_color": "r",
+        "map_xlim": (141.4127, 141.6027),  # e.g. (141.2, 141.8)
+        "map_ylim": (38.3298, 38.4992),  # e.g. (38.2, 38.6)
     },
 }
 
 
-#######################################################################################################################
-# control font size in plot
 SMALL_SIZE = 8
 MEDIUM_SIZE = 8
 BIGGER_SIZE = 8
@@ -96,7 +115,6 @@ rc("ytick", labelsize=SMALL_SIZE)
 rc("legend", fontsize=SMALL_SIZE)
 rc("axes", labelsize=MEDIUM_SIZE)
 rc("figure", titlesize=BIGGER_SIZE)
-#######################################################################################################################
 
 CANONICAL_LON_MODE = CONFIG["coordinates"].get("canonical", "180")
 
@@ -160,32 +178,13 @@ def point_in_region(region, lon, lat):
     bbox = region["bbox"]
     if bbox:
         lon_min, lon_max, lat_min, lat_max = bbox
-        lon_in_box = False
         if lon_min <= lon_max:
             lon_in_box = lon_min <= lon <= lon_max
-        else:  # dateline-crossing box
+        else:
             lon_in_box = lon >= lon_min or lon <= lon_max
         if not (lon_in_box and lat_min <= lat <= lat_max):
             return False
     return True
-
-
-def prepare_argo_files(argo_cfg):
-    dir_argo = argo_cfg["dir"]
-    files = array([f for f in os.listdir(dir_argo) if f.endswith(".nc")])
-    if len(files) == 0:
-        return array([]), array([])
-    mti = array([f.replace(".nc", "") for f in files])
-    sind = argsort(mti)
-    return files[sind], mti[sind]
-
-
-def sanitize_masked(arr):
-    data = array(arr, dtype=float)
-    mask = getattr(arr, "mask", None)
-    if mask is not None:
-        data[mask == 1] = NaN
-    return data
 
 
 def drop_nan_pairs(depth, values):
@@ -250,6 +249,7 @@ def prepare_global_model(cfg, start, end):
         "times": mti[sind],
         "cache_index": None,
         "cache_ds": None,
+        "cache_meta": None,
     })
     return cfg
 
@@ -316,6 +316,8 @@ def extract_global_profile(cfg, stime, lon, lat):
     if lon_data.ndim == 1 and lat_data.ndim == 1:
         lon_idx = int(np.abs(lon_norm - target_lon).argmin())
         lat_idx = int(np.abs(lat_data - lat).argmin())
+        lon_pick = lon_data[lon_idx]
+        lat_pick = lat_data[lat_idx]
     else:
         if lon_mode == "360":
             lon_grid = meta["lon_grid_360"]
@@ -327,8 +329,10 @@ def extract_global_profile(cfg, stime, lon, lat):
         dist = (lat_grid - lat) ** 2 + (lon_grid - target_lon) ** 2
         llidx = unravel_index(dist.argmin(), dist.shape)
         lat_idx, lon_idx = int(llidx[0]), int(llidx[1])
+        lon_pick = lon_data[lat_idx, lon_idx]
+        lat_pick = lat_data[lat_idx, lon_idx]
 
-    def extract_profile(var):
+    def extract_profile(var, lat_i=lat_idx, lon_i=lon_idx):
         dims = list(var.dimensions)
         slices = [slice(None)] * var.ndim
 
@@ -346,10 +350,10 @@ def extract_global_profile(cfg, stime, lon, lat):
             time_idx = int(np.clip(idx, 0, var.shape[time_axis] - 1))
             slices[time_axis] = time_idx
         if lat_axis is not None:
-            lat_idx_clipped = int(np.clip(lat_idx, 0, var.shape[lat_axis] - 1))
+            lat_idx_clipped = int(np.clip(lat_i, 0, var.shape[lat_axis] - 1))
             slices[lat_axis] = lat_idx_clipped
         if lon_axis is not None:
-            lon_idx_clipped = int(np.clip(lon_idx, 0, var.shape[lon_axis] - 1))
+            lon_idx_clipped = int(np.clip(lon_i, 0, var.shape[lon_axis] - 1))
             slices[lon_axis] = lon_idx_clipped
 
         data = var[tuple(slices)]
@@ -361,8 +365,10 @@ def extract_global_profile(cfg, stime, lon, lat):
             data = data.reshape(1)
         return data
 
-    temp_profile = extract_profile(ds.variables[vars_["temp"]])
-    salt_profile = extract_profile(ds.variables[vars_["salt"]])
+    temp_var = ds.variables[vars_["temp"]]
+    salt_var = ds.variables[vars_["salt"]]
+    temp_profile = extract_profile(temp_var)
+    salt_profile = extract_profile(salt_var)
 
     fill_value = cfg.get("fill_value")
     if fill_value is not None:
@@ -372,6 +378,56 @@ def extract_global_profile(cfg, stime, lon, lat):
     temp_profile[np.abs(temp_profile) > 1e30] = NaN
     salt_profile[np.abs(salt_profile) > 1e30] = NaN
 
+    def has_finite(arr):
+        return np.isfinite(arr).any()
+
+    search_radius = int(cfg.get("search_radius", 0))
+    if search_radius > 0 and not (has_finite(temp_profile) or has_finite(salt_profile)):
+        best = None
+        if lon_data.ndim == 1 and lat_data.ndim == 1:
+            for di in range(-search_radius, search_radius + 1):
+                for dj in range(-search_radius, search_radius + 1):
+                    li = lat_idx + di
+                    lj = lon_idx + dj
+                    if li < 0 or lj < 0 or li >= lat_data.size or lj >= lon_data.size:
+                        continue
+                    tpi = extract_profile(temp_var, lat_i=li, lon_i=lj)
+                    spi = extract_profile(salt_var, lat_i=li, lon_i=lj)
+                    if not (has_finite(tpi) or has_finite(spi)):
+                        continue
+                    lon_i = lon_norm[lj]
+                    lat_i = lat_data[li]
+                    dist2 = (lat_i - lat) ** 2 + (lon_i - target_lon) ** 2
+                    if best is None or dist2 < best[0]:
+                        best = (dist2, li, lj, tpi, spi)
+        else:
+            nlat, nlon = lat_data.shape
+            for di in range(-search_radius, search_radius + 1):
+                for dj in range(-search_radius, search_radius + 1):
+                    li = lat_idx + di
+                    lj = lon_idx + dj
+                    if li < 0 or lj < 0 or li >= nlat or lj >= nlon:
+                        continue
+                    tpi = extract_profile(temp_var, lat_i=li, lon_i=lj)
+                    spi = extract_profile(salt_var, lat_i=li, lon_i=lj)
+                    if not (has_finite(tpi) or has_finite(spi)):
+                        continue
+                    lon_i = lon_norm[li, lj]
+                    lat_i = lat_data[li, lj]
+                    dist2 = (lat_i - lat) ** 2 + (lon_i - target_lon) ** 2
+                    if best is None or dist2 < best[0]:
+                        best = (dist2, li, lj, tpi, spi)
+        if best is not None:
+            _, li, lj, tpi, spi = best
+            temp_profile = tpi
+            salt_profile = spi
+            if lon_data.ndim == 1:
+                lon_pick = lon_data[lj]
+                lat_pick = lat_data[li]
+            else:
+                lon_pick = lon_data[li, lj]
+                lat_pick = lat_data[li, lj]
+
     return {
         "name": cfg["label"],
         "color": cfg["color"],
@@ -379,8 +435,9 @@ def extract_global_profile(cfg, stime, lon, lat):
         "temp": temp_profile,
         "salt": salt_profile,
         "time": cfg["times"][idx],
+        "grid_lon": normalize_longitudes(lon_pick, CANONICAL_LON_MODE),
+        "grid_lat": float(lat_pick),
     }
-
 
 def prepare_schism(cfg):
     if not cfg.get("enabled", False):
@@ -468,6 +525,8 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
 
     lon = meta["lon"]
     lat = meta["lat"]
+    gm_lon = meta.get("gm_lon")
+    gm_lat = meta.get("gm_lat")
     alon = meta["lon_array"]
     alat = meta["lat_array"]
     stime = meta["obs_time"]
@@ -480,14 +539,19 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
     if len(depth_temp_obs) == 0 or len(depth_salt_obs) == 0:
         return
 
-    figure(1, figsize=[7.2, 3.5])
+    figure(figsize=[7.2, 3.5])
     clf()
     subplot(1, 2, 1)
     plot(alon, alat, f"{obs_color}+", markersize=10, label="Obs")
-    for model in models:
-        plot([], [], model["color"], lw=linewidth, label=model["name"])
+    plot(lon, lat, "b*", markersize=10, label="SCHISM")
+    if gm_lon is not None and gm_lat is not None:
+        plot(gm_lon, gm_lat, "k^", markersize=8, label="Global")
     if region["px"] is not None and region["py"] is not None:
         plot(region["px"], region["py"], "k")
+    if plot_cfg.get("map_xlim") is not None:
+        xlim(plot_cfg["map_xlim"])
+    if plot_cfg.get("map_ylim") is not None:
+        ylim(plot_cfg["map_ylim"])
     xlabel("Longitude")
     ylabel("Latitude")
     legend()
@@ -500,6 +564,7 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
         if len(m_depth) == 0:
             continue
         plot(m_temp, m_depth, model["color"], lw=linewidth, label=model["name"])
+        plot(m_temp, m_depth, marker="o", linestyle="None", markersize=3, color=model["color"])
         temp_depth_sets.append(m_depth)
         temp_value_sets.append(m_temp)
     plot(
@@ -541,15 +606,21 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
         dpi=400,
         bbox_inches="tight",
     )
+    close()
 
-    figure(1, figsize=[7.2, 3.5])
+    figure(figsize=[7.2, 3.5])
     clf()
     subplot(1, 2, 1)
     plot(alon, alat, f"{obs_color}+", markersize=10, label="Obs")
-    for model in models:
-        plot([], [], model["color"], lw=linewidth, label=model["name"])
+    plot(lon, lat, "b*", markersize=10, label="SCHISM")
+    if gm_lon is not None and gm_lat is not None:
+        plot(gm_lon, gm_lat, "k^", markersize=8, label="Global")
     if region["px"] is not None and region["py"] is not None:
         plot(region["px"], region["py"], "k")
+    if plot_cfg.get("map_xlim") is not None:
+        xlim(plot_cfg["map_xlim"])
+    if plot_cfg.get("map_ylim") is not None:
+        ylim(plot_cfg["map_ylim"])
     xlabel("Longitude")
     ylabel("Latitude")
     legend()
@@ -562,6 +633,7 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
         if len(m_depth) == 0:
             continue
         plot(m_salt, m_depth, model["color"], lw=linewidth, label=model["name"])
+        plot(m_salt, m_depth, marker="o", linestyle="None", markersize=3, color=model["color"])
         salt_depth_sets.append(m_depth)
         salt_value_sets.append(m_salt)
     plot(
@@ -603,25 +675,24 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
         dpi=400,
         bbox_inches="tight",
     )
+    close()
+
+
+def build_profile_groups(station_ids, times):
+    time_str = times.astype("datetime64[s]").astype(str)
+    keys = np.char.add(station_ids.astype(str), "|" + time_str)
+    uniq_keys, inv = np.unique(keys, return_inverse=True)
+    return uniq_keys, inv, time_str
 
 
 def main():
     start_t, end_t = parse_date_range(CONFIG["date_range"])
     region = setup_region(CONFIG["region"])
-    argo_files, argo_ids = prepare_argo_files(CONFIG["argo"])
-    ref_time_argo = datenum(*CONFIG["argo"]["reference_time"])
-
-    gm_cfg = prepare_global_model(CONFIG["global_model"], start_t, end_t)
     sch_cfg = prepare_schism(CONFIG["schism"])
+    gm_cfg = prepare_global_model(CONFIG["global_model"], start_t, end_t)
     active_models = [cfg for cfg in (gm_cfg, sch_cfg) if cfg is not None]
     if len(active_models) == 0:
         rank_print("No models selected for comparison. Enable at least one model in CONFIG.")
-        return
-
-    total_profiles = len(argo_files)
-    if total_profiles == 0:
-        if RANK == 0:
-            rank_print("No Argo profiles found in directory.")
         return
 
     if RANK == 0:
@@ -629,110 +700,158 @@ def main():
     if MPI:
         COMM.Barrier()
 
-    dir_argo = CONFIG["argo"]["dir"]
+    teams_cfg = CONFIG["teams"]
+    S = loadz(teams_cfg["npz_path"])
+    lon = np.asarray(getattr(S, teams_cfg["lon_name"]))
+    lat = np.asarray(getattr(S, teams_cfg["lat_name"]))
+    depth = np.asarray(getattr(S, teams_cfg["depth_name"]))
+    temp = np.asarray(getattr(S, teams_cfg["temp_name"]))
+    salt = np.asarray(getattr(S, teams_cfg["salt_name"]))
+    st_id = np.asarray(getattr(S, teams_cfg["station_id_name"]))
+    st_name = None
+    st_name_field = teams_cfg.get("station_name_name")
+    if st_name_field and hasattr(S, st_name_field):
+        st_name = np.asarray(getattr(S, st_name_field))
+
+    time_raw = np.asarray(getattr(S, teams_cfg["time_name"]))
+    time_str = time_raw.astype("datetime64[s]").astype(str)
+    obs_time = np.array([datenum(t) for t in time_str], dtype=float)
+
+    uniq_keys, inv, time_str = build_profile_groups(st_id, time_raw)
+    total_profiles = len(uniq_keys)
+    if total_profiles == 0:
+        rank_print("No TEAMS profiles found.")
+        return
 
     local_indices = [i for i in range(total_profiles) if i % SIZE == RANK]
-    local_total = len(local_indices)
-    rank_print(f"Assigned {local_total} of {total_profiles} profiles.")
-    if local_total == 0:
-        rank_print("No profiles assigned to this rank.")
+    rank_print(f"Assigned {len(local_indices)} of {total_profiles} profiles.")
 
-    for local_pos, global_idx in enumerate(local_indices, 1):
-        fname = argo_files[global_idx]
-        profile_id = argo_ids[global_idx]
-        rank_print(
-            f"Working on {local_pos}/{local_total} (global {global_idx + 1}/{total_profiles})"
-        )
-        S = ReadNC(os.path.join(dir_argo, fname))
-        stimes = S.JULD.val.data + ref_time_argo
-        depth = S.PRES_ADJUSTED.val * 1.01998
-        temp = S.TEMP_ADJUSTED.val
-        salt = S.PSAL_ADJUSTED.val
-        alon_raw = S.LONGITUDE.val
-        alon = normalize_longitudes(alon_raw, CANONICAL_LON_MODE)
-        alat = S.LATITUDE.val
+    compare_cfg = CONFIG.get("compare", {})
+    location_only = bool(compare_cfg.get("location_only", False))
+    location_only_time = compare_cfg.get("location_only_time")
+    station_ids = compare_cfg.get("station_ids")
+    station_names = compare_cfg.get("station_names")
+    if station_ids is not None:
+        station_ids = set(str(s) for s in station_ids)
+    if station_names is not None:
+        station_names = set(str(s) for s in station_names)
+    if location_only and location_only_time is None:
+        if sch_cfg is not None:
+            location_only_time = float(sch_cfg["mti"][0])
+        elif gm_cfg is not None:
+            location_only_time = float(gm_cfg["times"][0])
+        else:
+            raise RuntimeError("location_only_time is None but no model time is available.")
 
-        for nn, stime in enumerate(stimes):
-            lon_pt = alon[nn]
-            lat_pt = alat[nn]
+    for local_pos, profile_idx in enumerate(local_indices, 1):
+        mask = inv == profile_idx
+        if not np.any(mask):
+            continue
+
+        profile_id = uniq_keys[profile_idx]
+        stime = obs_time[mask][0]
+        lon_pt = float(np.nanmean(lon[mask]))
+        lat_pt = float(np.nanmean(lat[mask]))
+        if station_ids is not None:
+            pid = str(st_id[mask][0])
+            if pid not in station_ids:
+                log_skip("station_id filtered", profile_id, stime, lon_pt, lat_pt)
+                continue
+        if station_names is not None:
+            if st_name is None:
+                log_skip("station_name unavailable", profile_id, stime, lon_pt, lat_pt)
+                continue
+            pname = str(st_name[mask][0])
+            if pname not in station_names:
+                log_skip("station_name filtered", profile_id, stime, lon_pt, lat_pt)
+                continue
+        if not location_only:
             if stime < start_t or stime > end_t:
                 log_skip("outside target window", profile_id, stime, lon_pt, lat_pt)
                 continue
-            if not point_in_region(region, lon_pt, lat_pt):
-                log_skip("outside configured region", profile_id, stime, lon_pt, lat_pt)
-                continue
+        if not point_in_region(region, lon_pt, lat_pt):
+            log_skip("outside configured region", profile_id, stime, lon_pt, lat_pt)
+            continue
 
-            obs_depth = sanitize_masked(depth[nn, :])
-            obs_temp = sanitize_masked(temp[nn, :])
-            obs_salt = sanitize_masked(salt[nn, :])
+        obs_depth = np.asarray(depth[mask], dtype=float)
+        obs_temp = np.asarray(temp[mask], dtype=float)
+        obs_salt = np.asarray(salt[mask], dtype=float)
+        valid = np.isfinite(obs_depth) & np.isfinite(obs_temp) & np.isfinite(obs_salt)
+        if valid.sum() < 4:
+            log_skip("insufficient depth samples", profile_id, stime, lon_pt, lat_pt)
+            continue
 
-            valid = ~isnan(obs_depth)
-            if valid.sum() < 4:
-                log_skip("insufficient depth samples", profile_id, stime, lon_pt, lat_pt)
-                continue
-            obs_depth_clean = obs_depth[valid]
-            obs_temp_clean = obs_temp[valid]
-            obs_salt_clean = obs_salt[valid]
-            if len(obs_depth_clean) == 0:
-                log_skip("no valid observation depths", profile_id, stime, lon_pt, lat_pt)
-                continue
+        obs_depth = obs_depth[valid]
+        obs_temp = obs_temp[valid]
+        obs_salt = obs_salt[valid]
+        order = np.argsort(obs_depth)
+        obs_depth = obs_depth[order]
+        obs_temp = obs_temp[order]
+        obs_salt = obs_salt[order]
 
-            models = []
-            if gm_cfg is not None:
-                gm_profile = extract_global_profile(gm_cfg, stime, lon_pt, lat_pt)
-                if gm_profile is not None:
-                    obs_subset = select_obs_within_model_range(
-                        obs_depth_clean, obs_temp_clean, obs_salt_clean, gm_profile["depth"]
-                    )
-                    if obs_subset is not None:
-                        odi, otpi, osi = obs_subset
-                        temp_stat = compute_model_stats(gm_profile["depth"], gm_profile["temp"], odi, otpi)
-                        salt_stat = compute_model_stats(gm_profile["depth"], gm_profile["salt"], odi, osi)
-                        gm_profile["stats"] = {"temp": temp_stat, "salt": salt_stat}
-                        models.append(gm_profile)
-                    else:
-                        log_skip("global model depth range mismatch", profile_id, stime, lon_pt, lat_pt)
+        stime_model = location_only_time if location_only else stime
+        models = []
+        gm_lon = None
+        gm_lat = None
+        if gm_cfg is not None:
+            gm_profile = extract_global_profile(gm_cfg, stime_model, lon_pt, lat_pt)
+            if gm_profile is not None:
+                gm_lon = gm_profile.get("grid_lon")
+                gm_lat = gm_profile.get("grid_lat")
+                obs_subset = select_obs_within_model_range(
+                    obs_depth, obs_temp, obs_salt, gm_profile["depth"]
+                )
+                if obs_subset is not None:
+                    odi, otpi, osi = obs_subset
+                    temp_stat = compute_model_stats(gm_profile["depth"], gm_profile["temp"], odi, otpi)
+                    salt_stat = compute_model_stats(gm_profile["depth"], gm_profile["salt"], odi, osi)
+                    gm_profile["stats"] = {"temp": temp_stat, "salt": salt_stat}
+                    models.append(gm_profile)
                 else:
-                    log_skip("global model profile missing", profile_id, stime, lon_pt, lat_pt)
-            if sch_cfg is not None:
-                sch_profile = extract_schism_profile(sch_cfg, stime, lon_pt, lat_pt)
-                if sch_profile is not None:
-                    obs_subset = select_obs_within_model_range(
-                        obs_depth_clean, obs_temp_clean, obs_salt_clean, sch_profile["depth"]
-                    )
-                    if obs_subset is not None:
-                        odi, otpi, osi = obs_subset
-                        temp_stat = compute_model_stats(sch_profile["depth"], sch_profile["temp"], odi, otpi)
-                        salt_stat = compute_model_stats(sch_profile["depth"], sch_profile["salt"], odi, osi)
-                        sch_profile["stats"] = {"temp": temp_stat, "salt": salt_stat}
-                        models.append(sch_profile)
-                    else:
-                        log_skip("SCHISM depth range mismatch", profile_id, stime, lon_pt, lat_pt)
+                    log_skip("global model depth range mismatch", profile_id, stime, lon_pt, lat_pt)
+            else:
+                log_skip("global model profile missing", profile_id, stime, lon_pt, lat_pt)
+
+        if sch_cfg is not None:
+            sch_profile = extract_schism_profile(sch_cfg, stime_model, lon_pt, lat_pt)
+            if sch_profile is not None:
+                obs_subset = select_obs_within_model_range(
+                    obs_depth, obs_temp, obs_salt, sch_profile["depth"]
+                )
+                if obs_subset is not None:
+                    odi, otpi, osi = obs_subset
+                    temp_stat = compute_model_stats(sch_profile["depth"], sch_profile["temp"], odi, otpi)
+                    salt_stat = compute_model_stats(sch_profile["depth"], sch_profile["salt"], odi, osi)
+                    sch_profile["stats"] = {"temp": temp_stat, "salt": salt_stat}
+                    models.append(sch_profile)
                 else:
-                    log_skip("SCHISM profile missing", profile_id, stime, lon_pt, lat_pt)
+                    log_skip("SCHISM depth range mismatch", profile_id, stime, lon_pt, lat_pt)
+            else:
+                log_skip("SCHISM profile missing", profile_id, stime, lon_pt, lat_pt)
 
-            if len(models) == 0:
-                log_skip("no models available for comparison", profile_id, stime, lon_pt, lat_pt)
-                continue
+        if len(models) == 0:
+            log_skip("no models available for comparison", profile_id, stime, lon_pt, lat_pt)
+            continue
 
-            # ensure stats dictionary exists even if missing
-            for model in models:
-                model.setdefault("stats", {"temp": None, "salt": None})
+        for model in models:
+            model.setdefault("stats", {"temp": None, "salt": None})
 
-            obs_plot = {
-                "depth": obs_depth_clean,
-                "temp": obs_temp_clean,
-                "salt": obs_salt_clean,
-            }
-            meta = {
-                "lon": lon_pt,
-                "lat": lat_pt,
-                "lon_array": alon,
-                "lat_array": alat,
-                "obs_time": stime,
-                "profile_id": profile_id,
-            }
-            plot_profiles(meta, region, obs_plot, models, CONFIG["plot"], CONFIG["output"]["dir"])
+        obs_plot = {
+            "depth": obs_depth,
+            "temp": obs_temp,
+            "salt": obs_salt,
+        }
+        meta = {
+            "lon": lon_pt,
+            "lat": lat_pt,
+            "lon_array": lon[mask],
+            "lat_array": lat[mask],
+            "obs_time": stime,
+            "profile_id": profile_id,
+            "gm_lon": gm_lon,
+            "gm_lat": gm_lat,
+        }
+        plot_profiles(meta, region, obs_plot, models, CONFIG["plot"], CONFIG["output"]["dir"])
 
     if MPI:
         COMM.Barrier()
