@@ -51,7 +51,7 @@ USER_CONFIG = {
     "enable": True,
 
     # --- Experiment-driven paths ---
-    "exp": "RUN01a",                                # e.g., RUN01a/RUN01b/...
+    "exp": "RUN01d",                                # e.g., RUN01a/RUN01b/...
     "base_run_dir": "/scratch2/08924/kmpark/", # parent dir for runs
     "base_outdir": "./images/",                      # parent dir for images
 
@@ -62,8 +62,8 @@ USER_CONFIG = {
 
     # Range & time
     "start": 1,
-    "end": 117,
-    "refdate": "2022-01-02",
+    "end": 228,
+    "refdate": "2017-01-02",
 
     # Layer & intra-file aggregation
     "layer": -1,              # -1 = surface
@@ -79,6 +79,10 @@ USER_CONFIG = {
     "cbars": "each",          # each, shared, none
     "proj": "PlateCarree",
     "extent": None,           # [xmin xmax ymin ymax]
+    "coastline": True,
+    "bnd": False,
+    "bnd_color": "k",
+    "bnd_lw": 0.6,
 
     # MPI & temporal mean
     "mpi": True,
@@ -168,6 +172,10 @@ def parse_args():
     p.add_argument("--cbars", choices=["each", "shared", "none"])
     p.add_argument("--proj")
     p.add_argument("--extent", nargs=4, type=float)
+    p.add_argument("--no-coastline", action="store_true")
+    p.add_argument("--bnd", action="store_true")
+    p.add_argument("--bnd-color")
+    p.add_argument("--bnd-lw", type=float)
     # Temporal mean
     p.add_argument("--tmean", choices=["none", "hourly", "daily", "monthly"])
     # Reporting
@@ -265,10 +273,13 @@ def make_axes(n_panels, proj, layout):
     ]
     return fig, axes
 
-def format_geoaxes(ax, gd, extent, title_txt=None, data_crs=None):
-    ax.coastlines(resolution="10m", linewidth=0.6)
-    ax.add_feature(cfeature.LAND.with_scale("10m"), facecolor="0.9", zorder=0)
-    ax.add_feature(cfeature.OCEAN.with_scale("10m"), facecolor="0.98", zorder=0)
+def format_geoaxes(ax, gd, extent, title_txt=None, data_crs=None,
+                   show_coastline=True, show_bnd=False,
+                   bnd_color="k", bnd_lw=0.6):
+    if show_coastline:
+        ax.coastlines(resolution="10m", linewidth=0.6)
+        ax.add_feature(cfeature.LAND.with_scale("10m"), facecolor="0.9", zorder=0)
+        ax.add_feature(cfeature.OCEAN.with_scale("10m"), facecolor="0.98", zorder=0)
     gl = ax.gridlines(draw_labels=True, x_inline=False, y_inline=False, linewidth=0.5, alpha=0.4)
     gl.top_labels = False
     gl.right_labels = False
@@ -292,6 +303,11 @@ def format_geoaxes(ax, gd, extent, title_txt=None, data_crs=None):
 
     if title_txt:
         ax.set_title(title_txt, fontsize=9, weight="bold")
+    if show_bnd:
+        try:
+            gd.plot_bnd(ax=ax, color=bnd_color, lw=bnd_lw)
+        except Exception:
+            gd.plot_bnd(ax=ax)
 
 def _merge_config(args):
     ad = vars(args).copy()
@@ -324,6 +340,14 @@ def _merge_config(args):
     ad.setdefault("dpi", 200)
     ad.setdefault("cbars", "each")
     ad.setdefault("proj", "PlateCarree")
+    if ad.get("no_coastline"):
+        ad["coastline"] = False
+    ad.setdefault("coastline", USER_CONFIG.get("coastline", True))
+    if ad.get("bnd"):
+        ad["bnd"] = True
+    ad.setdefault("bnd", USER_CONFIG.get("bnd", False))
+    ad.setdefault("bnd_color", USER_CONFIG.get("bnd_color", "k"))
+    ad.setdefault("bnd_lw", USER_CONFIG.get("bnd_lw", 0.6))
     ad.setdefault("mpi", USER_CONFIG.get("mpi", True))
     ad.setdefault("tmean", USER_CONFIG.get("tmean", "none"))
     ad.setdefault("report_stack_info", USER_CONFIG.get("report_stack_info", False))
@@ -461,7 +485,11 @@ def main():
             for ax, var in zip(axes, vars_to_plot):
                 cfg = VAR_DEFAULTS[var]
                 cmap = _get_cmap(cfg["cmap"]); clim = cfg["clim"]
-                format_geoaxes(ax, gd, args.extent, title_txt=cfg["title"], data_crs=data_crs)
+                format_geoaxes(
+                    ax, gd, args.extent, title_txt=cfg["title"], data_crs=data_crs,
+                    show_coastline=args.coastline, show_bnd=args.bnd,
+                    bnd_color=args.bnd_color, bnd_lw=args.bnd_lw
+                )
 
                 plt.sca(ax)  # ensure drawing on THIS axes
                 m = gd.plot(fmt=1, value=reduced_fields[var], cmap=cmap, clim=clim, cb=False, ax=ax)
@@ -594,7 +622,11 @@ def main():
             for ax, var in zip(axes, vars_to_plot):
                 cfg = VAR_DEFAULTS[var]
                 cmap = _get_cmap(cfg["cmap"]); clim = cfg["clim"]
-                format_geoaxes(ax, gd, None, title_txt=cfg["title"], data_crs=data_crs)
+                format_geoaxes(
+                    ax, gd, None, title_txt=cfg["title"], data_crs=data_crs,
+                    show_coastline=args.coastline, show_bnd=args.bnd,
+                    bnd_color=args.bnd_color, bnd_lw=args.bnd_lw
+                )
 
                 plt.sca(ax)  # ensure drawing on THIS axes
                 m = gd.plot(fmt=1, value=mean_fields[var], cmap=cmap, clim=clim, cb=False, ax=ax)

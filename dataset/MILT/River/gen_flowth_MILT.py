@@ -9,19 +9,14 @@ import numpy as np
 # User config
 # -----------------------------
 milts = [
-	"/Users/kpark/Codes/coastal-ocean-utils/dataset/MILT/River/out_mlit2/station_302041282207100.csv",
-        "/Users/kpark/Codes/coastal-ocean-utils/dataset/MILT/River/out_mlit2/station_302031282207050.csv",
-        "/Users/kpark/Codes/coastal-ocean-utils/dataset/MILT/River/out_mlit2/station_302031282207120.csv",
-        "/Users/kpark/Codes/coastal-ocean-utils/dataset/MILT/River/out_mlit2/station_302021282206050.csv",
-        "/Users/kpark/Codes/coastal-ocean-utils/dataset/MILT/River/out_mlit2/station_302021282224010.csv",
-        "/Users/kpark/Codes/coastal-ocean-utils/dataset/MILT/River/out_mlit2/station_302011282206060.csv",
+    "/S/data00/G6008/d1041/dataset/MILT/River/out_mlit/station_302011282206030.csv",
 ]  # MLIT station CSVs with columns: datetime, value_cms
-st = datenum(2017, 1, 1)  # start time (UTC) for output
-et = datenum(2017, 12, 31)  # end time (UTC) for output
+st = datenum(2011, 1, 1)  # start time (UTC) for output
+et = datenum(2011, 12, 31)  # end time (UTC) for output
 sname = "flux_MILT.th"  # output file name
-dt = 3600  # time step of flux.th (seconds)
+dt = 900  # time step of flux.th (seconds)
 pt = 1  # quick plot check: 1=on
-lwp = 0
+lwp = 1
 cutfreq = 13  # low-pass cutoff (hours)
 
 tz = "Asia/Tokyo"  # set to None if datetimes are already in UTC

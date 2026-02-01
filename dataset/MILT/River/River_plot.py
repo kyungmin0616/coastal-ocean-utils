@@ -1,15 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-plot.py
+River_plot.py
 
 Quick plotting utility for MLIT river station CSVs (station_*.csv).
 Reads station files and renders discharge time series with optional
 time windows and labeling modes.
 
 Usage examples:
-  python plot.py --in-dir ./data --out ./figs --label station_id
-  python plot.py --in-dir ./data --station 303051 --start 2021-01-01 --end 2021-12-31
+  # One figure per river group (needs master CSV with river_group)
+  python River_plot.py --in-dir ./data --mode group --master_csv ./stations.csv --out ./figs
+
+  # One figure per station
+  python River_plot.py --in-dir ./data --mode station --out ./figs
+
+  # Filter to specific stations
+  python River_plot.py --in-dir ./data --mode station --station-list 303051,303052 --out ./figs
+
+  # Time window and label with station name
+  python River_plot.py --in-dir ./data --mode station --start 2021-01-01 --end 2021-12-31 \
+      --label station_id_name --out ./figs
+
+Flags summary:
+  --in-dir         Directory containing station_*.csv files.
+  --mode           group (one plot per river_group) or station (one plot per station).
+  --master_csv     Master station list CSV (required for group mode).
+  --start/--end     Optional time window (YYYY-MM-DD).
+  --save-dir/--out  Output directory for figures.
+  --fmt            png|pdf|svg (default: png).
+  --label           station_id or station_id_name.
+  --station-list   Comma-separated station IDs to plot (e.g., 303051,303052).
+  --mask-threshold Mask values <= this as missing (default: -9999).
+  --ymin/--ymax     Optional y-axis limits.
 Notes:
   - Missing values <= -9999 are masked to NaN.
   - Date parsing uses pandas; provide ISO timestamps for best results.
@@ -33,6 +55,13 @@ def parse_date(s: str | None) -> pd.Timestamp | None:
     if not s:
         return None
     return pd.to_datetime(s, errors="raise")
+
+
+def parse_station_list(s: str | None) -> set[str] | None:
+    if not s:
+        return None
+    items = [x.strip() for x in s.split(",") if x.strip()]
+    return set(items) if items else None
 
 
 def load_master_csv(master_csv: str) -> pd.DataFrame:
@@ -139,7 +168,8 @@ def setup_time_axis(ax):
 # Plotting
 # -----------------------------
 def plot_group(in_dir: str, master: pd.DataFrame, start, end, save_dir: str, fmt: str,
-               label_mode: str, mask_threshold: float, ymin=None, ymax=None):
+               label_mode: str, mask_threshold: float, ymin=None, ymax=None,
+               station_ids: set[str] | None = None):
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
     # map station_id -> metadata
@@ -148,6 +178,11 @@ def plot_group(in_dir: str, master: pd.DataFrame, start, end, save_dir: str, fmt
     station_paths = sorted(glob.glob(os.path.join(in_dir, "station_*.csv")))
     if not station_paths:
         raise FileNotFoundError(f"No station_*.csv found in {in_dir}")
+    if station_ids:
+        station_paths = [
+            p for p in station_paths
+            if Path(p).stem.replace("station_", "") in station_ids
+        ]
 
     # group by river_group using master csv metadata
     groups: dict[str, list[str]] = {}
@@ -199,12 +234,18 @@ def plot_group(in_dir: str, master: pd.DataFrame, start, end, save_dir: str, fmt
 
 
 def plot_station(in_dir: str, start, end, save_dir: str, fmt: str,
-                 label_mode: str, mask_threshold: float, ymin=None, ymax=None):
+                 label_mode: str, mask_threshold: float, ymin=None, ymax=None,
+                 station_ids: set[str] | None = None):
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
     station_paths = sorted(glob.glob(os.path.join(in_dir, "station_*.csv")))
     if not station_paths:
         raise FileNotFoundError(f"No station_*.csv found in {in_dir}")
+    if station_ids:
+        station_paths = [
+            p for p in station_paths
+            if Path(p).stem.replace("station_", "") in station_ids
+        ]
 
     for p in station_paths:
         df, dt_col, q_col = load_one_station_csv(p)
@@ -262,11 +303,14 @@ def main():
                     help="Mask values <= this threshold as missing (default masks -10000 etc.)")
     ap.add_argument("--ymin", type=float, default=None, help="Optional y-axis min")
     ap.add_argument("--ymax", type=float, default=None, help="Optional y-axis max")
+    ap.add_argument("--station-list", default=None,
+                    help="Comma-separated station IDs to plot (e.g., 303051,303052)")
 
     args = ap.parse_args()
 
     start = parse_date(args.start)
     end = parse_date(args.end)
+    station_ids = parse_station_list(args.station_list)
 
     if args.mode == "group":
         if not args.master_csv:
@@ -283,6 +327,7 @@ def main():
             mask_threshold=args.mask_threshold,
             ymin=args.ymin,
             ymax=args.ymax,
+            station_ids=station_ids,
         )
     else:
         plot_station(
@@ -295,6 +340,7 @@ def main():
             mask_threshold=args.mask_threshold,
             ymin=args.ymin,
             ymax=args.ymax,
+            station_ids=station_ids,
         )
 
 
