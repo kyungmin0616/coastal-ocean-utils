@@ -43,7 +43,7 @@ except Exception:  # pragma: no cover - optional plotting
 
 
 CONFIG = {  # Edit this block to change defaults.
-    'BASE_DIR': '/Users/kpark/Codes/D26-017-selected/SendaiBayData/D1',
+    'BASE_DIR': './data/SendaiBayData/D1',
     'PLOT_DIR': './SendaiD1Plots/',
     'PLOT_VARS': ['temp', 'sal'],
     'SAVE_VARS': ['temp', 'sal', 'depth'],
@@ -117,15 +117,56 @@ def _to_float(val):
 
 
 def _parse_excel_datetime(date_val, frac_val=None):
-    base = _to_float(date_val)
-    if base is None:
+    if date_val is None:
         return None
+    if isinstance(date_val, datetime):
+        base_dt = date_val
+    else:
+        s = _cell_str(date_val)
+        base_dt = None
+        if s:
+            for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M"):
+                try:
+                    base_dt = datetime.strptime(s, fmt)
+                    break
+                except Exception:
+                    continue
+        if base_dt is None:
+            base = _to_float(date_val)
+            if base is None:
+                return None
+            if base < 1000:
+                return None
+            if 10000 < base < 60000:
+                base_dt = datetime(1899, 12, 30) + timedelta(days=base)
+            elif 19000101 <= base <= 21000101:
+                try:
+                    base_dt = datetime.strptime(str(int(base)), "%Y%m%d")
+                except Exception:
+                    base_dt = None
+            elif 1900 <= base <= 2100:
+                base_dt = datetime(int(base), 1, 1)
+            else:
+                base_dt = datetime(1899, 12, 30) + timedelta(days=base)
+        if base_dt is None:
+            return None
+
     if frac_val is not None:
-        frac = _to_float(frac_val)
-        if frac is not None and 0 <= frac < 1.0:
-            base = base + frac
-    base_dt = datetime(1899, 12, 30)
-    return base_dt + timedelta(days=base)
+        if isinstance(frac_val, datetime):
+            base_dt = base_dt.replace(hour=frac_val.hour, minute=frac_val.minute, second=frac_val.second)
+        else:
+            s2 = _cell_str(frac_val)
+            if s2 and ":" in s2:
+                parts = [int(p) for p in s2.split(":") if p]
+                while len(parts) < 3:
+                    parts.append(0)
+                base_dt = base_dt.replace(hour=parts[0], minute=parts[1], second=parts[2])
+            else:
+                frac = _to_float(frac_val)
+                if frac is not None and 0 <= frac < 1.0:
+                    base_dt = base_dt + timedelta(days=frac)
+
+    return base_dt
 
 
 def _wrap_lon(lon, wrap_360):
@@ -673,7 +714,10 @@ def save_npz(records, out_path, save_vars):
     payload = {
         'time': np.array(time_utc, dtype='datetime64[s]'),
         'time_local': np.array(time_local, dtype='datetime64[s]'),
-        'station_id': np.array([r.get('station_id', '') for r in records], dtype='U'),
+        'station_id': np.array([
+            _station_label(r.get('dataset', ''), r.get('station_id', ''), 'dataset_station')
+            for r in records
+        ], dtype='U'),
         'lat': np.array([np.nan if r.get('lat') is None else r.get('lat') for r in records], dtype=float),
         'lon': np.array([np.nan if r.get('lon') is None else r.get('lon') for r in records], dtype=float),
         'layer': np.array([r.get('layer', '') for r in records], dtype='U'),

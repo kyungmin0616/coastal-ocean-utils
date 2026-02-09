@@ -13,9 +13,9 @@ except Exception:  # pragma: no cover
 
 
 CONFIG = {
-    "GRID_PATH": "/Users/kpark/Codes/D26-017-selected/hgrid.gr3",
-    "STATION_BP": "/Users/kpark/Codes/D26-017-selected/station_onagawa_d1.in",
-    "OUT_PNG": "/Users/kpark/Codes/D26-017-selected/plots_obs/station_map.png",
+    "GRID_PATH": "/Users/kpark/Documents/Projects/Active/AIMEC_TohokuCoast/01_Data/01.gr3",
+    "STATION_BP": "/Users/kpark/Documents/Codes/coastal-ocean-utils/schism/post-proc/TEAMS/station_onagawa_d3.in",
+    "OUT_PNG": "/Users/kpark/Documents/Projects/Active/AIMEC_TohokuCoast/01_Data/station_map.png",
     "FIGSIZE": (7, 7),
     "MARKER": "r*",
     "MARKER_SIZE": 7,

@@ -39,14 +39,15 @@ CONFIG = {
         "canonical": "180",  # use "180" for [-180, 180], "360" for [0, 360)
     },
     "date_range": {
-        "start": (2017, 1, 1),
-        "end": (2019, 12, 31),
+        "start": (2017, 4, 1),
+        "end": (2017, 12, 31),
     },
     "compare": {
-        "location_only": True,  # True: ignore observation time and use a fixed SCHISM time
+        "location_only": None,  # True: ignore observation time and use a fixed SCHISM time
         "location_only_time": None,  # datenum or None to use first SCHISM time
-        "station_ids": ["4", "5","6", "7","8"],  # list of station_id strings to include, or None for all
+        "station_ids": None, # ["4", "5","6", "7","8"],  # list of station_id strings to include, or None for all
         "station_names": None,  # list of station_name strings to include, or None for all
+        "match_month_day": True,  # True: ignore year, match month/day across model times
     },
     "region": {
         "shapefile": "SO_bnd.shp",  # set to None to skip shapefile filtering
@@ -54,7 +55,7 @@ CONFIG = {
         "subset_bbox": None, #(141.48767,141.56841,38.41906,38.43688),  # (lon_min, lon_max, lat_min, lat_max)
     },
     "teams": {
-        "npz_path": "/S/data00/G6008/d1041/Projects/SendaiOnagawa/post-proc/npz/onagawa_d2_ctd.npz",
+        "npz_path": "/scratch2/08924/kmpark/post-proc/npz/onagawa_d1_ctd.npz",
         "lon_name": "lon",
         "lat_name": "lat",
         "time_name": "time",
@@ -64,22 +65,37 @@ CONFIG = {
         "station_id_name": "station_id",
         "station_name_name": "station_name",
     },
-    "schism": {
+
+    "schism": [
+        {
         "enabled": True,
-        "label": "SCHISM",
-        "color": "b",
-        "run_dir": "/S/data00/G6008/d1041/Projects/SendaiOnagawa/run/RUN01a",
+        "label": "RUN01e",
+        "color": "g",
+        "run_dir": "/scratch2/08924/kmpark/RUN01e",
         "variables": ["temp", "salt"],
-        "refdate": datenum("2017-4-1"),
-        "stack_range": (1, 118),
+        "refdate": datenum("2017-1-2"),
+        "stack_range": (1, 220),
         "stack_step": 1 / 24,
         "lon_mode": "180",  # set to "360" if SCHISM output uses 0-360 longitudes
-    },
+        },
+        {
+        "enabled": True,
+        "label": "RUN01d",
+        "color": "b",
+        "run_dir": "/scratch2/08924/kmpark/RUN01d",
+        "variables": ["temp", "salt"],
+        "refdate": datenum("2017-1-2"),
+        "stack_range": (1, 220),
+        "stack_step": 1 / 24,
+        "lon_mode": "180",  # set to "360" if SCHISM output uses 0-360 longitudes
+        },
+    ],
+
     "global_model": {
         "enabled": True,  # set True to compare against a global model
         "label": "CMEMS",
         "color": "k",
-        "data_dir": "/S/data00/G6008/d1041/dataset/CMEMS/daily/Japan",
+        "data_dir": "/scratch2/08924/kmpark/CMEMS/Japan",
         "file_suffix": ".nc",
         "variables": {
             "lon": "longitude",
@@ -93,7 +109,7 @@ CONFIG = {
         "search_radius": 1,  # grid cells to search for nearest wet point if target is all-NaN
     },
     "output": {
-        "dir": "./SCHISMvsCMEMSvsTEAMS",
+        "dir": "./CompTEAMS_RUN01bd_d1",
     },
     "plot": {
         "linewidth": 1.5,
@@ -247,6 +263,7 @@ def prepare_global_model(cfg, start, end):
     cfg.update({
         "files": files[sind],
         "times": mti[sind],
+        "month_day": _month_day_array(mti[sind]),
         "cache_index": None,
         "cache_ds": None,
         "cache_meta": None,
@@ -440,6 +457,13 @@ def extract_global_profile(cfg, stime, lon, lat):
     }
 
 def prepare_schism(cfg):
+    if isinstance(cfg, (list, tuple)):
+        out = []
+        for item in cfg:
+            prepared = prepare_schism(item)
+            if prepared is not None:
+                out.append(prepared)
+        return out
     if not cfg.get("enabled", False):
         return None
     cfg = cfg.copy()
@@ -448,6 +472,7 @@ def prepare_schism(cfg):
     stacks = arange(stack_start, stack_end + stack_step, stack_step)
     cfg["stacks"] = stacks
     cfg["mti"] = stacks - 1 + cfg["refdate"]
+    cfg["month_day"] = _month_day_array(cfg["mti"])
     return cfg
 
 
@@ -679,10 +704,29 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
 
 
 def build_profile_groups(station_ids, times):
-    time_str = times.astype("datetime64[s]").astype(str)
-    keys = np.char.add(station_ids.astype(str), "|" + time_str)
+    station_ids = np.asarray(station_ids).astype("U").ravel()
+    time_str = np.asarray(times).astype("datetime64[s]").astype("U").ravel()
+    if station_ids.shape != time_str.shape:
+        raise ValueError(f"station_ids/time mismatch: {station_ids.shape} vs {time_str.shape}")
+    keys = np.char.add(station_ids, np.char.add("|", time_str))
     uniq_keys, inv = np.unique(keys, return_inverse=True)
     return uniq_keys, inv, time_str
+
+
+
+def _month_day_array(times):
+    return np.array([(num2date(t).month, num2date(t).day) for t in times], dtype=int)
+
+
+def _pick_time_same_month_day(stime, times, month_day):
+    if times is None or len(times) == 0:
+        return stime
+    obs = num2date(stime)
+    mask = (month_day[:, 0] == obs.month) & (month_day[:, 1] == obs.day)
+    if not np.any(mask):
+        return float(times[abs(times - stime).argmin()])
+    cand = times[mask]
+    return float(cand[abs(cand - stime).argmin()])
 
 
 def main():
@@ -690,7 +734,8 @@ def main():
     region = setup_region(CONFIG["region"])
     sch_cfg = prepare_schism(CONFIG["schism"])
     gm_cfg = prepare_global_model(CONFIG["global_model"], start_t, end_t)
-    active_models = [cfg for cfg in (gm_cfg, sch_cfg) if cfg is not None]
+    sch_list = sch_cfg if isinstance(sch_cfg, list) else ([sch_cfg] if sch_cfg is not None else [])
+    active_models = [cfg for cfg in ([gm_cfg] + sch_list) if cfg is not None]
     if len(active_models) == 0:
         rank_print("No models selected for comparison. Enable at least one model in CONFIG.")
         return
@@ -731,13 +776,14 @@ def main():
     location_only_time = compare_cfg.get("location_only_time")
     station_ids = compare_cfg.get("station_ids")
     station_names = compare_cfg.get("station_names")
+    match_month_day = bool(compare_cfg.get("match_month_day", False))
     if station_ids is not None:
         station_ids = set(str(s) for s in station_ids)
     if station_names is not None:
         station_names = set(str(s) for s in station_names)
     if location_only and location_only_time is None:
-        if sch_cfg is not None:
-            location_only_time = float(sch_cfg["mti"][0])
+        if sch_list:
+            location_only_time = float(sch_list[0]["mti"][0])
         elif gm_cfg is not None:
             location_only_time = float(gm_cfg["times"][0])
         else:
@@ -789,11 +835,16 @@ def main():
         obs_temp = obs_temp[order]
         obs_salt = obs_salt[order]
 
-        stime_model = location_only_time if location_only else stime
         models = []
         gm_lon = None
         gm_lat = None
         if gm_cfg is not None:
+            if location_only:
+                stime_model = location_only_time
+            elif match_month_day:
+                stime_model = _pick_time_same_month_day(stime, gm_cfg["times"], gm_cfg.get("month_day"))
+            else:
+                stime_model = stime
             gm_profile = extract_global_profile(gm_cfg, stime_model, lon_pt, lat_pt)
             if gm_profile is not None:
                 gm_lon = gm_profile.get("grid_lon")
@@ -812,8 +863,14 @@ def main():
             else:
                 log_skip("global model profile missing", profile_id, stime, lon_pt, lat_pt)
 
-        if sch_cfg is not None:
-            sch_profile = extract_schism_profile(sch_cfg, stime_model, lon_pt, lat_pt)
+        for sch_item in sch_list:
+            if location_only:
+                stime_model = location_only_time
+            elif match_month_day:
+                stime_model = _pick_time_same_month_day(stime, sch_item["mti"], sch_item.get("month_day"))
+            else:
+                stime_model = stime
+            sch_profile = extract_schism_profile(sch_item, stime_model, lon_pt, lat_pt)
             if sch_profile is not None:
                 obs_subset = select_obs_within_model_range(
                     obs_depth, obs_temp, obs_salt, sch_profile["depth"]
@@ -862,3 +919,4 @@ def main():
 if __name__ == "__main__":
     main()
     sys.exit()
+

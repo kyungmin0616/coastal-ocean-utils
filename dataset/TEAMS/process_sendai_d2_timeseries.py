@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover - optional plotting
 
 
 CONFIG = {  # Edit this block to change defaults.
-    'BASE_DIR': '/Users/kpark/Codes/D26-017-selected/SendaiBayData/D2',
+    'BASE_DIR': './data/SendaiBayData/D2',
     'PLOT_DIR': './SendaiD2Plots/',
     'PLOT_VARS': ['temp', 'sal'],
     'SAVE_VARS': ['temp', 'sal', 'cond', 'ec25', 'depth', 'battery'],
@@ -619,7 +619,8 @@ def save_npz(records, out_path, save_vars):
     payload = {
         'time': np.array(time_utc, dtype='datetime64[s]'),
         'time_local': np.array(time_local, dtype='datetime64[s]'),
-        'station_id': np.array([r.get('station_id', '') for r in records], dtype='U'),
+        'station_id': np.array([_station_label(r.get('dataset', ''), r.get('station_id', ''), 'dataset_station')
+                               for r in records], dtype='U'),
         'lat': np.array([np.nan if r.get('lat') is None else r.get('lat') for r in records], dtype=float),
         'lon': np.array([np.nan if r.get('lon') is None else r.get('lon') for r in records], dtype=float),
         'dataset': np.array([r.get('dataset', '') for r in records], dtype='U'),
