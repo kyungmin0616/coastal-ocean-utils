@@ -1,0 +1,9 @@
+{
+  "experiment_id": "RUN03",
+  "is_baseline": 0,
+  "baseline_id": "RUN00",
+  "grid": "fine",
+  "bathy": "highres",
+  "forcing": "ERA5",
+  "river": "observed"
+}

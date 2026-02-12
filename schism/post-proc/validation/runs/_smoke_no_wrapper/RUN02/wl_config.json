@@ -1,0 +1,17 @@
+{
+  "runs": [],
+  "tags": [
+    "RUN02"
+  ],
+  "bpfile": "/Users/kpark/Documents/Codes/coastal-ocean-utils/schism/post-proc/station_jodc.bp",
+  "outdir": "/Users/kpark/Documents/Codes/coastal-ocean-utils/schism/post-proc/validation/runs/_smoke_no_wrapper/RUN02/wl",
+  "obs_path": "/Users/kpark/Documents/Codes/coastal-ocean-utils/schism/post-proc/npz/jodc_tide_all.npz",
+  "start": "2022-01-14 00:00:00",
+  "end": "2022-03-30 00:00:00",
+  "model_start": "2022-01-02 00:00:00",
+  "resample_obs": "h",
+  "resample_model": "h",
+  "demean": true,
+  "save_plots": true,
+  "progress_every": 20
+}

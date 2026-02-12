@@ -3,8 +3,13 @@
 Compare SCHISM profiles against TEAMS CTD observations stored in NPZ.
 """
 
+import argparse
+import copy
+import csv
+import json
 import os
 import sys
+import time
 from pylib import *
 import numpy as np
 
@@ -110,6 +115,19 @@ CONFIG = {
     },
     "output": {
         "dir": "./CompTEAMS_RUN01bd_d1",
+        "task_name": "ctd",
+        "experiment_id": None,
+        "write_task_metrics": True,
+        "write_scatter_plots": True,
+        "save_profile_plots": True,
+        "metrics_raw_name": "CTD_metrics_raw.csv",
+        "metrics_station_name": "CTD_stats.csv",
+        "metrics_model_name": "CTD_stats_by_model.csv",
+        "manifest_name": "CTD_manifest.json",
+        "scatter_alpha": 0.7,
+        "scatter_size": 9,
+        "scatter_cmap": "jet_r",
+        "scatter_depth_max": None,
     },
     "plot": {
         "linewidth": 1.5,
@@ -133,6 +151,75 @@ rc("axes", labelsize=MEDIUM_SIZE)
 rc("figure", titlesize=BIGGER_SIZE)
 
 CANONICAL_LON_MODE = CONFIG["coordinates"].get("canonical", "180")
+
+
+def _deep_update(base, override):
+    out = copy.deepcopy(base)
+    for key, val in override.items():
+        if isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_update(out[key], val)
+        else:
+            out[key] = copy.deepcopy(val)
+    return out
+
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Compare SCHISM profiles against TEAMS CTD observations.",
+    )
+    p.add_argument("--config", help="Optional JSON config overrides.")
+    p.add_argument("--output-dir", help="Override CONFIG['output']['dir'].")
+    p.add_argument("--experiment-id", help="Experiment ID written to output metrics.")
+    p.add_argument("--teams-npz", help="Override TEAMS NPZ path.")
+    p.add_argument("--disable-profile-plots", action="store_true", help="Skip profile/map plot generation.")
+    p.add_argument("--disable-scatter", action="store_true", help="Skip integrated scatter plots.")
+    p.add_argument("--disable-metrics", action="store_true", help="Skip writing standardized task metrics.")
+    p.add_argument("--start-date", help="Override date_range.start as YYYY-MM-DD.")
+    p.add_argument("--end-date", help="Override date_range.end as YYYY-MM-DD.")
+    return p.parse_args(argv)
+
+
+def _parse_ymd(text):
+    y, m, d = [int(x) for x in str(text).strip().split("-")]
+    return [y, m, d]
+
+
+def _apply_runtime_overrides(args):
+    global CONFIG, CANONICAL_LON_MODE
+
+    cfg = copy.deepcopy(CONFIG)
+    if args.config:
+        with open(args.config, "r", encoding="utf-8") as f:
+            user_cfg = json.load(f)
+        cfg = _deep_update(cfg, user_cfg)
+
+    if args.output_dir:
+        cfg.setdefault("output", {})
+        cfg["output"]["dir"] = args.output_dir
+    if args.experiment_id:
+        cfg.setdefault("output", {})
+        cfg["output"]["experiment_id"] = args.experiment_id
+    if args.teams_npz:
+        cfg.setdefault("teams", {})
+        cfg["teams"]["npz_path"] = args.teams_npz
+    if args.disable_profile_plots:
+        cfg.setdefault("output", {})
+        cfg["output"]["save_profile_plots"] = False
+    if args.disable_scatter:
+        cfg.setdefault("output", {})
+        cfg["output"]["write_scatter_plots"] = False
+    if args.disable_metrics:
+        cfg.setdefault("output", {})
+        cfg["output"]["write_task_metrics"] = False
+    if args.start_date:
+        cfg.setdefault("date_range", {})
+        cfg["date_range"]["start"] = _parse_ymd(args.start_date)
+    if args.end_date:
+        cfg.setdefault("date_range", {})
+        cfg["date_range"]["end"] = _parse_ymd(args.end_date)
+
+    CONFIG = cfg
+    CANONICAL_LON_MODE = CONFIG["coordinates"].get("canonical", "180")
 
 
 def normalize_longitudes(lon, mode):
@@ -235,15 +322,78 @@ def select_obs_within_model_range(obs_depth, obs_temp, obs_salt, model_depth):
 
 
 def compute_model_stats(model_depth, model_values, obs_depth, obs_values):
+    pairs = interpolate_model_to_obs(model_depth, model_values, obs_depth, obs_values)
+    if pairs is None:
+        return None
+    return pairs["stat"]
+
+
+def compute_basic_metrics(obs, mod):
+    obs = np.asarray(obs, dtype=float)
+    mod = np.asarray(mod, dtype=float)
+    valid = np.isfinite(obs) & np.isfinite(mod)
+    if valid.sum() < 2:
+        return {
+            "n": int(valid.sum()),
+            "bias": np.nan,
+            "rmse": np.nan,
+            "corr": np.nan,
+            "obs_std": np.nan,
+            "mod_std": np.nan,
+            "nrmse_std": np.nan,
+            "wss": np.nan,
+            "crmsd": np.nan,
+        }
+    obs = obs[valid]
+    mod = mod[valid]
+    diff = mod - obs
+    n = int(len(obs))
+    bias = float(np.mean(diff))
+    rmse = float(np.sqrt(np.mean(diff**2)))
+    obs_std = float(np.std(obs))
+    mod_std = float(np.std(mod))
+    corr = float(np.corrcoef(obs, mod)[0, 1]) if n > 1 else np.nan
+    nrmse = float(rmse / obs_std) if obs_std > 0 else np.nan
+    obs_mean = float(np.mean(obs))
+    denom = np.sum((np.abs(mod - obs_mean) + np.abs(obs - obs_mean)) ** 2)
+    wss = float(1.0 - np.sum((mod - obs) ** 2) / denom) if denom > 0 else np.nan
+    obs_anom = obs - obs_mean
+    mod_anom = mod - float(np.mean(mod))
+    crmsd = float(np.sqrt(np.mean((mod_anom - obs_anom) ** 2)))
+    return {
+        "n": n,
+        "bias": bias,
+        "rmse": rmse,
+        "corr": corr,
+        "obs_std": obs_std,
+        "mod_std": mod_std,
+        "nrmse_std": nrmse,
+        "wss": wss,
+        "crmsd": crmsd,
+    }
+
+
+def interpolate_model_to_obs(model_depth, model_values, obs_depth, obs_values):
     model_depth, model_values = drop_nan_pairs(model_depth, model_values)
+    obs_depth = np.asarray(obs_depth, dtype=float)
+    obs_values = np.asarray(obs_values, dtype=float)
     if len(model_depth) < 2 or len(obs_depth) < 2:
         return None
     interp_fn = interpolate.interp1d(model_depth, model_values, bounds_error=False, fill_value=NaN)
     model_interp = interp_fn(obs_depth)
-    valid = (~isnan(model_interp)) & (~isnan(obs_values))
+    valid = np.isfinite(model_interp) & np.isfinite(obs_values) & np.isfinite(obs_depth)
     if valid.sum() < 2:
         return None
-    return get_stat(model_interp[valid], obs_values[valid])
+    obs_valid = obs_values[valid]
+    mod_valid = model_interp[valid]
+    dep_valid = obs_depth[valid]
+    return {
+        "obs": obs_valid,
+        "mod": mod_valid,
+        "depth": dep_valid,
+        "stat": get_stat(mod_valid, obs_valid),
+        "metrics": compute_basic_metrics(obs_valid, mod_valid),
+    }
 
 
 def prepare_global_model(cfg, start, end):
@@ -729,9 +879,291 @@ def _pick_time_same_month_day(stime, times, month_day):
     return float(cand[abs(cand - stime).argmin()])
 
 
+def _sanitize_name(text):
+    keep = []
+    for ch in str(text):
+        if ch.isalnum() or ch in {"_", "-", "."}:
+            keep.append(ch)
+        else:
+            keep.append("_")
+    out = "".join(keep).strip("_")
+    return out or "model"
+
+
+def _write_csv_rows(path, rows, fieldnames):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _aggregate_metric_rows(pair_rows):
+    station_groups = {}
+    model_groups = {}
+    for row in pair_rows:
+        s_key = (
+            str(row.get("model", "")),
+            str(row.get("var", "")),
+            str(row.get("station_id", "")),
+            str(row.get("station_name", "")),
+        )
+        m_key = (
+            str(row.get("model", "")),
+            str(row.get("var", "")),
+        )
+        station_groups.setdefault(s_key, {"obs": [], "mod": []})
+        model_groups.setdefault(m_key, {"obs": [], "mod": []})
+        station_groups[s_key]["obs"].append(float(row.get("obs", np.nan)))
+        station_groups[s_key]["mod"].append(float(row.get("model_value", np.nan)))
+        model_groups[m_key]["obs"].append(float(row.get("obs", np.nan)))
+        model_groups[m_key]["mod"].append(float(row.get("model_value", np.nan)))
+
+    station_rows = []
+    for (model, var, station_id, station_name), vals in sorted(station_groups.items()):
+        metrics = compute_basic_metrics(vals["obs"], vals["mod"])
+        station_rows.append(
+            {
+                "model": model,
+                "task": "ctd",
+                "var": var,
+                "station_id": station_id,
+                "station_id_full": station_id,
+                "station_name": station_name,
+                "n": metrics["n"],
+                "bias": metrics["bias"],
+                "rmse": metrics["rmse"],
+                "corr": metrics["corr"],
+                "obs_std": metrics["obs_std"],
+                "mod_std": metrics["mod_std"],
+                "nrmse_std": metrics["nrmse_std"],
+                "wss": metrics["wss"],
+                "crmsd": metrics["crmsd"],
+            }
+        )
+
+    model_rows = []
+    for (model, var), vals in sorted(model_groups.items()):
+        metrics = compute_basic_metrics(vals["obs"], vals["mod"])
+        model_rows.append(
+            {
+                "model": model,
+                "task": "ctd",
+                "var": var,
+                "n": metrics["n"],
+                "bias": metrics["bias"],
+                "rmse": metrics["rmse"],
+                "corr": metrics["corr"],
+                "obs_std": metrics["obs_std"],
+                "mod_std": metrics["mod_std"],
+                "nrmse_std": metrics["nrmse_std"],
+                "wss": metrics["wss"],
+                "crmsd": metrics["crmsd"],
+            }
+        )
+    return station_rows, model_rows
+
+
+def _write_depth_scatter(pair_rows, output_cfg):
+    outdir = output_cfg["dir"]
+    by_model = {}
+    for row in pair_rows:
+        by_model.setdefault(str(row.get("model", "")), []).append(row)
+
+    written = []
+    for model_name, rows in sorted(by_model.items()):
+        model_depth = np.asarray([float(r.get("depth", np.nan)) for r in rows], dtype=float)
+        model_depth = np.abs(model_depth[np.isfinite(model_depth)])
+        if model_depth.size == 0:
+            continue
+
+        depth_max_cfg = output_cfg.get("scatter_depth_max")
+        if depth_max_cfg is None:
+            depth_max = float(np.nanmax(model_depth))
+        else:
+            depth_max = float(depth_max_cfg)
+        if not np.isfinite(depth_max) or depth_max <= 0:
+            depth_max = float(np.nanmax(model_depth))
+        depth_max = max(depth_max, 1e-6)
+
+        fig, axs = subplots(1, 2, figsize=(10.5, 4.5))
+        vars_info = [
+            ("temp", "Temperature", r"$^\circ$C"),
+            ("salt", "Salinity", "PSU"),
+        ]
+        mappable = None
+        for ax, (var, title_txt, unit_txt) in zip(axs, vars_info):
+            sub = [r for r in rows if str(r.get("var", "")) == var]
+            if len(sub) == 0:
+                ax.text(0.5, 0.5, f"No {var} pairs", ha="center", va="center", transform=ax.transAxes)
+                ax.set_axis_off()
+                continue
+            x = np.asarray([float(r.get("model_value", np.nan)) for r in sub], dtype=float)
+            y = np.asarray([float(r.get("obs", np.nan)) for r in sub], dtype=float)
+            c = np.abs(np.asarray([float(r.get("depth", np.nan)) for r in sub], dtype=float))
+            valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(c)
+            if valid.sum() < 2:
+                ax.text(0.5, 0.5, f"Not enough {var} pairs", ha="center", va="center", transform=ax.transAxes)
+                ax.set_axis_off()
+                continue
+            x = x[valid]
+            y = y[valid]
+            c = c[valid]
+            c = np.clip(c, 0.0, depth_max)
+            mappable = ax.scatter(
+                x,
+                y,
+                c=c,
+                s=float(output_cfg.get("scatter_size", 9)),
+                alpha=float(output_cfg.get("scatter_alpha", 0.7)),
+                cmap=str(output_cfg.get("scatter_cmap", "jet_r")),
+                vmin=0.0,
+                vmax=depth_max,
+                edgecolors="none",
+            )
+            vmin = float(np.nanmin(np.r_[x, y]))
+            vmax = float(np.nanmax(np.r_[x, y]))
+            if not np.isfinite(vmin) or not np.isfinite(vmax):
+                vmin, vmax = 0.0, 1.0
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+            pad = 0.03 * (vmax - vmin)
+            lo = vmin - pad
+            hi = vmax + pad
+            ax.plot([lo, hi], [lo, hi], "k", lw=1.7)
+            ax.set_xlim(lo, hi)
+            ax.set_ylim(lo, hi)
+            ax.set_xlabel(f"Model ({unit_txt})")
+            ax.set_ylabel(f"Observation ({unit_txt})")
+            ax.set_title(title_txt)
+            ax.grid(True, alpha=0.3)
+
+            metrics = compute_basic_metrics(y, x)
+            ax.text(
+                0.03,
+                0.96,
+                f"ME: {metrics['bias']:.2f} {unit_txt}\nRMSE: {metrics['rmse']:.2f} {unit_txt}",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+            )
+
+        if mappable is not None:
+            cbar = fig.colorbar(mappable, ax=axs, orientation="horizontal", fraction=0.08, pad=0.14)
+            cbar.set_label("Water depth (m)")
+
+        fig.suptitle(f"{model_name}: model vs observation", fontsize=11)
+        fig.tight_layout(rect=[0, 0.06, 1, 0.95])
+        fp = os.path.join(outdir, f"{_sanitize_name(model_name)}_scatter_depth.png")
+        savefig(fp, dpi=350, bbox_inches="tight")
+        close(fig)
+        written.append(fp)
+    return written
+
+
+def _write_task_outputs(pair_rows, output_cfg, run_summary):
+    if len(pair_rows) == 0:
+        payload = {
+            "raw_file": None,
+            "station_file": None,
+            "model_file": None,
+            "scatter_files": [],
+        }
+        manifest_file = os.path.join(output_cfg["dir"], output_cfg.get("manifest_name", "CTD_manifest.json"))
+        with open(manifest_file, "w", encoding="utf-8") as f:
+            json.dump({"summary": run_summary, **payload, "raw_rows": 0, "station_rows": 0, "model_rows": 0}, f, indent=2)
+        return payload
+
+    outdir = output_cfg["dir"]
+    do_metrics = bool(output_cfg.get("write_task_metrics", True))
+    raw_file = None
+    station_file = None
+    model_file = None
+    station_rows = []
+    model_rows = []
+    if do_metrics:
+        raw_file = os.path.join(outdir, output_cfg.get("metrics_raw_name", "CTD_metrics_raw.csv"))
+        station_file = os.path.join(outdir, output_cfg.get("metrics_station_name", "CTD_stats.csv"))
+        model_file = os.path.join(outdir, output_cfg.get("metrics_model_name", "CTD_stats_by_model.csv"))
+        raw_fields = [
+            "task",
+            "experiment_id",
+            "model",
+            "station_id",
+            "station_id_full",
+            "station_name",
+            "profile_id",
+            "obs_time",
+            "var",
+            "depth",
+            "obs",
+            "model_value",
+            "error",
+        ]
+        _write_csv_rows(raw_file, pair_rows, raw_fields)
+
+        station_rows, model_rows = _aggregate_metric_rows(pair_rows)
+        station_fields = [
+            "model",
+            "task",
+            "var",
+            "station_id",
+            "station_id_full",
+            "station_name",
+            "n",
+            "bias",
+            "rmse",
+            "corr",
+            "obs_std",
+            "mod_std",
+            "nrmse_std",
+            "wss",
+            "crmsd",
+        ]
+        model_fields = [
+            "model",
+            "task",
+            "var",
+            "n",
+            "bias",
+            "rmse",
+            "corr",
+            "obs_std",
+            "mod_std",
+            "nrmse_std",
+            "wss",
+            "crmsd",
+        ]
+        _write_csv_rows(station_file, station_rows, station_fields)
+        _write_csv_rows(model_file, model_rows, model_fields)
+
+    scatter_files = []
+    if bool(output_cfg.get("write_scatter_plots", True)):
+        scatter_files = _write_depth_scatter(pair_rows, output_cfg)
+
+    manifest_file = os.path.join(outdir, output_cfg.get("manifest_name", "CTD_manifest.json"))
+    payload = {
+        "summary": run_summary,
+        "raw_file": raw_file,
+        "station_file": station_file,
+        "model_file": model_file,
+        "scatter_files": scatter_files,
+        "raw_rows": len(pair_rows),
+        "station_rows": len(station_rows),
+        "model_rows": len(model_rows),
+    }
+    with open(manifest_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    return payload
+
+
 def main():
     start_t, end_t = parse_date_range(CONFIG["date_range"])
     region = setup_region(CONFIG["region"])
+    output_cfg = CONFIG.get("output", {})
+
     sch_cfg = prepare_schism(CONFIG["schism"])
     gm_cfg = prepare_global_model(CONFIG["global_model"], start_t, end_t)
     sch_list = sch_cfg if isinstance(sch_cfg, list) else ([sch_cfg] if sch_cfg is not None else [])
@@ -741,7 +1173,7 @@ def main():
         return
 
     if RANK == 0:
-        ensure_output_dir(CONFIG["output"]["dir"])
+        ensure_output_dir(output_cfg["dir"])
     if MPI:
         COMM.Barrier()
 
@@ -762,7 +1194,7 @@ def main():
     time_str = time_raw.astype("datetime64[s]").astype(str)
     obs_time = np.array([datenum(t) for t in time_str], dtype=float)
 
-    uniq_keys, inv, time_str = build_profile_groups(st_id, time_raw)
+    uniq_keys, inv, _ = build_profile_groups(st_id, time_raw)
     total_profiles = len(uniq_keys)
     if total_profiles == 0:
         rank_print("No TEAMS profiles found.")
@@ -789,33 +1221,47 @@ def main():
         else:
             raise RuntimeError("location_only_time is None but no model time is available.")
 
-    for local_pos, profile_idx in enumerate(local_indices, 1):
+    local_pair_rows = []
+    local_summary = {
+        "rank": RANK,
+        "assigned_profiles": len(local_indices),
+        "processed_profiles": 0,
+        "skipped_profiles": 0,
+        "saved_profile_plots": 0,
+    }
+    task_name = str(output_cfg.get("task_name", "ctd"))
+    experiment_id = output_cfg.get("experiment_id")
+
+    for profile_idx in local_indices:
         mask = inv == profile_idx
         if not np.any(mask):
             continue
 
-        profile_id = uniq_keys[profile_idx]
+        profile_id = str(uniq_keys[profile_idx])
         stime = obs_time[mask][0]
         lon_pt = float(np.nanmean(lon[mask]))
         lat_pt = float(np.nanmean(lat[mask]))
-        if station_ids is not None:
-            pid = str(st_id[mask][0])
-            if pid not in station_ids:
-                log_skip("station_id filtered", profile_id, stime, lon_pt, lat_pt)
-                continue
+        station_id = str(st_id[mask][0]).strip()
+        station_name = str(st_name[mask][0]).strip() if st_name is not None else ""
+        if station_ids is not None and station_id not in station_ids:
+            local_summary["skipped_profiles"] += 1
+            log_skip("station_id filtered", profile_id, stime, lon_pt, lat_pt)
+            continue
         if station_names is not None:
             if st_name is None:
+                local_summary["skipped_profiles"] += 1
                 log_skip("station_name unavailable", profile_id, stime, lon_pt, lat_pt)
                 continue
-            pname = str(st_name[mask][0])
-            if pname not in station_names:
+            if station_name not in station_names:
+                local_summary["skipped_profiles"] += 1
                 log_skip("station_name filtered", profile_id, stime, lon_pt, lat_pt)
                 continue
-        if not location_only:
-            if stime < start_t or stime > end_t:
-                log_skip("outside target window", profile_id, stime, lon_pt, lat_pt)
-                continue
+        if (not location_only) and (stime < start_t or stime > end_t):
+            local_summary["skipped_profiles"] += 1
+            log_skip("outside target window", profile_id, stime, lon_pt, lat_pt)
+            continue
         if not point_in_region(region, lon_pt, lat_pt):
+            local_summary["skipped_profiles"] += 1
             log_skip("outside configured region", profile_id, stime, lon_pt, lat_pt)
             continue
 
@@ -824,6 +1270,7 @@ def main():
         obs_salt = np.asarray(salt[mask], dtype=float)
         valid = np.isfinite(obs_depth) & np.isfinite(obs_temp) & np.isfinite(obs_salt)
         if valid.sum() < 4:
+            local_summary["skipped_profiles"] += 1
             log_skip("insufficient depth samples", profile_id, stime, lon_pt, lat_pt)
             continue
 
@@ -849,15 +1296,20 @@ def main():
             if gm_profile is not None:
                 gm_lon = gm_profile.get("grid_lon")
                 gm_lat = gm_profile.get("grid_lat")
-                obs_subset = select_obs_within_model_range(
-                    obs_depth, obs_temp, obs_salt, gm_profile["depth"]
-                )
+                obs_subset = select_obs_within_model_range(obs_depth, obs_temp, obs_salt, gm_profile["depth"])
                 if obs_subset is not None:
                     odi, otpi, osi = obs_subset
-                    temp_stat = compute_model_stats(gm_profile["depth"], gm_profile["temp"], odi, otpi)
-                    salt_stat = compute_model_stats(gm_profile["depth"], gm_profile["salt"], odi, osi)
-                    gm_profile["stats"] = {"temp": temp_stat, "salt": salt_stat}
-                    models.append(gm_profile)
+                    temp_cmp = interpolate_model_to_obs(gm_profile["depth"], gm_profile["temp"], odi, otpi)
+                    salt_cmp = interpolate_model_to_obs(gm_profile["depth"], gm_profile["salt"], odi, osi)
+                    if temp_cmp is not None or salt_cmp is not None:
+                        gm_profile["stats"] = {
+                            "temp": temp_cmp["stat"] if temp_cmp is not None else None,
+                            "salt": salt_cmp["stat"] if salt_cmp is not None else None,
+                        }
+                        gm_profile["compare"] = {"temp": temp_cmp, "salt": salt_cmp}
+                        models.append(gm_profile)
+                    else:
+                        log_skip("global model interpolation failed", profile_id, stime, lon_pt, lat_pt)
                 else:
                     log_skip("global model depth range mismatch", profile_id, stime, lon_pt, lat_pt)
             else:
@@ -872,51 +1324,104 @@ def main():
                 stime_model = stime
             sch_profile = extract_schism_profile(sch_item, stime_model, lon_pt, lat_pt)
             if sch_profile is not None:
-                obs_subset = select_obs_within_model_range(
-                    obs_depth, obs_temp, obs_salt, sch_profile["depth"]
-                )
+                obs_subset = select_obs_within_model_range(obs_depth, obs_temp, obs_salt, sch_profile["depth"])
                 if obs_subset is not None:
                     odi, otpi, osi = obs_subset
-                    temp_stat = compute_model_stats(sch_profile["depth"], sch_profile["temp"], odi, otpi)
-                    salt_stat = compute_model_stats(sch_profile["depth"], sch_profile["salt"], odi, osi)
-                    sch_profile["stats"] = {"temp": temp_stat, "salt": salt_stat}
-                    models.append(sch_profile)
+                    temp_cmp = interpolate_model_to_obs(sch_profile["depth"], sch_profile["temp"], odi, otpi)
+                    salt_cmp = interpolate_model_to_obs(sch_profile["depth"], sch_profile["salt"], odi, osi)
+                    if temp_cmp is not None or salt_cmp is not None:
+                        sch_profile["stats"] = {
+                            "temp": temp_cmp["stat"] if temp_cmp is not None else None,
+                            "salt": salt_cmp["stat"] if salt_cmp is not None else None,
+                        }
+                        sch_profile["compare"] = {"temp": temp_cmp, "salt": salt_cmp}
+                        models.append(sch_profile)
+                    else:
+                        log_skip("SCHISM interpolation failed", profile_id, stime, lon_pt, lat_pt)
                 else:
                     log_skip("SCHISM depth range mismatch", profile_id, stime, lon_pt, lat_pt)
             else:
                 log_skip("SCHISM profile missing", profile_id, stime, lon_pt, lat_pt)
 
         if len(models) == 0:
+            local_summary["skipped_profiles"] += 1
             log_skip("no models available for comparison", profile_id, stime, lon_pt, lat_pt)
             continue
 
+        local_summary["processed_profiles"] += 1
+        obs_time_txt = num2date(stime).strftime("%Y-%m-%d %H:%M:%S")
         for model in models:
             model.setdefault("stats", {"temp": None, "salt": None})
+            model_name = str(model.get("name", "model"))
+            compares = model.get("compare", {})
+            for var in ("temp", "salt"):
+                cmp = compares.get(var)
+                if cmp is None:
+                    continue
+                obs_vals = np.asarray(cmp["obs"], dtype=float)
+                mod_vals = np.asarray(cmp["mod"], dtype=float)
+                dep_vals = np.asarray(cmp["depth"], dtype=float)
+                for j in range(len(obs_vals)):
+                    local_pair_rows.append(
+                        {
+                            "task": task_name,
+                            "experiment_id": experiment_id if experiment_id is not None else model_name,
+                            "model": model_name,
+                            "station_id": station_id,
+                            "station_id_full": station_id,
+                            "station_name": station_name,
+                            "profile_id": profile_id,
+                            "obs_time": obs_time_txt,
+                            "var": var,
+                            "depth": float(dep_vals[j]),
+                            "obs": float(obs_vals[j]),
+                            "model_value": float(mod_vals[j]),
+                            "error": float(mod_vals[j] - obs_vals[j]),
+                        }
+                    )
 
-        obs_plot = {
-            "depth": obs_depth,
-            "temp": obs_temp,
-            "salt": obs_salt,
-        }
-        meta = {
-            "lon": lon_pt,
-            "lat": lat_pt,
-            "lon_array": lon[mask],
-            "lat_array": lat[mask],
-            "obs_time": stime,
-            "profile_id": profile_id,
-            "gm_lon": gm_lon,
-            "gm_lat": gm_lat,
-        }
-        plot_profiles(meta, region, obs_plot, models, CONFIG["plot"], CONFIG["output"]["dir"])
+        if bool(output_cfg.get("save_profile_plots", True)):
+            obs_plot = {"depth": obs_depth, "temp": obs_temp, "salt": obs_salt}
+            meta = {
+                "lon": lon_pt,
+                "lat": lat_pt,
+                "lon_array": lon[mask],
+                "lat_array": lat[mask],
+                "obs_time": stime,
+                "profile_id": profile_id,
+                "gm_lon": gm_lon,
+                "gm_lat": gm_lat,
+            }
+            plot_profiles(meta, region, obs_plot, models, CONFIG["plot"], output_cfg["dir"])
+            local_summary["saved_profile_plots"] += 1
 
+    local_summary["pair_samples"] = len(local_pair_rows)
+    if MPI:
+        pair_chunks = COMM.gather(local_pair_rows, root=0)
+        summary_chunks = COMM.gather(local_summary, root=0)
+    else:
+        pair_chunks = [local_pair_rows]
+        summary_chunks = [local_summary]
+
+    if RANK == 0:
+        pair_rows = [r for chunk in pair_chunks for r in chunk]
+        total_summary = {
+            "mpi_size": SIZE,
+            "total_profiles": total_profiles,
+            "assigned_profiles": int(sum(s["assigned_profiles"] for s in summary_chunks)),
+            "processed_profiles": int(sum(s["processed_profiles"] for s in summary_chunks)),
+            "skipped_profiles": int(sum(s["skipped_profiles"] for s in summary_chunks)),
+            "saved_profile_plots": int(sum(s["saved_profile_plots"] for s in summary_chunks)),
+            "pair_samples": int(sum(s["pair_samples"] for s in summary_chunks)),
+        }
+        _write_task_outputs(pair_rows, output_cfg, total_summary)
+        rank_print("done")
     if MPI:
         COMM.Barrier()
-    if RANK == 0:
-        rank_print("done")
 
 
 if __name__ == "__main__":
+    cli_args = _parse_args()
+    _apply_runtime_overrides(cli_args)
     main()
     sys.exit()
-

@@ -1,0 +1,21 @@
+{
+  "schism": [
+    {
+      "enabled": true,
+      "label": "RUN00",
+      "color": "b",
+      "run_dir": ""
+    }
+  ],
+  "global_model": {
+    "enabled": false
+  },
+  "output": {
+    "dir": "/Users/kpark/Documents/Codes/coastal-ocean-utils/schism/post-proc/validation/runs/_smoke_no_wrapper/RUN00/ctd",
+    "experiment_id": "RUN00",
+    "task_name": "ctd",
+    "write_task_metrics": true,
+    "write_scatter_plots": true,
+    "save_profile_plots": true
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "campaign_id": "_smoke_no_wrapper",
+  "catalog": "/Users/kpark/Documents/Codes/coastal-ocean-utils/schism/post-proc/validation/experiments.csv",
+  "campaign_dir": "/Users/kpark/Documents/Codes/coastal-ocean-utils/schism/post-proc/validation/runs/_smoke_no_wrapper",
+  "baseline_id": "RUN00",
+  "experiments": 4,
+  "execute_ctd": false,
+  "execute_th": false,
+  "execute_wl": false,
+  "execute_scorecard": false,
+  "metrics_info": {
+    "enabled": false,
+    "saved": false
+  },
+  "weights": {
+    "wl": 0.3333333333333333,
+    "salt": 0.3333333333333333,
+    "temp": 0.3333333333333333
+  }
+}

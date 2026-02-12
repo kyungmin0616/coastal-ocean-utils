@@ -1,0 +1,9 @@
+{
+  "experiment_id": "RUN00",
+  "is_baseline": 1,
+  "baseline_id": "RUN00",
+  "grid": "coarse",
+  "bathy": "GEBCO",
+  "forcing": "basic",
+  "river": "climatology"
+}

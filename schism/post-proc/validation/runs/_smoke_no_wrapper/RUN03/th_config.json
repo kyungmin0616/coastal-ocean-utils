@@ -1,0 +1,19 @@
+{
+  "schism_npzs": [],
+  "schism_labels": [
+    "RUN03"
+  ],
+  "bpfile": "/Users/kpark/Documents/Codes/coastal-ocean-utils/schism/post-proc/station_sendai_d2.bp",
+  "outdir": "/Users/kpark/Documents/Codes/coastal-ocean-utils/schism/post-proc/validation/runs/_smoke_no_wrapper/RUN03/th",
+  "vars": [
+    "temp",
+    "sal"
+  ],
+  "resample": "h",
+  "debug_times": true,
+  "task_name": "th",
+  "experiment_id": "RUN03",
+  "write_task_metrics": true,
+  "write_integrated_scatter": true,
+  "save_plots": true
+}

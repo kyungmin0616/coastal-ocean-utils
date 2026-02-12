@@ -27,14 +27,14 @@ Notes
 
 Examples
 --------
-python SCHISMvsTEAMS-TH.py \
+python SCHISMvsTEAMS_TH.py \
   --teams TEAMS/npz/sendai_d2_timeseries.npz \
   --schism RUN01d.npz \
   --bp TEAMS/station_sendai_d2.in \
   --outdir ./images/teams_compare \
   --vars temp sal --resample H
 
-python SCHISMvsTEAMS-TH.py --depth 5 --depth-tol 0.5 --resample D
+python SCHISMvsTEAMS_TH.py --depth 5 --depth-tol 0.5 --resample D
 """
 
 import argparse

@@ -1,0 +1,9 @@
+{
+  "experiment_id": "RUN02",
+  "is_baseline": 0,
+  "baseline_id": "RUN00",
+  "grid": "coarse",
+  "bathy": "highres",
+  "forcing": "basic",
+  "river": "climatology"
+}
