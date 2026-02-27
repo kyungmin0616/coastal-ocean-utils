@@ -98,7 +98,12 @@ import json
 import math
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import datetime
+try:
+    from datetime import UTC
+except ImportError:
+    from datetime import timezone
+    UTC = timezone.utc
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -111,18 +116,19 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # ---------------------------------------------------------------------------
 CONFIG: Dict[str, Any] = {
     # Campaign basics
-    "CATALOG": "validation/experiments.csv",
-    "OUT_ROOT": "validation/runs",
-    "CAMPAIGN_ID": None,  # None -> timestamp-based campaign id
+    "CATALOG": "/scratch2/08924/kmpark/post-proc/validation/experiments.csv",
+    "OUT_ROOT": "/scratch2/08924/kmpark/post-proc/validation/runs",
+    "CAMPAIGN_ID": "Test",  # None -> timestamp-based campaign id
     "ONLY": None,  # Example: ["RUN00", "RUN01"]
+    "COMPARE_MODE": "joint",  # joint | per_experiment
     "PYTHON": sys.executable,
     "CONTINUE_ON_ERROR": False,
     "DRY_RUN": False,
 
     # Task execution switches
-    "EXECUTE_CTD": False,
-    "EXECUTE_TH": False,
-    "EXECUTE_WL": False,
+    "EXECUTE_CTD": True,
+    "EXECUTE_TH": True,
+    "EXECUTE_WL": True,
     "EXECUTE_SCORECARD": True,
 
     # Script paths
@@ -131,30 +137,33 @@ CONFIG: Dict[str, Any] = {
     "WL_SCRIPT": "SCHISMvsJODC_WL.py",
 
     # CTD task config
-    "CTD_RUN_DIR_TEMPLATE": None,  # Example: "/scratch/runs/{experiment_id}"
-    "CTD_TEAMS_PATH": None,  # Example: "/scratch/npz/onagawa_d1_ctd.npz"
-    "CTD_START": None,  # "YYYY-MM-DD"
-    "CTD_END": None,  # "YYYY-MM-DD"
+    "CTD_RUN_DIR_TEMPLATE": "/scratch2/08924/kmpark/{experiment_id}",  # Example: "/scratch/runs/{experiment_id}"
+    "CTD_TEAMS_PATH": "/scratch2/08924/kmpark/post-proc/npz/onagawa_d1_ctd.npz",  # Example: "/scratch/npz/onagawa_d1_ctd.npz"
+    "CTD_START": "2012-01-01",  # "YYYY-MM-DD"
+    "CTD_END": "2012-12-31",  # "YYYY-MM-DD"
     "CTD_ENABLE_GLOBAL_MODEL": False,
     "CTD_COLOR": "b",
+    # Optional per-experiment color override. Keys are experiment_id values.
+    # Example: {"RUN00": "k", "RUN01": "b", "RUN02": "g", "RUN03": "r"}
+    "CTD_COLOR_MAP": {},
 
     # Teams time histories task config
-    "TH_SCHISM_TEMPLATE": None,  # Example: "/scratch/npz/{experiment_id}.npz"
-    "TH_TEAMS_PATH": None,  # Example: "/scratch/npz/sendai_d2_timeseries.npz"
-    "TH_BPFILE": "station_sendai_d2.bp",
-    "TH_GRID": None,
-    "TH_START": None,
-    "TH_END": None,
+    "TH_SCHISM_TEMPLATE": "/scratch2/08924/kmpark/post-proc/npz/{experiment_id}_SB_d2.npz",  # Example: "/scratch/npz/{experiment_id}.npz"
+    "TH_TEAMS_PATH": "/scratch2/08924/kmpark/post-proc/npz/sendai_d2_timeseries.npz",  # Example: "/scratch/npz/sendai_d2_timeseries.npz"
+    "TH_BPFILE": "/scratch2/08924/kmpark/post-proc/station_sendai_d2.bp",
+    "TH_GRID": "/scratch2/08924/kmpark/RUN01d/hgrid.gr3",
+    "TH_START": "2012-01-01",
+    "TH_END": "2012-12-31",
     "TH_RESAMPLE": "h",
     "TH_VARS": ["temp", "sal"],
 
     # JODC water level task config
-    "WL_RUN_TEMPLATE": None,  # Example: "/scratch/npz/{experiment_id}.npz"
-    "WL_BPFILE": "station_jodc.bp",
-    "WL_OBS_PATH": "npz/jodc_tide_all.npz",
-    "WL_START": "2022-01-14 00:00:00",
-    "WL_END": "2022-03-30 00:00:00",
-    "WL_MODEL_START": "2022-01-02 00:00:00",
+    "WL_RUN_TEMPLATE": "/scratch2/08924/kmpark/post-proc/npz/{experiment_id}_jodc.npz",  # Example: "/scratch/npz/{experiment_id}.npz"
+    "WL_BPFILE": "/scratch2/08924/kmpark/post-proc/station_jodc.bp",
+    "WL_OBS_PATH": "/scratch2/08924/kmpark/post-proc/npz/jodc_tide_all.npz",
+    "WL_START": "2012-01-14 00:00:00",
+    "WL_END": "2012-12-31 00:00:00",
+    "WL_MODEL_START": "2012-01-01 00:00:00",
 
     # Scorecard config
     "WEIGHTING_MODES": ["station_equal", "sample_count"],
@@ -173,8 +182,35 @@ def _resolve(path_like: str) -> Path:
 
 
 def _read_csv_rows(path: Path) -> List[Dict[str, str]]:
-    with open(path, "r", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    with open(path, "r", encoding="utf-8-sig") as f:
+        raw_lines = [ln.rstrip("\n") for ln in f]
+
+    lines = [ln.strip() for ln in raw_lines if ln.strip() and not ln.lstrip().startswith("#")]
+    if not lines:
+        return []
+
+    header = lines[0]
+
+    # Standard CSV
+    if "," in header:
+        return list(csv.DictReader(lines))
+
+    # TSV
+    if "\t" in header:
+        return list(csv.DictReader(lines, delimiter="\t"))
+
+    # Whitespace-delimited fallback (common on HPC edits)
+    cols = header.split()
+    rows: List[Dict[str, str]] = []
+    for i, line in enumerate(lines[1:], start=2):
+        parts = line.split()
+        if len(parts) < len(cols):
+            raise ValueError(
+                f"Malformed catalog row {i} in {path}: expected >= {len(cols)} fields, got {len(parts)}"
+            )
+        row = {c: parts[j] for j, c in enumerate(cols)}
+        rows.append(row)
+    return rows
 
 
 def _write_csv_rows(
@@ -214,6 +250,15 @@ def _to_ymd_list(text: str) -> List[int]:
     if len(parts) != 3:
         raise ValueError(f"Expected date like YYYY-MM-DD, got: {text}")
     return [int(parts[0]), int(parts[1]), int(parts[2])]
+
+
+def _pick_ctd_color(cfg: Dict[str, Any], exp_id: str) -> str:
+    cmap = cfg.get("CTD_COLOR_MAP", {})
+    if isinstance(cmap, dict):
+        c = cmap.get(str(exp_id))
+        if c:
+            return str(c)
+    return str(cfg.get("CTD_COLOR", "b"))
 
 
 def _is_finite(v: Any) -> bool:
@@ -287,17 +332,32 @@ def _run_cmd(cmd: List[str], cwd: Path, stdout_log: Path, stderr_log: Path) -> T
     with open(stdout_log, "w", encoding="utf-8") as fo, open(stderr_log, "w", encoding="utf-8") as fe:
         proc = subprocess.run(cmd, cwd=str(cwd), stdout=fo, stderr=fe, check=False)
     if proc.returncode == 0:
-        return True, "completed"
-    return False, f"failed with return code {proc.returncode}"
+        return True, f"completed (stdout={stdout_log}, stderr={stderr_log})"
+
+    err_tail = ""
+    try:
+        with open(stderr_log, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        if lines:
+            err_tail = " | stderr_tail: " + " || ".join(lines[-5:])
+    except Exception:
+        pass
+
+    return (
+        False,
+        f"failed with return code {proc.returncode} "
+        f"(stdout={stdout_log}, stderr={stderr_log}){err_tail}",
+    )
 
 
 def _prepare_ctd_config(cfg: Dict[str, Any], exp_id: str, exp_dir: Path) -> Dict[str, Any]:
+    ctd_color = _pick_ctd_color(cfg, exp_id)
     out: Dict[str, Any] = {
         "schism": [
             {
                 "enabled": True,
                 "label": exp_id,
-                "color": cfg["CTD_COLOR"],
+                "color": ctd_color,
                 "run_dir": "",
             }
         ],
@@ -374,7 +434,113 @@ def _prepare_wl_config(cfg: Dict[str, Any], exp_id: str, exp_dir: Path) -> Dict[
     return out
 
 
-def _load_metrics_from_wl_csv(path: Path, exp_id: str) -> List[Dict[str, Any]]:
+def _prepare_ctd_config_joint(cfg: Dict[str, Any], experiments: List[Dict[str, str]], campaign_dir: Path) -> Dict[str, Any]:
+    schism_items: List[Dict[str, Any]] = []
+    for row in experiments:
+        exp_id = str(row["experiment_id"]).strip()
+        item = {
+            "enabled": True,
+            "label": exp_id,
+            "color": _pick_ctd_color(cfg, exp_id),
+            "run_dir": "",
+        }
+        if cfg.get("CTD_RUN_DIR_TEMPLATE"):
+            item["run_dir"] = str(cfg["CTD_RUN_DIR_TEMPLATE"]).format(experiment_id=exp_id)
+        schism_items.append(item)
+
+    out: Dict[str, Any] = {
+        "schism": schism_items,
+        "global_model": {"enabled": bool(cfg["CTD_ENABLE_GLOBAL_MODEL"])},
+        "output": {
+            "dir": str((campaign_dir / "ctd").resolve()),
+            "experiment_id": None,
+            "task_name": "ctd",
+            "write_task_metrics": True,
+            "write_scatter_plots": True,
+            "save_profile_plots": True,
+        },
+    }
+    if cfg.get("CTD_TEAMS_PATH"):
+        out["teams"] = {"npz_path": str(_resolve(cfg["CTD_TEAMS_PATH"]))}
+    if cfg.get("CTD_START") or cfg.get("CTD_END"):
+        dr: Dict[str, Any] = {}
+        if cfg.get("CTD_START"):
+            dr["start"] = _to_ymd_list(str(cfg["CTD_START"]))
+        if cfg.get("CTD_END"):
+            dr["end"] = _to_ymd_list(str(cfg["CTD_END"]))
+        out["date_range"] = dr
+    return out
+
+
+def _prepare_th_config_joint(cfg: Dict[str, Any], experiments: List[Dict[str, str]], campaign_dir: Path) -> Dict[str, Any]:
+    labels = [str(r["experiment_id"]).strip() for r in experiments]
+    out: Dict[str, Any] = {
+        "schism_npzs": [],
+        "schism_labels": labels,
+        "bpfile": str(_resolve(cfg["TH_BPFILE"])),
+        "outdir": str((campaign_dir / "th").resolve()),
+        "vars": list(cfg["TH_VARS"]),
+        "resample": str(cfg["TH_RESAMPLE"]),
+        "debug_times": True,
+        "task_name": "th",
+        "experiment_id": None,
+        "write_task_metrics": True,
+        "write_integrated_scatter": True,
+        "save_plots": True,
+    }
+    if cfg.get("TH_SCHISM_TEMPLATE"):
+        out["schism_npzs"] = [str(cfg["TH_SCHISM_TEMPLATE"]).format(experiment_id=eid) for eid in labels]
+    if cfg.get("TH_TEAMS_PATH"):
+        out["teams_npz"] = str(_resolve(cfg["TH_TEAMS_PATH"]))
+    if cfg.get("TH_GRID"):
+        out["grid"] = str(_resolve(cfg["TH_GRID"]))
+    if cfg.get("TH_START"):
+        out["start"] = str(cfg["TH_START"])
+    if cfg.get("TH_END"):
+        out["end"] = str(cfg["TH_END"])
+    return out
+
+
+def _prepare_wl_config_joint(cfg: Dict[str, Any], experiments: List[Dict[str, str]], campaign_dir: Path) -> Dict[str, Any]:
+    tags = [str(r["experiment_id"]).strip() for r in experiments]
+    out: Dict[str, Any] = {
+        "runs": [],
+        "tags": tags,
+        "bpfile": str(_resolve(cfg["WL_BPFILE"])),
+        "outdir": str((campaign_dir / "wl").resolve()),
+        "obs_path": str(_resolve(cfg["WL_OBS_PATH"])),
+        "start": str(cfg["WL_START"]),
+        "end": str(cfg["WL_END"]),
+        "model_start": str(cfg["WL_MODEL_START"]),
+        "resample_obs": "h",
+        "resample_model": "h",
+        "demean": True,
+        "save_plots": True,
+        "progress_every": 20,
+    }
+    if cfg.get("WL_RUN_TEMPLATE"):
+        out["runs"] = [str(cfg["WL_RUN_TEMPLATE"]).format(experiment_id=eid) for eid in tags]
+    return out
+
+
+def _validate_run_paths(run_paths: List[str]) -> Optional[str]:
+    missing: List[str] = []
+    for rp in run_paths:
+        p = Path(str(rp)).expanduser()
+        if p.exists():
+            continue
+        # Some scripts accept staout prefix/path that may expand internally.
+        if str(p).endswith("staout"):
+            continue
+        missing.append(str(p))
+    if not missing:
+        return None
+    if len(missing) == 1:
+        return f"Model run input not found: {missing[0]}"
+    return f"Model run inputs not found ({len(missing)}): {', '.join(missing[:5])}"
+
+
+def _load_metrics_from_wl_csv(path: Path, exp_id: str, strict_model: bool = False) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
     rows = _read_csv_rows(path)
@@ -383,9 +549,15 @@ def _load_metrics_from_wl_csv(path: Path, exp_id: str) -> List[Dict[str, Any]]:
     has_self_model = any(str(r.get("model", "")).strip() == exp_id for r in rows)
     out: List[Dict[str, Any]] = []
     for r in rows:
-        model = str(r.get("model", "")).strip() or exp_id
-        if has_self_model and model != exp_id:
-            continue
+        model_raw = str(r.get("model", "")).strip()
+        if strict_model:
+            if model_raw != exp_id:
+                continue
+            model = model_raw
+        else:
+            model = model_raw or exp_id
+            if has_self_model and model != exp_id:
+                continue
         rmse = _safe_float(r.get("rmse"))
         obs_std = _safe_float(r.get("obs_std"))
         nrmse = _safe_float(r.get("nrmse_std"))
@@ -412,7 +584,7 @@ def _load_metrics_from_wl_csv(path: Path, exp_id: str) -> List[Dict[str, Any]]:
     return out
 
 
-def _load_metrics_from_generic_csv(path: Path, exp_id: str, task: str) -> List[Dict[str, Any]]:
+def _load_metrics_from_generic_csv(path: Path, exp_id: str, task: str, strict_model: bool = False) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
     rows = _read_csv_rows(path)
@@ -421,9 +593,15 @@ def _load_metrics_from_generic_csv(path: Path, exp_id: str, task: str) -> List[D
     has_self_model = any(str(r.get("model", "")).strip() == exp_id for r in rows)
     out: List[Dict[str, Any]] = []
     for r in rows:
-        model = str(r.get("model", "")).strip() or exp_id
-        if has_self_model and model != exp_id:
-            continue
+        model_raw = str(r.get("model", "")).strip()
+        if strict_model:
+            if model_raw != exp_id:
+                continue
+            model = model_raw
+        else:
+            model = model_raw or exp_id
+            if has_self_model and model != exp_id:
+                continue
         var = _normalize_var(r.get("var", "unknown"))
         if var not in {"temp", "salt", "wl"}:
             continue
@@ -458,10 +636,35 @@ def _load_metrics_from_generic_csv(path: Path, exp_id: str, task: str) -> List[D
     return out
 
 
-def _collect_campaign_metrics(campaign_dir: Path, experiments: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+def _collect_campaign_metrics(
+    campaign_dir: Path,
+    experiments: List[Dict[str, str]],
+    compare_mode: str = "per_experiment",
+) -> List[Dict[str, Any]]:
     raw: List[Dict[str, Any]] = []
+    joint_mode = str(compare_mode).strip().lower() == "joint"
+    joint_wl = campaign_dir / "wl" / "WL_stats.csv"
+    joint_th = campaign_dir / "th" / "SCHISMvsTEAMS_stats.csv"
+    joint_ctd_candidates = [
+        campaign_dir / "ctd" / "CTD_stats.csv",
+        campaign_dir / "ctd" / "ctd_stats.csv",
+        campaign_dir / "ctd" / "SCHISMvsTEAMS_CTD_stats.csv",
+    ]
     for row in experiments:
         exp_id = str(row["experiment_id"]).strip()
+        if joint_mode:
+            raw.extend(_load_metrics_from_wl_csv(joint_wl, exp_id, strict_model=True))
+            raw.extend(_load_metrics_from_generic_csv(joint_th, exp_id, "th", strict_model=True))
+            for cfp in joint_ctd_candidates:
+                if cfp.exists():
+                    raw.extend(_load_metrics_from_generic_csv(cfp, exp_id, "ctd", strict_model=True))
+                    break
+
+            # Backward-compatible fallback if joint files don't contain model labels.
+            got_any = any(str(r.get("experiment_id", "")).strip() == exp_id for r in raw)
+            if got_any:
+                continue
+
         exp_dir = campaign_dir / exp_id
         raw.extend(_load_metrics_from_wl_csv(exp_dir / "wl" / "WL_stats.csv", exp_id))
         raw.extend(_load_metrics_from_generic_csv(exp_dir / "th" / "SCHISMvsTEAMS_stats.csv", exp_id, "th"))
@@ -606,11 +809,12 @@ def _save_metrics_and_scorecards(
     baseline_id: str,
     weights: Dict[str, float],
     weighting_modes: List[str],
+    compare_mode: str = "per_experiment",
 ) -> Dict[str, Any]:
     metrics_dir = campaign_dir / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_rows = _collect_campaign_metrics(campaign_dir, experiments)
+    raw_rows = _collect_campaign_metrics(campaign_dir, experiments, compare_mode=compare_mode)
     _write_csv_rows(
         metrics_dir / "merged_metrics_raw.csv",
         raw_rows,
@@ -764,6 +968,11 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--python",
         help="Python executable used to launch child task scripts.",
+    )
+    p.add_argument(
+        "--compare-mode",
+        choices=["joint", "per_experiment"],
+        help="How to run tasks: one joint multi-model run or legacy per-experiment runs.",
     )
 
     p.add_argument(
@@ -977,6 +1186,7 @@ def _build_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         "out_root": "OUT_ROOT",
         "campaign_id": "CAMPAIGN_ID",
         "only": "ONLY",
+        "compare_mode": "COMPARE_MODE",
         "python": "PYTHON",
         "continue_on_error": "CONTINUE_ON_ERROR",
         "dry_run": "DRY_RUN",
@@ -1048,6 +1258,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     ctd_script = _resolve(str(cfg["CTD_SCRIPT"]))
     th_script = _resolve(str(cfg["TH_SCRIPT"]))
     wl_script = _resolve(str(cfg["WL_SCRIPT"]))
+    compare_mode = str(cfg.get("COMPARE_MODE", "joint")).strip().lower()
+    if compare_mode not in {"joint", "per_experiment"}:
+        raise ValueError(f"Unknown COMPARE_MODE: {compare_mode}")
 
     plan_rows: List[Dict[str, Any]] = []
     statuses: List[Dict[str, Any]] = []
@@ -1069,13 +1282,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         with open(exp_dir / "experiment_meta.json", "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 
-        ctd_cfg = _prepare_ctd_config(cfg, exp_id, exp_dir)
-        th_cfg = _prepare_th_config(cfg, exp_id, exp_dir)
-        wl_cfg = _prepare_wl_config(cfg, exp_id, exp_dir)
+    if compare_mode == "joint":
+        exp_ids = [str(e["experiment_id"]).strip() for e in experiments]
+        ctd_cfg = _prepare_ctd_config_joint(cfg, experiments, campaign_dir)
+        th_cfg = _prepare_th_config_joint(cfg, experiments, campaign_dir)
+        wl_cfg = _prepare_wl_config_joint(cfg, experiments, campaign_dir)
 
-        ctd_cfg_path = exp_dir / "ctd_config.json"
-        th_cfg_path = exp_dir / "th_config.json"
-        wl_cfg_path = exp_dir / "wl_config.json"
+        ctd_cfg_path = campaign_dir / "ctd_config.json"
+        th_cfg_path = campaign_dir / "th_config.json"
+        wl_cfg_path = campaign_dir / "wl_config.json"
         with open(ctd_cfg_path, "w", encoding="utf-8") as f:
             json.dump(ctd_cfg, f, indent=2)
         with open(th_cfg_path, "w", encoding="utf-8") as f:
@@ -1085,15 +1300,17 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         plan_rows.append(
             {
-                "experiment_id": exp_id,
-                "is_baseline": meta["is_baseline"],
-                "grid": meta["grid"],
-                "bathy": meta["bathy"],
-                "forcing": meta["forcing"],
-                "river": meta["river"],
+                "experiment_id": "__joint__",
+                "is_baseline": 0,
+                "grid": "",
+                "bathy": "",
+                "forcing": "",
+                "river": "",
                 "ctd_config_path": str(ctd_cfg_path),
                 "th_config_path": str(th_cfg_path),
                 "wl_config_path": str(wl_cfg_path),
+                "experiments": ",".join(exp_ids),
+                "compare_mode": compare_mode,
             }
         )
 
@@ -1103,40 +1320,41 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "enabled": bool(cfg["EXECUTE_CTD"]),
                 "required_ok": bool(cfg.get("CTD_RUN_DIR_TEMPLATE")),
                 "required_msg": "Missing CTD_RUN_DIR_TEMPLATE.",
-                "run_path": ((ctd_cfg.get("schism") or [{}])[0]).get("run_dir", ""),
+                "run_paths": [str(x.get("run_dir", "")) for x in ctd_cfg.get("schism", [])],
                 "cmd": [str(cfg["PYTHON"]), str(ctd_script), "--config", str(ctd_cfg_path)],
-                "stdout": exp_dir / "ctd" / "stdout.log",
-                "stderr": exp_dir / "ctd" / "stderr.log",
+                "stdout": campaign_dir / "ctd" / "stdout.log",
+                "stderr": campaign_dir / "ctd" / "stderr.log",
             },
             {
                 "task": "th",
                 "enabled": bool(cfg["EXECUTE_TH"]),
                 "required_ok": bool(cfg.get("TH_SCHISM_TEMPLATE")),
                 "required_msg": "Missing TH_SCHISM_TEMPLATE.",
-                "run_path": (th_cfg.get("schism_npzs") or [""])[0],
+                "run_paths": list(th_cfg.get("schism_npzs") or []),
                 "cmd": [str(cfg["PYTHON"]), str(th_script), "--config", str(th_cfg_path)],
-                "stdout": exp_dir / "th" / "stdout.log",
-                "stderr": exp_dir / "th" / "stderr.log",
+                "stdout": campaign_dir / "th" / "stdout.log",
+                "stderr": campaign_dir / "th" / "stderr.log",
             },
             {
                 "task": "wl",
                 "enabled": bool(cfg["EXECUTE_WL"]),
                 "required_ok": bool(cfg.get("WL_RUN_TEMPLATE")),
                 "required_msg": "Missing WL_RUN_TEMPLATE.",
-                "run_path": (wl_cfg.get("runs") or [""])[0],
+                "run_paths": list(wl_cfg.get("runs") or []),
                 "cmd": [str(cfg["PYTHON"]), str(wl_script), "--config", str(wl_cfg_path)],
-                "stdout": exp_dir / "wl" / "stdout.log",
-                "stderr": exp_dir / "wl" / "stderr.log",
+                "stdout": campaign_dir / "wl" / "stdout.log",
+                "stderr": campaign_dir / "wl" / "stderr.log",
             },
         ]
 
         for spec in task_specs:
             task = spec["task"]
             cmd = spec["cmd"]
+            ref_id = "__joint__"
             if not spec["enabled"] or bool(cfg["DRY_RUN"]):
                 statuses.append(
                     _status_record(
-                        exp_id,
+                        ref_id,
                         task,
                         "planned",
                         "Execution skipped (dry-run or task not enabled).",
@@ -1147,23 +1365,122 @@ def main(argv: Optional[List[str]] = None) -> None:
 
             if not spec["required_ok"]:
                 msg = str(spec["required_msg"])
-                statuses.append(_status_record(exp_id, task, "failed", msg, cmd))
+                statuses.append(_status_record(ref_id, task, "failed", msg, cmd))
                 if not bool(cfg["CONTINUE_ON_ERROR"]):
-                    raise RuntimeError(f"[{exp_id}:{task}] {msg}")
+                    raise RuntimeError(f"[{ref_id}:{task}] {msg}")
                 continue
 
-            run_path = Path(str(spec["run_path"])).expanduser()
-            if not run_path.exists() and not str(run_path).endswith("staout"):
-                msg = f"Model run input not found: {run_path}"
-                statuses.append(_status_record(exp_id, task, "failed", msg, cmd))
+            missing_msg = _validate_run_paths(list(spec.get("run_paths") or []))
+            if missing_msg is not None:
+                statuses.append(_status_record(ref_id, task, "failed", missing_msg, cmd))
                 if not bool(cfg["CONTINUE_ON_ERROR"]):
-                    raise FileNotFoundError(f"[{exp_id}:{task}] {msg}")
+                    raise FileNotFoundError(f"[{ref_id}:{task}] {missing_msg}")
                 continue
 
             ok, msg = _run_cmd(cmd, SCRIPT_DIR, spec["stdout"], spec["stderr"])
-            statuses.append(_status_record(exp_id, task, "ok" if ok else "failed", msg, cmd))
+            statuses.append(_status_record(ref_id, task, "ok" if ok else "failed", msg, cmd))
             if (not ok) and (not bool(cfg["CONTINUE_ON_ERROR"])):
-                raise RuntimeError(f"[{exp_id}:{task}] {msg}")
+                raise RuntimeError(f"[{ref_id}:{task}] {msg}")
+    else:
+        for exp in experiments:
+            exp_id = str(exp["experiment_id"]).strip()
+            exp_dir = campaign_dir / exp_id
+
+            ctd_cfg = _prepare_ctd_config(cfg, exp_id, exp_dir)
+            th_cfg = _prepare_th_config(cfg, exp_id, exp_dir)
+            wl_cfg = _prepare_wl_config(cfg, exp_id, exp_dir)
+
+            ctd_cfg_path = exp_dir / "ctd_config.json"
+            th_cfg_path = exp_dir / "th_config.json"
+            wl_cfg_path = exp_dir / "wl_config.json"
+            with open(ctd_cfg_path, "w", encoding="utf-8") as f:
+                json.dump(ctd_cfg, f, indent=2)
+            with open(th_cfg_path, "w", encoding="utf-8") as f:
+                json.dump(th_cfg, f, indent=2)
+            with open(wl_cfg_path, "w", encoding="utf-8") as f:
+                json.dump(wl_cfg, f, indent=2)
+
+            plan_rows.append(
+                {
+                    "experiment_id": exp_id,
+                    "is_baseline": int(str(exp.get("is_baseline", "0")).strip() or "0"),
+                    "grid": str(exp.get("grid", "")),
+                    "bathy": str(exp.get("bathy", "")),
+                    "forcing": str(exp.get("forcing", "")),
+                    "river": str(exp.get("river", "")),
+                    "ctd_config_path": str(ctd_cfg_path),
+                    "th_config_path": str(th_cfg_path),
+                    "wl_config_path": str(wl_cfg_path),
+                    "compare_mode": compare_mode,
+                }
+            )
+
+            task_specs = [
+                {
+                    "task": "ctd",
+                    "enabled": bool(cfg["EXECUTE_CTD"]),
+                    "required_ok": bool(cfg.get("CTD_RUN_DIR_TEMPLATE")),
+                    "required_msg": "Missing CTD_RUN_DIR_TEMPLATE.",
+                    "run_paths": [((ctd_cfg.get("schism") or [{}])[0]).get("run_dir", "")],
+                    "cmd": [str(cfg["PYTHON"]), str(ctd_script), "--config", str(ctd_cfg_path)],
+                    "stdout": exp_dir / "ctd" / "stdout.log",
+                    "stderr": exp_dir / "ctd" / "stderr.log",
+                },
+                {
+                    "task": "th",
+                    "enabled": bool(cfg["EXECUTE_TH"]),
+                    "required_ok": bool(cfg.get("TH_SCHISM_TEMPLATE")),
+                    "required_msg": "Missing TH_SCHISM_TEMPLATE.",
+                    "run_paths": [(th_cfg.get("schism_npzs") or [""])[0]],
+                    "cmd": [str(cfg["PYTHON"]), str(th_script), "--config", str(th_cfg_path)],
+                    "stdout": exp_dir / "th" / "stdout.log",
+                    "stderr": exp_dir / "th" / "stderr.log",
+                },
+                {
+                    "task": "wl",
+                    "enabled": bool(cfg["EXECUTE_WL"]),
+                    "required_ok": bool(cfg.get("WL_RUN_TEMPLATE")),
+                    "required_msg": "Missing WL_RUN_TEMPLATE.",
+                    "run_paths": [(wl_cfg.get("runs") or [""])[0]],
+                    "cmd": [str(cfg["PYTHON"]), str(wl_script), "--config", str(wl_cfg_path)],
+                    "stdout": exp_dir / "wl" / "stdout.log",
+                    "stderr": exp_dir / "wl" / "stderr.log",
+                },
+            ]
+
+            for spec in task_specs:
+                task = spec["task"]
+                cmd = spec["cmd"]
+                if not spec["enabled"] or bool(cfg["DRY_RUN"]):
+                    statuses.append(
+                        _status_record(
+                            exp_id,
+                            task,
+                            "planned",
+                            "Execution skipped (dry-run or task not enabled).",
+                            cmd,
+                        )
+                    )
+                    continue
+
+                if not spec["required_ok"]:
+                    msg = str(spec["required_msg"])
+                    statuses.append(_status_record(exp_id, task, "failed", msg, cmd))
+                    if not bool(cfg["CONTINUE_ON_ERROR"]):
+                        raise RuntimeError(f"[{exp_id}:{task}] {msg}")
+                    continue
+
+                missing_msg = _validate_run_paths(list(spec.get("run_paths") or []))
+                if missing_msg is not None:
+                    statuses.append(_status_record(exp_id, task, "failed", missing_msg, cmd))
+                    if not bool(cfg["CONTINUE_ON_ERROR"]):
+                        raise FileNotFoundError(f"[{exp_id}:{task}] {missing_msg}")
+                    continue
+
+                ok, msg = _run_cmd(cmd, SCRIPT_DIR, spec["stdout"], spec["stderr"])
+                statuses.append(_status_record(exp_id, task, "ok" if ok else "failed", msg, cmd))
+                if (not ok) and (not bool(cfg["CONTINUE_ON_ERROR"])):
+                    raise RuntimeError(f"[{exp_id}:{task}] {msg}")
 
     _write_csv_rows(campaign_dir / "run_plan.csv", plan_rows)
     _write_csv_rows(
@@ -1180,6 +1497,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             baseline_id=baseline_id,
             weights=dict(cfg["J_WEIGHTS"]),
             weighting_modes=list(cfg["WEIGHTING_MODES"]),
+            compare_mode=compare_mode,
         )
         metrics_info["enabled"] = True
         metrics_info["saved"] = True
@@ -1190,6 +1508,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "campaign_dir": str(campaign_dir),
         "baseline_id": baseline_id,
         "experiments": len(experiments),
+        "compare_mode": compare_mode,
         "execute_ctd": bool(cfg["EXECUTE_CTD"] and not cfg["DRY_RUN"]),
         "execute_th": bool(cfg["EXECUTE_TH"] and not cfg["DRY_RUN"]),
         "execute_wl": bool(cfg["EXECUTE_WL"] and not cfg["DRY_RUN"]),

@@ -24,23 +24,70 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from pylib import datenum, loadz, num2date, read_schism_bpfile
+from pylib import datenum, loadz, num2date, read, read_schism_bpfile
 
 try:
     from scipy import signal
 except Exception:  # pragma: no cover - optional dependency
     signal = None
 
-try:
-    from mpi4py import MPI  # type: ignore
+MPI = None
+COMM = None
+RANK = 0
+SIZE = 1
 
-    COMM = MPI.COMM_WORLD
-    RANK = COMM.Get_rank()
-    SIZE = COMM.Get_size()
-except Exception:
-    COMM = None
-    RANK = 0
-    SIZE = 1
+
+def _env_int(names: Sequence[str], default: int = 0) -> int:
+    for name in names:
+        val = os.environ.get(name)
+        if val is None:
+            continue
+        try:
+            return int(val)
+        except Exception:
+            continue
+    return default
+
+
+def _looks_like_mpi_launch() -> bool:
+    size = _env_int(
+        [
+            "OMPI_COMM_WORLD_SIZE",
+            "PMI_SIZE",
+            "PMIX_SIZE",
+            "MPI_LOCALNRANKS",
+            "SLURM_NTASKS",
+        ],
+        default=0,
+    )
+    return size > 1
+
+
+USE_MPI = (
+    "--mpi" in sys.argv
+    or os.environ.get("ENABLE_MPI", "0") == "1"
+    or _looks_like_mpi_launch()
+)
+if "--no-mpi" in sys.argv:
+    USE_MPI = False
+if "--mpi" in sys.argv:
+    sys.argv.remove("--mpi")
+if "--no-mpi" in sys.argv:
+    sys.argv.remove("--no-mpi")
+
+if USE_MPI:
+    try:
+        from mpi4py import MPI
+
+        COMM = MPI.COMM_WORLD
+        RANK = COMM.Get_rank()
+        SIZE = COMM.Get_size()
+    except (ImportError, Exception) as exc:
+        print(f"[WARN] MPI requested but initialization failed: {exc}. Falling back to serial mode.")
+        MPI = None
+        COMM = None
+        RANK = 0
+        SIZE = 1
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -48,15 +95,17 @@ OBS_DEFAULT = SCRIPT_DIR / "npz" / "jodc_tide_all.npz"
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "runs": ["npz/RUN01a.npz"],
-    "tags": ["RUN01a"],
-    "bpfile": "station_jodc.bp",
-    "outdir": "images/RUN01a_WL_only",
-    "obs_path": str(OBS_DEFAULT),
-    "start": "2022-01-14 00:00:00",
-    "end": "2022-03-30 00:00:00",
-    "model_start": "2022-01-02 00:00:00",
-    "model_time_offset_days": [float(datenum("2022-01-02 00:00:00"))],
+    "runs": ["/scratch2/08924/kmpark/post-proc/npz/RUN01e_JODC.npz", "/scratch2/08924/kmpark/post-proc/npz/RUN01f_JODC.npz", "/scratch2/08924/kmpark/post-proc/npz/RUN02a_JODC.npz", "/scratch2/08924/kmpark/post-proc/npz/RUN02b_JODC.npz"],
+    "tags": ["RUN01e", "RUN01f", "RUN02a", "RUN02b"],
+    "bpfile": "/scratch2/08924/kmpark/post-proc/station_jodc.bp",
+    "outdir": "/scratch2/08924/kmpark/post-proc/ESIMAGES/CompJODC_01ef02ab",
+    "obs_path": "/scratch2/08924/kmpark/post-proc/npz/jodc_tide_all.npz",
+    "start": "2017-04-14 00:00:00",
+    "end": "2017-04-30 00:00:00",
+    "model_start": None,
+    "model_time_offset_days": [0.0],
+    "npz_time_mode": "absolute",  # absolute | relative | auto
+    "apply_offset_to_npz": False,  # legacy fallback when npz_time_mode=absolute
     "resample_obs": "h",
     "resample_model": "h",
     "demean": True,
@@ -68,7 +117,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "cutoff_period_hours": 34.0,
     "butterworth_order": 4,
     "station_list": None,
-    "progress_every": 20,
+    "progress_every": 1,
+    "grid": None,  # optional hgrid.gr3 for map boundary
+    "map_zoom": 0.1,  # half-width in degree around active station
 }
 
 
@@ -77,6 +128,27 @@ def log(msg: str, rank0_only: bool = False) -> None:
         return
     prefix = f"[rank {RANK}/{SIZE}] " if SIZE > 1 else ""
     print(prefix + msg, flush=True)
+
+
+def _report_station_assignment(tag: str, total_count: int, local_indices: Sequence[int]) -> None:
+    nloc = len(local_indices)
+    if nloc > 0:
+        first_idx = int(local_indices[0])
+        last_idx = int(local_indices[-1])
+    else:
+        first_idx = -1
+        last_idx = -1
+    log(
+        f"{tag} assignment: local={nloc}/{total_count}, "
+        f"index_range=[{first_idx},{last_idx}], stride={SIZE}",
+        rank0_only=False,
+    )
+    if MPI:
+        counts = COMM.gather(nloc, root=0)
+        if RANK == 0:
+            summary = ", ".join([f"r{i}:{c}" for i, c in enumerate(counts)])
+            log(f"{tag} distribution by rank -> {summary}", rank0_only=True)
+        COMM.Barrier()
 
 
 def _resolve_path(path_like: str) -> Path:
@@ -234,7 +306,36 @@ def _build_station_lookup(obs_map: Dict[str, Tuple[np.ndarray, np.ndarray]]) -> 
     return lookup
 
 
-def _load_model_run(path: Path, offset_days: float) -> Dict[str, np.ndarray]:
+def _npz_time_is_absolute(ds: Any, time_values: np.ndarray) -> bool:
+    if hasattr(ds, "time_is_absolute"):
+        try:
+            return bool(int(np.asarray(ds.time_is_absolute).ravel()[0]) == 1)
+        except Exception:
+            pass
+    if hasattr(ds, "time_units"):
+        try:
+            units = str(np.asarray(ds.time_units).ravel()[0]).lower()
+            if "datenum" in units or "absolute" in units:
+                return True
+        except Exception:
+            pass
+    # Fallback heuristic: absolute datenums are usually very large.
+    finite = np.asarray(time_values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return False
+    return bool(np.nanmedian(finite) > 10000.0)
+
+
+def _load_model_run(
+    path: Path,
+    offset_days: float,
+    npz_time_mode: str = "absolute",
+    apply_offset_to_npz: bool = False,
+) -> Dict[str, Any]:
+    source_kind = "npz" if str(path).endswith(".npz") else "staout"
+    mode_used = ""
+    offset_applied = False
     if str(path).endswith(".npz"):
         ds = loadz(str(path))
         if not hasattr(ds, "time"):
@@ -245,13 +346,37 @@ def _load_model_run(path: Path, offset_days: float) -> Dict[str, np.ndarray]:
             elev = np.asarray(ds.wl, dtype=float)
         else:
             raise ValueError(f"{path}: missing 'elev' (or 'wl') in npz")
-        time_days = np.asarray(ds.time, dtype=float) + float(offset_days)
+        t_raw = np.asarray(ds.time, dtype=float)
+        mode = str(npz_time_mode).strip().lower()
+        if mode not in {"absolute", "relative", "auto"}:
+            raise ValueError(f"Invalid npz_time_mode={npz_time_mode}; expected absolute|relative|auto")
+        if mode == "auto":
+            absolute = _npz_time_is_absolute(ds, t_raw)
+            mode_used = "npz:auto->absolute" if absolute else "npz:auto->relative"
+        elif mode == "absolute":
+            absolute = True
+            mode_used = "npz:absolute"
+        else:
+            absolute = False
+            mode_used = "npz:relative"
+
+        if absolute:
+            time_days = t_raw.astype(float)
+            if apply_offset_to_npz and float(offset_days) != 0.0:
+                time_days = time_days + float(offset_days)
+                offset_applied = True
+                mode_used = mode_used + "+offset"
+        else:
+            time_days = t_raw.astype(float) + float(offset_days)
+            offset_applied = True
     elif str(path).endswith("staout"):
         data = np.loadtxt(str(path) + "_1")
         if data.ndim != 2 or data.shape[1] < 2:
             raise ValueError(f"{path}_1 has unexpected shape")
         time_days = data[:, 0].astype(float) / 86400.0 + float(offset_days)
         elev = data[:, 1:].T.astype(float)
+        mode_used = "staout:relative+offset"
+        offset_applied = True
     else:
         raise ValueError(f"Unsupported run type: {path}")
 
@@ -265,20 +390,28 @@ def _load_model_run(path: Path, offset_days: float) -> Dict[str, np.ndarray]:
     else:
         raise ValueError(f"{path}: cannot align elev shape {elev.shape} with nt={nt}")
 
-    return {"time": time_days, "elev": elev}
+    return {
+        "time": time_days,
+        "elev": elev,
+        "source_kind": source_kind,
+        "time_mode_used": mode_used,
+        "offset_days_used": float(offset_days) if offset_applied else 0.0,
+    }
 
 
-def _build_station_info(bpfile: Path) -> Tuple[List[str], List[str]]:
+def _build_station_info(bpfile: Path) -> Tuple[List[str], List[str], np.ndarray, np.ndarray]:
     bp = read_schism_bpfile(str(bpfile))
     station_ids: List[str] = []
     station_vars: List[str] = []
+    x = np.asarray(getattr(bp, "x"), dtype=float).ravel()
+    y = np.asarray(getattr(bp, "y"), dtype=float).ravel()
     for entry in np.asarray(bp.station).astype("U").tolist():
         parts = str(entry).split()
         sid = parts[0] if parts else ""
         svar = parts[1].upper() if len(parts) > 1 else "WL"
         station_ids.append(sid)
         station_vars.append(svar)
-    return station_ids, station_vars
+    return station_ids, station_vars, x, y
 
 
 def _load_config(args: argparse.Namespace) -> Dict[str, Any]:
@@ -328,10 +461,18 @@ def _load_config(args: argparse.Namespace) -> Dict[str, Any]:
         cfg["plot_ylim"] = [ymin, ymax]
     if args.progress_every is not None:
         cfg["progress_every"] = int(args.progress_every)
+    if args.grid:
+        cfg["grid"] = args.grid
+    if args.map_zoom is not None:
+        cfg["map_zoom"] = float(args.map_zoom)
     if args.model_time_offset_days:
         cfg["model_time_offset_days"] = [float(v) for v in args.model_time_offset_days]
     elif args.model_start:
         cfg["model_time_offset_days"] = [float(datenum(args.model_start))]
+    if args.npz_time_mode:
+        cfg["npz_time_mode"] = str(args.npz_time_mode).strip().lower()
+    if args.apply_offset_to_npz is not None:
+        cfg["apply_offset_to_npz"] = bool(args.apply_offset_to_npz)
 
     runs = list(cfg.get("runs", []))
     tags = list(cfg.get("tags", []))
@@ -348,9 +489,14 @@ def _load_config(args: argparse.Namespace) -> Dict[str, Any]:
         pass
 
     offsets = _expand_scalar_or_list(cfg.get("model_time_offset_days", [0.0]), len(runs))
+    mode = str(cfg.get("npz_time_mode", "absolute")).strip().lower()
+    if mode not in {"absolute", "relative", "auto"}:
+        raise ValueError(f"Invalid npz_time_mode={mode}; expected absolute|relative|auto")
     cfg["runs"] = runs
     cfg["tags"] = tags
     cfg["model_time_offset_days"] = [float(x) for x in offsets]
+    cfg["npz_time_mode"] = mode
+    cfg["apply_offset_to_npz"] = bool(cfg.get("apply_offset_to_npz", False))
     return cfg
 
 
@@ -371,6 +517,24 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=float,
         help="Offset days to add to model time (one value or per-run values).",
     )
+    p.add_argument(
+        "--npz-time-mode",
+        choices=["absolute", "relative", "auto"],
+        help="How to interpret NPZ model time arrays.",
+    )
+    p.add_argument(
+        "--apply-offset-to-npz",
+        dest="apply_offset_to_npz",
+        action="store_true",
+        help="Also apply model_time_offset_days to NPZ even in absolute mode.",
+    )
+    p.add_argument(
+        "--no-apply-offset-to-npz",
+        dest="apply_offset_to_npz",
+        action="store_false",
+        help="Do not apply model_time_offset_days to NPZ in absolute mode.",
+    )
+    p.set_defaults(apply_offset_to_npz=None)
     p.add_argument("--resample-obs", help="Obs resample frequency (e.g., h, d).")
     p.add_argument("--resample-model", help="Model resample frequency (e.g., h, d).")
     p.add_argument("--station-list", nargs="+", help="Optional station IDs filter.")
@@ -397,6 +561,8 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--plot-ymin", type=float, help="Y-axis minimum.")
     p.add_argument("--plot-ymax", type=float, help="Y-axis maximum.")
     p.add_argument("--progress-every", type=int, help="Progress print frequency by station count.")
+    p.add_argument("--grid", help="SCHISM grid file for map panel (gr3).")
+    p.add_argument("--map-zoom", type=float, help="Half-width in degrees around station for map panel.")
     return p.parse_args(argv)
 
 
@@ -405,13 +571,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     cfg = _load_config(args)
 
     outdir = _resolve_path(str(cfg["outdir"]))
-    outdir.mkdir(parents=True, exist_ok=True)
+    if RANK == 0:
+        outdir.mkdir(parents=True, exist_ok=True)
+    if MPI:
+        COMM.Barrier()
 
     cfg_snapshot = outdir / "wl_config_used.json"
     if RANK == 0:
         with open(cfg_snapshot, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
-    if COMM is not None:
+    if MPI:
         COMM.Barrier()
 
     start_dnum = _parse_time_value(cfg["start"])
@@ -423,7 +592,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if not obs_path.exists():
         raise FileNotFoundError(f"Observation file not found: {obs_path}")
 
-    station_ids, station_vars = _build_station_info(_resolve_path(str(cfg["bpfile"])))
+    station_ids, station_vars, station_lon, station_lat = _build_station_info(_resolve_path(str(cfg["bpfile"])))
     wl_indices = [i for i, v in enumerate(station_vars) if str(v).upper() == "WL"]
     if not wl_indices:
         wl_indices = list(range(len(station_ids)))
@@ -435,21 +604,42 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ]
 
     local_indices = [idx for pos, idx in enumerate(wl_indices) if (pos % SIZE) == RANK]
-    log(f"WL stations selected: {len(wl_indices)}; assigned to this rank: {len(local_indices)}", rank0_only=False)
+    _report_station_assignment("WL stations", len(wl_indices), local_indices)
 
     t0 = time.time()
     obs_map = _load_observations(obs_path)
     obs_lookup = _build_station_lookup(obs_map)
     log(f"Loaded observations for {len(obs_map)} stations", rank0_only=True)
+    gd = None
+    if cfg.get("grid"):
+        grid_path = _resolve_path(str(cfg["grid"]))
+        try:
+            gd = read(str(grid_path))
+        except Exception as exc:
+            log(f"[WARN] Failed to read grid {grid_path}: {exc}", rank0_only=True)
 
     model_runs: List[Dict[str, Any]] = []
     for run_path, tag, offset in zip(cfg["runs"], cfg["tags"], cfg["model_time_offset_days"]):
         rp = _resolve_path(str(run_path))
         if not rp.exists() and not str(rp).endswith("staout"):
             raise FileNotFoundError(f"Model run not found: {rp}")
-        model = _load_model_run(rp, float(offset))
+        model = _load_model_run(
+            rp,
+            float(offset),
+            npz_time_mode=str(cfg.get("npz_time_mode", "absolute")),
+            apply_offset_to_npz=bool(cfg.get("apply_offset_to_npz", False)),
+        )
         model_runs.append({"path": str(rp), "tag": tag, **model})
-        log(f"Loaded model {tag}: nsta={model['elev'].shape[0]}, nt={model['elev'].shape[1]}", rank0_only=True)
+        tmin = float(np.nanmin(model["time"])) if len(model["time"]) > 0 else np.nan
+        tmax = float(np.nanmax(model["time"])) if len(model["time"]) > 0 else np.nan
+        tmin_txt = num2date(tmin).strftime("%Y-%m-%d %H:%M:%S") if np.isfinite(tmin) else "nan"
+        tmax_txt = num2date(tmax).strftime("%Y-%m-%d %H:%M:%S") if np.isfinite(tmax) else "nan"
+        log(
+            f"Loaded model {tag}: nsta={model['elev'].shape[0]}, nt={model['elev'].shape[1]}, "
+            f"time={model.get('time_mode_used','')}, "
+            f"range=[{tmin_txt} .. {tmax_txt}]",
+            rank0_only=True,
+        )
 
     rows_local: List[Dict[str, Any]] = []
     progress_every = max(1, int(cfg.get("progress_every", 20)))
@@ -484,10 +674,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 obs_series = obs_series - obs_mean
 
         fig = None
-        ax = None
+        ax_map = None
+        ax_ts = None
         if cfg.get("save_plots", True):
-            fig, ax = plt.subplots(1, 1, figsize=(11, 4))
-            ax.plot(
+            fig, (ax_map, ax_ts) = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [1.0, 2.2]})
+            ax_ts.plot(
                 obs_series.index,
                 obs_series.values,
                 linestyle="None",
@@ -497,6 +688,29 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 alpha=0.8,
                 label="Obs",
             )
+
+            # left panel: station location map
+            if gd is not None:
+                try:
+                    gd.plot_bnd(ax=ax_map)
+                except Exception as exc:
+                    log(f"[WARN] grid boundary plotting failed: {exc}", rank0_only=True)
+            finite_all = np.isfinite(station_lon) & np.isfinite(station_lat)
+            if np.any(finite_all):
+                ax_map.plot(station_lon[finite_all], station_lat[finite_all], ".", color="0.65", ms=3.0, label="Stations")
+            lon0 = float(station_lon[sidx]) if sidx < len(station_lon) else np.nan
+            lat0 = float(station_lat[sidx]) if sidx < len(station_lat) else np.nan
+            if np.isfinite(lon0) and np.isfinite(lat0):
+                ax_map.plot(lon0, lat0, "ro", ms=5, label="Obs site")
+                dz = float(cfg.get("map_zoom", 0.1))
+                if np.isfinite(dz) and dz > 0:
+                    ax_map.set_xlim(lon0 - dz, lon0 + dz)
+                    ax_map.set_ylim(lat0 - dz, lat0 + dz)
+            ax_map.set_title(f"Station {sid}")
+            ax_map.set_xlabel("Lon")
+            ax_map.set_ylabel("Lat")
+            ax_map.grid(alpha=0.3)
+            ax_map.legend(loc="best", fontsize=8)
 
         text_lines = []
         for model in model_runs:
@@ -568,30 +782,30 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 f"Bias={metrics['bias']:.3f}, WSS={metrics['wss']:.3f}"
             )
 
-            if ax is not None:
-                ax.plot(
+            if ax_ts is not None:
+                ax_ts.plot(
                     model_series.index,
                     model_series.values,
                     linewidth=float(cfg["line_width"]),
                     label=model["tag"],
                 )
 
-        if ax is not None and len(ax.lines) > 1:
-            ax.set_title(f"WL station {sid}")
-            ax.set_xlabel("Time")
-            ax.set_ylabel("Water level (m)")
+        if ax_ts is not None and len(ax_ts.lines) > 1:
+            ax_ts.set_title(f"WL station {sid}")
+            ax_ts.set_xlabel("Time")
+            ax_ts.set_ylabel("Water level (m)")
             if cfg.get("plot_ylim") is not None:
                 y0, y1 = cfg["plot_ylim"]
                 if y0 is not None and y1 is not None:
-                    ax.set_ylim(float(y0), float(y1))
-            ax.grid(alpha=0.3)
-            ax.legend(loc="best")
+                    ax_ts.set_ylim(float(y0), float(y1))
+            ax_ts.grid(alpha=0.3)
+            ax_ts.legend(loc="best")
             if text_lines:
-                ax.text(
+                ax_ts.text(
                     0.01,
                     0.02,
                     "\n".join(text_lines[:6]),
-                    transform=ax.transAxes,
+                    transform=ax_ts.transAxes,
                     va="bottom",
                     fontsize=8,
                     bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
@@ -604,7 +818,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if p == 1 or p % progress_every == 0 or p == len(local_indices):
             log(f"Processed {p}/{len(local_indices)} assigned stations")
 
-    if COMM is not None:
+    if MPI:
         all_rows = COMM.gather(rows_local, root=0)
     else:
         all_rows = [rows_local]

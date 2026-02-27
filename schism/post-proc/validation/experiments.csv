@@ -1,5 +1,3 @@
 experiment_id,is_baseline,grid,bathy,forcing,river
-RUN00,1,coarse,GEBCO,basic,climatology
-RUN01,0,fine,GEBCO,basic,climatology
-RUN02,0,coarse,highres,basic,climatology
-RUN03,0,fine,highres,ERA5,observed
+RUN01c,1,coarse,ETOPO,basic,no
+RUN01i,0,coarse,ETOPO,basic,MILT

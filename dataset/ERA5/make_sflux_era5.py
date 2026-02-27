@@ -63,6 +63,11 @@ Flags quick guide:
     Output longitude convention for SCHISM sflux.
       180 or 360
 
+  --accum-mode
+    auto      : detect accumulation style from forecast-hour behavior
+    interval  : treat each forecast_hour as interval accumulation (no differencing)
+    cumulative: treat forecast_hour as cumulative from cycle start (use differencing)
+
   --stream-mode
     month: process month windows (default; memory safer)
     all: process whole period as one window
@@ -144,6 +149,7 @@ CONFIG = dict(
     INDEX_PAD=0,  # 0 -> sflux_rad_1.3.nc ; 4 -> sflux_rad_1.0003.nc
     LON_SYSTEM="360",  # input lon system ("360" for ERA5 0..360)
     OUTPUT_LON_SYSTEM="180",  # output lon system expected by SCHISM
+    ACCUM_MODE="auto",  # auto, interval, cumulative
     OVERWRITE=False,
     STREAM_MODE="month",  # "month" or "all"
     USE_MPI=False,
@@ -331,23 +337,121 @@ def _open_era5(paths, lon_system, bbox, progress=False, progress_every=10):
     return _ensure_fitime_sorted_unique(ds)
 
 
-def _accum_to_hourly_flux(ds, var_name):
+def _forecast_hour_to_float_hours(fhr_values):
+    fhr = np.asarray(fhr_values)
+    if np.issubdtype(fhr.dtype, np.timedelta64):
+        return fhr.astype("timedelta64[s]").astype(float) / 3600.0
+    return np.asarray(fhr, dtype=float)
+
+
+def _infer_accum_mode(da):
+    """
+    Infer whether accumulated fields are interval-style or cumulative-style.
+    interval: values are per-step accumulation (diff can be frequently negative)
+    cumulative: values are running sum from cycle start (diff mostly >= 0)
+    """
+    nfit = min(2, da.sizes.get("forecast_initial_time", 0))
+    if nfit == 0:
+        return "cumulative", np.nan
+
+    lat_stride = max(1, da.sizes.get("lat", 1) // 40)
+    lon_stride = max(1, da.sizes.get("lon", 1) // 40)
+    sample = da.isel(
+        forecast_initial_time=slice(0, nfit),
+        lat=slice(None, None, lat_stride),
+        lon=slice(None, None, lon_stride),
+    )
+    if sample.sizes.get("forecast_hour", 0) < 2:
+        return "interval", np.nan
+
+    d = sample.diff("forecast_hour").values
+    finite = np.isfinite(d)
+    if not finite.any():
+        return "cumulative", np.nan
+    neg_frac = float(np.mean(d[finite] < 0.0))
+    mode = "cumulative" if neg_frac < 0.01 else "interval"
+    return mode, neg_frac
+
+
+def _accum_to_hourly_flux(ds, var_name, accum_mode="auto"):
     if "forecast_initial_time" not in ds.coords or "forecast_hour" not in ds.coords:
         raise ValueError("Dataset must have forecast_initial_time and forecast_hour.")
 
-    da = ds[var_name].transpose("forecast_initial_time", "forecast_hour", "lat", "lon")
-    first = da.isel(forecast_hour=0)
-    diff = da.diff("forecast_hour")
-    incr = xr.concat([first, diff], dim="forecast_hour")
-    incr = incr.assign_coords(forecast_hour=da["forecast_hour"])
+    da = ds[var_name].transpose("forecast_initial_time", "forecast_hour", "lat", "lon").sortby(
+        "forecast_hour"
+    )
+    fhr_hours = _forecast_hour_to_float_hours(da["forecast_hour"].values)
+    if len(fhr_hours) == 0:
+        raise ValueError("forecast_hour has zero length.")
+    if len(fhr_hours) > 1 and np.any(np.diff(fhr_hours) <= 0.0):
+        raise ValueError("forecast_hour must be strictly increasing.")
 
-    # ERA5 accumulated radiation is in J/m^2 (W m^-2 s); convert to W/m^2.
-    flux = incr / 3600.0
+    mode = str(accum_mode).strip().lower()
+    if mode == "auto":
+        mode, neg_frac = _infer_accum_mode(da)
+        if np.isnan(neg_frac):
+            log(f"    Detected accum_mode={mode} (insufficient/invalid diff samples).")
+        else:
+            log(f"    Detected accum_mode={mode} (negative diff fraction={neg_frac:.3f}).")
+    elif mode not in ("interval", "cumulative"):
+        raise ValueError("accum_mode must be one of: auto, interval, cumulative")
+
+    if mode == "interval":
+        if fhr_hours[0] <= 0.0:
+            if len(fhr_hours) < 2:
+                raise ValueError("forecast_hour starts at <=0 with <2 steps; cannot infer step duration.")
+            work = da.isel(forecast_hour=slice(1, None))
+            out_fhr_hours = fhr_hours[1:]
+            step_hours = np.diff(fhr_hours)
+        else:
+            work = da
+            out_fhr_hours = fhr_hours
+            step_hours = np.empty_like(fhr_hours)
+            step_hours[0] = fhr_hours[0]
+            if len(fhr_hours) > 1:
+                step_hours[1:] = np.diff(fhr_hours)
+        if np.any(step_hours <= 0.0):
+            raise ValueError("Non-positive forecast step duration detected.")
+        sec_da = xr.DataArray(
+            step_hours * 3600.0,
+            dims=("forecast_hour",),
+            coords={"forecast_hour": work["forecast_hour"]},
+        )
+        flux = work / sec_da
+    else:
+        # cumulative mode: convert running accumulation to per-step increments
+        if fhr_hours[0] <= 0.0:
+            if len(fhr_hours) < 2:
+                raise ValueError("forecast_hour starts at <=0 with <2 steps; cannot compute increments.")
+            incr = da.diff("forecast_hour")
+            out_fhr_hours = fhr_hours[1:]
+            step_hours = np.diff(fhr_hours)
+        else:
+            first = da.isel(forecast_hour=0)
+            diff = da.diff("forecast_hour")
+            incr = xr.concat([first, diff], dim="forecast_hour")
+            incr = incr.assign_coords(forecast_hour=da["forecast_hour"])
+            out_fhr_hours = fhr_hours
+            step_hours = np.empty_like(fhr_hours)
+            step_hours[0] = fhr_hours[0]
+            if len(fhr_hours) > 1:
+                step_hours[1:] = np.diff(fhr_hours)
+        if np.any(step_hours <= 0.0):
+            raise ValueError("Non-positive forecast step duration detected.")
+        sec_da = xr.DataArray(
+            step_hours * 3600.0,
+            dims=("forecast_hour",),
+            coords={"forecast_hour": incr["forecast_hour"]},
+        )
+        flux = incr / sec_da
+
+    # Convert to physically valid downward flux.
     flux = flux.where(flux >= 0.0, 0.0)
 
-    fit = pd.to_datetime(ds["forecast_initial_time"].values).values.astype("datetime64[h]")
-    fhr = np.asarray(ds["forecast_hour"].values, dtype=int)
-    valid_2d = fit[:, None] + fhr[None, :].astype("timedelta64[h]")
+    fit = pd.to_datetime(ds["forecast_initial_time"].values).values.astype("datetime64[ns]")
+    valid_2d = fit[:, None] + np.rint(out_fhr_hours * 3600.0).astype("int64")[None, :].astype(
+        "timedelta64[s]"
+    )
 
     flat = xr.DataArray(
         flux.values.reshape(-1, flux.sizes["lat"], flux.sizes["lon"]),
@@ -492,8 +596,12 @@ def _build_rad_cache_entry(cfg, ssrd_files, strd_files, materialize=False):
         strd_name = _pick_var_name(ds_strd, ["STRD", "strd"])
 
         t1 = time.time()
-        da_dswrf = _accum_to_hourly_flux(ds_ssrd, ssrd_name)
-        da_dlwrf = _accum_to_hourly_flux(ds_strd, strd_name)
+        da_dswrf = _accum_to_hourly_flux(
+            ds_ssrd, ssrd_name, accum_mode=cfg.get("ACCUM_MODE", "auto")
+        )
+        da_dlwrf = _accum_to_hourly_flux(
+            ds_strd, strd_name, accum_mode=cfg.get("ACCUM_MODE", "auto")
+        )
         log(f"    Converted accumulated fields in {time.time() - t1:.1f} s")
 
         common_time = np.intersect1d(
@@ -778,6 +886,16 @@ def _parse_args(argv=None):
         help="Output longitude system for SCHISM sflux files.",
     )
     ap.add_argument(
+        "--accum-mode",
+        choices=("auto", "interval", "cumulative"),
+        help=(
+            "Interpretation of ERA5 accumulated fields.\n"
+            "  auto      : detect from forecast-hour differencing (recommended)\n"
+            "  interval  : each forecast_hour is already one-step accumulation\n"
+            "  cumulative: values are cumulative from cycle start"
+        ),
+    )
+    ap.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite existing output files if present.",
@@ -884,6 +1002,8 @@ def main(argv=None):
         cfg["LON_SYSTEM"] = args.lon_system
     if args.output_lon_system:
         cfg["OUTPUT_LON_SYSTEM"] = args.output_lon_system
+    if args.accum_mode:
+        cfg["ACCUM_MODE"] = args.accum_mode
     if args.overwrite:
         cfg["OVERWRITE"] = True
     if args.use_mpi:

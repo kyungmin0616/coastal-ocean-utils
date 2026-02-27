@@ -4,7 +4,8 @@ Compare SCHISM profiles against TEAMS CTD observations stored in NPZ.
 """
 
 import argparse
-import copy
+import builtins
+import copy as pycopy
 import csv
 import json
 import os
@@ -20,9 +21,43 @@ COMM = None
 RANK = 0
 SIZE = 1
 
-USE_MPI = "--mpi" in sys.argv or os.environ.get("ENABLE_MPI", "0") == "1"
+def _env_int(names, default=0):
+    for name in names:
+        val = os.environ.get(name)
+        if val is None:
+            continue
+        try:
+            return int(val)
+        except Exception:
+            continue
+    return default
+
+
+def _looks_like_mpi_launch():
+    size = _env_int(
+        [
+            "OMPI_COMM_WORLD_SIZE",
+            "PMI_SIZE",
+            "PMIX_SIZE",
+            "MPI_LOCALNRANKS",
+            "SLURM_NTASKS",
+        ],
+        default=0,
+    )
+    return size > 1
+
+
+USE_MPI = (
+    "--mpi" in sys.argv
+    or os.environ.get("ENABLE_MPI", "0") == "1"
+    or _looks_like_mpi_launch()
+)
+if "--no-mpi" in sys.argv:
+    USE_MPI = False
 if "--mpi" in sys.argv:
     sys.argv.remove("--mpi")
+if "--no-mpi" in sys.argv:
+    sys.argv.remove("--no-mpi")
 
 if USE_MPI:
     try:
@@ -44,18 +79,24 @@ CONFIG = {
         "canonical": "180",  # use "180" for [-180, 180], "360" for [0, 360)
     },
     "date_range": {
-        "start": (2017, 4, 1),
-        "end": (2017, 12, 31),
+        "start": (2012, 2, 1),
+        "end": (2012, 12, 31),
     },
     "compare": {
         "location_only": None,  # True: ignore observation time and use a fixed SCHISM time
         "location_only_time": None,  # datenum or None to use first SCHISM time
         "station_ids": None, # ["4", "5","6", "7","8"],  # list of station_id strings to include, or None for all
         "station_names": None,  # list of station_name strings to include, or None for all
-        "match_month_day": True,  # True: ignore year, match month/day across model times
+        "match_month_day": None,  # True: ignore year, match month/day across model times
+    },
+    "source": {
+        "mode": "npz",  # raw | npz
+        "npz_path": "./npz/RUN01b_OB_D1.npz",  # required when mode=npz
+        "npz_paths": ["./npz/RUN01g_OB_D1.npz","./npz/RUN01h_OB_D1.npz"],
+        "plot_depth_mode": "native",  # native | interp
     },
     "region": {
-        "shapefile": "SO_bnd.shp",  # set to None to skip shapefile filtering
+        "shapefile": "./SO_bnd.shp",  # set to None to skip shapefile filtering
         "use_shapefile": True,
         "subset_bbox": None, #(141.48767,141.56841,38.41906,38.43688),  # (lon_min, lon_max, lat_min, lat_max)
     },
@@ -74,25 +115,18 @@ CONFIG = {
     "schism": [
         {
         "enabled": True,
-        "label": "RUN01e",
+        "label": "RUN01g",
         "color": "g",
-        "run_dir": "/scratch2/08924/kmpark/RUN01e",
-        "variables": ["temp", "salt"],
-        "refdate": datenum("2017-1-2"),
-        "stack_range": (1, 220),
-        "stack_step": 1 / 24,
-        "lon_mode": "180",  # set to "360" if SCHISM output uses 0-360 longitudes
         },
         {
         "enabled": True,
-        "label": "RUN01d",
-        "color": "b",
-        "run_dir": "/scratch2/08924/kmpark/RUN01d",
-        "variables": ["temp", "salt"],
-        "refdate": datenum("2017-1-2"),
-        "stack_range": (1, 220),
-        "stack_step": 1 / 24,
-        "lon_mode": "180",  # set to "360" if SCHISM output uses 0-360 longitudes
+        "label": "RUN01h",
+        "color": "c",
+        },
+        {
+        "enabled": True,
+        "label": "RUN01f",
+        "color": "k",
         },
     ],
 
@@ -114,12 +148,21 @@ CONFIG = {
         "search_radius": 1,  # grid cells to search for nearest wet point if target is all-NaN
     },
     "output": {
-        "dir": "./CompTEAMS_RUN01bd_d1",
+        "dir": "./ESIMAGES/CompTEAMS_2012_01gh",
         "task_name": "ctd",
         "experiment_id": None,
         "write_task_metrics": True,
         "write_scatter_plots": True,
         "save_profile_plots": True,
+        "plot_mode": "full",  # full | quick | off
+        "quick_max_profiles_per_rank": 25,
+        "quick_profile_stride": 5,
+        "profile_dpi_full": 400,
+        "profile_dpi_quick": 150,
+        "profile_tight_layout_full": True,
+        "profile_tight_layout_quick": False,
+        "profile_bbox_inches_full": "tight",
+        "profile_bbox_inches_quick": None,
         "metrics_raw_name": "CTD_metrics_raw.csv",
         "metrics_station_name": "CTD_stats.csv",
         "metrics_model_name": "CTD_stats_by_model.csv",
@@ -133,6 +176,10 @@ CONFIG = {
         "linewidth": 1.5,
         "font_size": 7,
         "obs_color": "r",
+        "map_auto_zoom": False,  # True: auto-center map on observation point
+        "map_zoom_degree": 0.03,  # half-width in degrees around obs point (lon/lat)
+        "map_zoom_degree_lon": None,  # optional lon half-width override
+        "map_zoom_degree_lat": None,  # optional lat half-width override
         "map_xlim": (141.4127, 141.6027),  # e.g. (141.2, 141.8)
         "map_ylim": (38.3298, 38.4992),  # e.g. (38.2, 38.6)
     },
@@ -151,15 +198,30 @@ rc("axes", labelsize=MEDIUM_SIZE)
 rc("figure", titlesize=BIGGER_SIZE)
 
 CANONICAL_LON_MODE = CONFIG["coordinates"].get("canonical", "180")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _deep_update(base, override):
-    out = copy.deepcopy(base)
+    out = pycopy.deepcopy(base)
     for key, val in override.items():
         if isinstance(val, dict) and isinstance(out.get(key), dict):
             out[key] = _deep_update(out[key], val)
+        elif (
+            isinstance(val, list)
+            and isinstance(out.get(key), list)
+            and all(isinstance(v, dict) for v in val)
+            and all(isinstance(v, dict) for v in out.get(key, []))
+            and len(out.get(key, [])) > 0
+        ):
+            # Merge list-of-dicts by index using existing defaults as templates.
+            merged = []
+            base_list = out.get(key, [])
+            for i, item in enumerate(val):
+                tmpl = base_list[i] if i < len(base_list) else base_list[0]
+                merged.append(_deep_update(tmpl, item))
+            out[key] = merged
         else:
-            out[key] = copy.deepcopy(val)
+            out[key] = pycopy.deepcopy(val)
     return out
 
 
@@ -174,8 +236,12 @@ def _parse_args(argv=None):
     p.add_argument("--disable-profile-plots", action="store_true", help="Skip profile/map plot generation.")
     p.add_argument("--disable-scatter", action="store_true", help="Skip integrated scatter plots.")
     p.add_argument("--disable-metrics", action="store_true", help="Skip writing standardized task metrics.")
+    p.add_argument("--plot-mode", choices=["full", "quick", "off"], help="Profile plotting mode.")
     p.add_argument("--start-date", help="Override date_range.start as YYYY-MM-DD.")
     p.add_argument("--end-date", help="Override date_range.end as YYYY-MM-DD.")
+    p.add_argument("--source-mode", choices=["raw", "npz"], help="Data source mode.")
+    p.add_argument("--source-npz", nargs="+", help="One or more NPZs from pextract_schism_ctd.py when source-mode=npz.")
+    p.add_argument("--plot-depth-mode", choices=["native", "interp"], help="Profile plot depth mode for source-mode=npz.")
     return p.parse_args(argv)
 
 
@@ -187,7 +253,7 @@ def _parse_ymd(text):
 def _apply_runtime_overrides(args):
     global CONFIG, CANONICAL_LON_MODE
 
-    cfg = copy.deepcopy(CONFIG)
+    cfg = pycopy.deepcopy(CONFIG)
     if args.config:
         with open(args.config, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
@@ -211,12 +277,32 @@ def _apply_runtime_overrides(args):
     if args.disable_metrics:
         cfg.setdefault("output", {})
         cfg["output"]["write_task_metrics"] = False
+    if args.plot_mode:
+        cfg.setdefault("output", {})
+        cfg["output"]["plot_mode"] = str(args.plot_mode)
+        if str(args.plot_mode).lower() == "off":
+            cfg["output"]["save_profile_plots"] = False
     if args.start_date:
         cfg.setdefault("date_range", {})
         cfg["date_range"]["start"] = _parse_ymd(args.start_date)
     if args.end_date:
         cfg.setdefault("date_range", {})
         cfg["date_range"]["end"] = _parse_ymd(args.end_date)
+    if args.source_mode:
+        cfg.setdefault("source", {})
+        cfg["source"]["mode"] = str(args.source_mode)
+    if args.source_npz:
+        cfg.setdefault("source", {})
+        npz_list = [str(x) for x in args.source_npz]
+        if len(npz_list) == 1:
+            cfg["source"]["npz_path"] = npz_list[0]
+            cfg["source"]["npz_paths"] = None
+        else:
+            cfg["source"]["npz_path"] = npz_list[0]
+            cfg["source"]["npz_paths"] = npz_list
+    if args.plot_depth_mode:
+        cfg.setdefault("source", {})
+        cfg["source"]["plot_depth_mode"] = str(args.plot_depth_mode)
 
     CONFIG = cfg
     CANONICAL_LON_MODE = CONFIG["coordinates"].get("canonical", "180")
@@ -253,6 +339,28 @@ def rank_print(*args, **kwargs):
     print(f"[Rank {RANK}]", *args, **kwargs)
 
 
+def _report_profile_assignment(tag, total_profiles, local_indices):
+    nloc = len(local_indices)
+    if nloc > 0:
+        first_idx = int(local_indices[0])
+        last_idx = int(local_indices[-1])
+    else:
+        first_idx = -1
+        last_idx = -1
+
+    rank_print(
+        f"{tag} assignment: local={nloc}/{total_profiles}, "
+        f"index_range=[{first_idx},{last_idx}], stride={SIZE}"
+    )
+
+    if MPI:
+        counts = COMM.gather(nloc, root=0)
+        if RANK == 0:
+            summary = ", ".join([f"r{i}:{c}" for i, c in enumerate(counts)])
+            rank_print(f"{tag} distribution by rank -> {summary}")
+        COMM.Barrier()
+
+
 def parse_date_range(date_cfg):
     start = datenum(*date_cfg["start"])
     end = datenum(*date_cfg["end"])
@@ -264,9 +372,31 @@ def setup_region(region_cfg):
     use_shapefile = region_cfg.get("use_shapefile", bool(shapefile_path))
     px = py = None
     if use_shapefile and shapefile_path:
-        bp = read_shapefile_data(shapefile_path)
-        px, py = bp.xy.T
-        px = normalize_longitudes(px, CANONICAL_LON_MODE)
+        shp_candidates = [str(shapefile_path)]
+        if not os.path.isabs(str(shapefile_path)):
+            shp_candidates.append(os.path.join(SCRIPT_DIR, str(shapefile_path)))
+
+        shp_path = None
+        for cand in shp_candidates:
+            if os.path.exists(cand):
+                shp_path = cand
+                break
+
+        if shp_path is None:
+            rank_print(
+                f"[WARN] Shapefile not found: {shapefile_path}. "
+                "Proceeding without shapefile region filter."
+            )
+        else:
+            try:
+                bp = read_shapefile_data(shp_path)
+                px, py = bp.xy.T
+                px = normalize_longitudes(px, CANONICAL_LON_MODE)
+            except Exception as exc:
+                rank_print(
+                    f"[WARN] Failed to read shapefile '{shp_path}': {exc}. "
+                    "Proceeding without shapefile region filter."
+                )
     bbox = region_cfg.get("subset_bbox")
     bbox = normalize_bbox(bbox, CANONICAL_LON_MODE)
     return {"px": px, "py": py, "bbox": bbox}
@@ -664,20 +794,25 @@ def format_time_label(label, time_val):
     return f"{label}:{dt.strftime('%Y-%m-%d %H:%M:%S')}"
 
 
-def annotate_stats(ax, models, stats_key, font_size, xm, ym):
-    dy = ym[1] - ym[0]
-    dx = xm[1] - xm[0]
-    y_cursor = ym[0] + 0.1 * dy
+def annotate_stats(ax, models, stats_key, font_size):
+    lines = []
     for model in models:
         stat = model["stats"].get(stats_key)
         if stat is None:
             continue
-        ax.text(xm[0] + 0.1 * dx, y_cursor, f"mdl={model['name']}", fontsize=font_size)
-        ax.text(xm[0] + 0.1 * dx, y_cursor + 0.05 * dy, f"R={stat.R:.3f}", fontsize=font_size)
-        ax.text(xm[0] + 0.1 * dx, y_cursor + 0.10 * dy, f"MAE={stat.MAE:.3f}", fontsize=font_size)
-        ax.text(xm[0] + 0.1 * dx, y_cursor + 0.15 * dy, f"ME={stat.ME:.3f}", fontsize=font_size)
-        ax.text(xm[0] + 0.1 * dx, y_cursor + 0.20 * dy, f"RMSE={stat.RMSD:.3f}", fontsize=font_size)
-        y_cursor += 0.35 * dy
+        lines.append(f"{model['name']}  R={stat.R:.3f}  RMSE={stat.RMSD:.3f}")
+    if not lines:
+        return
+    ax.text(
+        0.02,
+        0.98,
+        "\n".join(lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=font_size,
+        bbox=dict(facecolor="white", alpha=0.65, edgecolor="none"),
+    )
 
 
 def log_skip(reason, profile_id=None, stime=None, lon=None, lat=None):
@@ -693,10 +828,58 @@ def log_skip(reason, profile_id=None, stime=None, lon=None, lat=None):
     rank_print(", ".join(parts))
 
 
-def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
+def _resolve_map_limits(meta, plot_cfg):
+    if bool(plot_cfg.get("map_auto_zoom", False)):
+        lon0 = _safe_float_scalar(meta.get("lon"), default=np.nan)
+        lat0 = _safe_float_scalar(meta.get("lat"), default=np.nan)
+        if np.isfinite(lon0) and np.isfinite(lat0):
+            base = _safe_float_scalar(plot_cfg.get("map_zoom_degree", 0.03), default=0.03)
+            zlon = _safe_float_scalar(plot_cfg.get("map_zoom_degree_lon"), default=base)
+            zlat = _safe_float_scalar(plot_cfg.get("map_zoom_degree_lat"), default=base)
+            zlon = max(float(zlon), 1e-6)
+            zlat = max(float(zlat), 1e-6)
+            return (lon0 - zlon, lon0 + zlon), (lat0 - zlat, lat0 + zlat)
+    return plot_cfg.get("map_xlim"), plot_cfg.get("map_ylim")
+
+
+def _prepare_plot_runtime(output_cfg):
+    mode = str(output_cfg.get("plot_mode", "full")).strip().lower()
+    if not bool(output_cfg.get("save_profile_plots", True)):
+        mode = "off"
+    rt = {
+        "mode": mode,
+        "enabled": mode != "off",
+        "max_per_rank": int(output_cfg.get("quick_max_profiles_per_rank", 25)),
+        "stride": max(1, int(output_cfg.get("quick_profile_stride", 5))),
+    }
+    if mode == "quick":
+        rt["dpi"] = int(output_cfg.get("profile_dpi_quick", 150))
+        rt["tight_layout"] = bool(output_cfg.get("profile_tight_layout_quick", False))
+        rt["bbox_inches"] = output_cfg.get("profile_bbox_inches_quick", None)
+    else:
+        rt["dpi"] = int(output_cfg.get("profile_dpi_full", 400))
+        rt["tight_layout"] = bool(output_cfg.get("profile_tight_layout_full", True))
+        rt["bbox_inches"] = output_cfg.get("profile_bbox_inches_full", "tight")
+    return rt
+
+
+def _should_plot_profile(profile_index, n_saved, plot_runtime):
+    if not bool(plot_runtime.get("enabled", False)):
+        return False
+    if str(plot_runtime.get("mode", "full")).lower() != "quick":
+        return True
+    if int(n_saved) >= int(plot_runtime.get("max_per_rank", 25)):
+        return False
+    stride = max(1, int(plot_runtime.get("stride", 5)))
+    return (int(profile_index) % stride) == 0
+
+
+def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir, plot_runtime=None):
     linewidth = plot_cfg["linewidth"]
     font_size = plot_cfg["font_size"]
     obs_color = plot_cfg["obs_color"]
+    if plot_runtime is None:
+        plot_runtime = {"dpi": 400, "tight_layout": True, "bbox_inches": "tight"}
 
     lon = meta["lon"]
     lat = meta["lat"]
@@ -707,14 +890,22 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
     stime = meta["obs_time"]
 
     obs_time_str = num2date(stime).strftime("%Y-%m-%d %H:%M:%S")
-    model_time_labels = ", ".join([format_time_label(m["name"], m["time"]) for m in models])
+    if len(models) > 0:
+        first_mdl_time = num2date(models[0]["time"]).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        first_mdl_time = "-"
+    profile_title = f"lon:{lon:.2f}, lat:{lat:.2f}, obs:{obs_time_str}, mdl0:{first_mdl_time}"
+    map_xlim, map_ylim = _resolve_map_limits(meta, plot_cfg)
+
+    n_models = max(1, int(len(models)))
+    fig_w = min(12.5, 7.2 + 0.55 * max(0, n_models - 2))
 
     depth_temp_obs, temp_obs = drop_nan_pairs(obs_plot["depth"], obs_plot["temp"])
     depth_salt_obs, salt_obs = drop_nan_pairs(obs_plot["depth"], obs_plot["salt"])
     if len(depth_temp_obs) == 0 or len(depth_salt_obs) == 0:
         return
 
-    figure(figsize=[7.2, 3.5])
+    figure(figsize=[fig_w, 3.5])
     clf()
     subplot(1, 2, 1)
     plot(alon, alat, f"{obs_color}+", markersize=10, label="Obs")
@@ -723,10 +914,10 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
         plot(gm_lon, gm_lat, "k^", markersize=8, label="Global")
     if region["px"] is not None and region["py"] is not None:
         plot(region["px"], region["py"], "k")
-    if plot_cfg.get("map_xlim") is not None:
-        xlim(plot_cfg["map_xlim"])
-    if plot_cfg.get("map_ylim") is not None:
-        ylim(plot_cfg["map_ylim"])
+    if map_xlim is not None:
+        xlim(map_xlim)
+    if map_ylim is not None:
+        ylim(map_ylim)
     xlabel("Longitude")
     ylabel("Latitude")
     legend()
@@ -754,36 +945,33 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
     )
     temp_depth_sets.append(depth_temp_obs)
     temp_value_sets.append(temp_obs)
-    title(
-        f"lon:{lon:.2f}, lat:{lat:.2f}, obs:{obs_time_str}, {model_time_labels}",
-        fontsize=font_size,
-        fontweight="bold",
-    )
+    title(profile_title, fontsize=font_size, fontweight="bold")
     temp_values_concat = concatenate(temp_value_sets)
     temp_depth_concat = concatenate(temp_depth_sets)
     xm = [nanmin(temp_values_concat) - 1, nanmax(temp_values_concat) + 1]
     ym = [nanmin(temp_depth_concat), nanmax(temp_depth_concat)]
     setp(gca(), ylim=ym, xlim=xm)
     gca().invert_yaxis()
-    annotate_stats(gca(), models, "temp", font_size, xm, ym)
-    legend(loc="lower right")
+    annotate_stats(gca(), models, "temp", font_size)
+    legend(loc="center left", bbox_to_anchor=(1.02, 0.5), borderaxespad=0.0)
     xlabel("Temperature ($^\\circ$C)")
     ylabel("Depth (m)")
     gca().xaxis.grid("on")
     gca().yaxis.grid("on")
-    gcf().tight_layout()
+    if bool(plot_runtime.get("tight_layout", True)):
+        gcf().tight_layout(rect=[0.0, 0.0, 0.86, 1.0])
 
     savefig(
         os.path.join(
             output_dir,
             f"{meta['profile_id']}_temp_{num2date(stime).strftime('%Y%m%d%H%M%S')}.png",
         ),
-        dpi=400,
-        bbox_inches="tight",
+        dpi=int(plot_runtime.get("dpi", 400)),
+        bbox_inches=plot_runtime.get("bbox_inches", "tight"),
     )
     close()
 
-    figure(figsize=[7.2, 3.5])
+    figure(figsize=[fig_w, 3.5])
     clf()
     subplot(1, 2, 1)
     plot(alon, alat, f"{obs_color}+", markersize=10, label="Obs")
@@ -792,10 +980,10 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
         plot(gm_lon, gm_lat, "k^", markersize=8, label="Global")
     if region["px"] is not None and region["py"] is not None:
         plot(region["px"], region["py"], "k")
-    if plot_cfg.get("map_xlim") is not None:
-        xlim(plot_cfg["map_xlim"])
-    if plot_cfg.get("map_ylim") is not None:
-        ylim(plot_cfg["map_ylim"])
+    if map_xlim is not None:
+        xlim(map_xlim)
+    if map_ylim is not None:
+        ylim(map_ylim)
     xlabel("Longitude")
     ylabel("Latitude")
     legend()
@@ -823,32 +1011,29 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir):
     )
     salt_depth_sets.append(depth_salt_obs)
     salt_value_sets.append(salt_obs)
-    title(
-        f"lon:{lon:.2f}, lat:{lat:.2f}, obs:{obs_time_str}, {model_time_labels}",
-        fontsize=font_size,
-        fontweight="bold",
-    )
+    title(profile_title, fontsize=font_size, fontweight="bold")
     salt_values_concat = concatenate(salt_value_sets)
     salt_depth_concat = concatenate(salt_depth_sets)
     xm = [nanmin(salt_values_concat) - 1, nanmax(salt_values_concat) + 1]
     ym = [nanmin(salt_depth_concat), nanmax(salt_depth_concat)]
     setp(gca(), ylim=ym, xlim=xm)
     gca().invert_yaxis()
-    annotate_stats(gca(), models, "salt", font_size, xm, ym)
-    legend(loc="lower right")
+    annotate_stats(gca(), models, "salt", font_size)
+    legend(loc="center left", bbox_to_anchor=(1.02, 0.5), borderaxespad=0.0)
     xlabel("Salinity (PSU)")
     ylabel("Depth (m)")
     gca().xaxis.grid("on")
     gca().yaxis.grid("on")
-    gcf().tight_layout()
+    if bool(plot_runtime.get("tight_layout", True)):
+        gcf().tight_layout(rect=[0.0, 0.0, 0.86, 1.0])
 
     savefig(
         os.path.join(
             output_dir,
             f"{meta['profile_id']}_salt_{num2date(stime).strftime('%Y%m%d%H%M%S')}.png",
         ),
-        dpi=400,
-        bbox_inches="tight",
+        dpi=int(plot_runtime.get("dpi", 400)),
+        bbox_inches=plot_runtime.get("bbox_inches", "tight"),
     )
     close()
 
@@ -998,8 +1183,8 @@ def _write_depth_scatter(pair_rows, output_cfg):
                 ax.text(0.5, 0.5, f"No {var} pairs", ha="center", va="center", transform=ax.transAxes)
                 ax.set_axis_off()
                 continue
-            x = np.asarray([float(r.get("model_value", np.nan)) for r in sub], dtype=float)
-            y = np.asarray([float(r.get("obs", np.nan)) for r in sub], dtype=float)
+            x = np.asarray([float(r.get("obs", np.nan)) for r in sub], dtype=float)
+            y = np.asarray([float(r.get("model_value", np.nan)) for r in sub], dtype=float)
             c = np.abs(np.asarray([float(r.get("depth", np.nan)) for r in sub], dtype=float))
             valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(c)
             if valid.sum() < 2:
@@ -1033,12 +1218,12 @@ def _write_depth_scatter(pair_rows, output_cfg):
             ax.plot([lo, hi], [lo, hi], "k", lw=1.7)
             ax.set_xlim(lo, hi)
             ax.set_ylim(lo, hi)
-            ax.set_xlabel(f"Model ({unit_txt})")
-            ax.set_ylabel(f"Observation ({unit_txt})")
+            ax.set_xlabel(f"Observation ({unit_txt})")
+            ax.set_ylabel(f"Model ({unit_txt})")
             ax.set_title(title_txt)
             ax.grid(True, alpha=0.3)
 
-            metrics = compute_basic_metrics(y, x)
+            metrics = compute_basic_metrics(x, y)
             ax.text(
                 0.03,
                 0.96,
@@ -1051,13 +1236,15 @@ def _write_depth_scatter(pair_rows, output_cfg):
             )
 
         if mappable is not None:
-            cbar = fig.colorbar(mappable, ax=axs, orientation="horizontal", fraction=0.08, pad=0.14)
+            # Use a dedicated bottom axis for colorbar to avoid overlap with x-axis labels/ticks.
+            cax = fig.add_axes([0.24, 0.10, 0.52, 0.055])
+            cbar = fig.colorbar(mappable, cax=cax, orientation="horizontal")
             cbar.set_label("Water depth (m)")
 
-        fig.suptitle(f"{model_name}: model vs observation", fontsize=11)
-        fig.tight_layout(rect=[0, 0.06, 1, 0.95])
+        fig.suptitle(f"{model_name}: observation vs model", fontsize=11)
+        fig.subplots_adjust(left=0.07, right=0.98, bottom=0.24, top=0.88, wspace=0.22)
         fp = os.path.join(outdir, f"{_sanitize_name(model_name)}_scatter_depth.png")
-        savefig(fp, dpi=350, bbox_inches="tight")
+        savefig(fp, dpi=350)
         close(fig)
         written.append(fp)
     return written
@@ -1159,10 +1346,449 @@ def _write_task_outputs(pair_rows, output_cfg, run_summary):
     return payload
 
 
+def _build_color_lookup_from_config():
+    cmap = {}
+    sch = CONFIG.get("schism", [])
+    if isinstance(sch, dict):
+        sch = [sch]
+    if isinstance(sch, (list, tuple)):
+        for item in sch:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label", "")).strip()
+            color = str(item.get("color", "")).strip()
+            if label:
+                cmap[label] = color if color else "b"
+    return cmap
+
+
+def _safe_float_scalar(v, default=np.nan):
+    try:
+        x = float(v)
+        if np.isfinite(x):
+            return x
+    except Exception:
+        pass
+    return default
+
+
+def _cmp_from_interp_on_obs_grid(obs_depth, obs_values, model_interp_values):
+    obs_depth = np.asarray(obs_depth, dtype=float)
+    obs_values = np.asarray(obs_values, dtype=float)
+    mod_values = np.asarray(model_interp_values, dtype=float)
+    valid = np.isfinite(obs_depth) & np.isfinite(obs_values) & np.isfinite(mod_values)
+    if valid.sum() < 2:
+        return None
+    dep = obs_depth[valid]
+    obs = obs_values[valid]
+    mod = mod_values[valid]
+    return {
+        "obs": obs,
+        "mod": mod,
+        "depth": dep,
+        "stat": get_stat(mod, obs),
+        "metrics": compute_basic_metrics(obs, mod),
+    }
+
+
+def _resolve_source_npz_paths(source_cfg):
+    raw_paths = None
+    if source_cfg.get("npz_paths") is not None:
+        raw_paths = source_cfg.get("npz_paths")
+    elif source_cfg.get("npz_path") is not None:
+        raw_paths = source_cfg.get("npz_path")
+    if raw_paths is None:
+        return []
+    if isinstance(raw_paths, (list, tuple, np.ndarray)):
+        return [str(p) for p in raw_paths if str(p).strip()]
+    return [str(raw_paths)]
+
+
+def _array_equal_nan_ok(a, b):
+    a = np.asarray(a)
+    b = np.asarray(b)
+    if a.shape != b.shape:
+        return False
+    if a.dtype.kind in {"f", "c"} or b.dtype.kind in {"f", "c"}:
+        return bool(np.allclose(a, b, equal_nan=True))
+    return bool(np.array_equal(a, b))
+
+
+def _load_and_merge_source_npz(npz_paths):
+    if len(npz_paths) == 0:
+        raise ValueError("No source NPZ paths were provided.")
+    datasets = []
+    for path in npz_paths:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"source npz not found: {path}")
+        datasets.append(np.load(path, allow_pickle=True))
+
+    try:
+        required = [
+            "profile_id",
+            "station_id",
+            "lon",
+            "lat",
+            "time_obs",
+            "nlev",
+            "obs_depth",
+            "obs_temp",
+            "obs_sal",
+            "run_names",
+        ]
+        for i, ds in enumerate(datasets):
+            missing = [k for k in required if k not in ds.files]
+            if missing:
+                raise KeyError(f"source npz[{i}] missing required keys: {missing}")
+
+        if len(datasets) == 1:
+            ds0 = datasets[0]
+            return {k: ds0[k] for k in ds0.files}
+
+        run_axis_keys = {
+            "run_names",
+            "run_dirs",
+            "model_start",
+            "model_temp",
+            "model_sal",
+            "model_time",
+            "model_lag_hours",
+            "model_stack",
+            "qc_flag",
+            "model_depth_native",
+            "model_temp_native",
+            "model_sal_native",
+            "model_nlev_native",
+            "has_interp",
+            "has_native",
+        }
+        obs_axis_keys = {
+            "profile_id",
+            "station_id",
+            "station_name",
+            "lon",
+            "lat",
+            "time_obs",
+            "nlev",
+            "obs_depth",
+            "obs_temp",
+            "obs_sal",
+            "time_units",
+        }
+
+        merged = {}
+        ds0 = datasets[0]
+
+        # Keep and verify observation-side arrays once.
+        for key in obs_axis_keys:
+            if key not in ds0.files:
+                continue
+            ref = ds0[key]
+            for j in range(1, len(datasets)):
+                dsj = datasets[j]
+                if key not in dsj.files:
+                    raise KeyError(f"source npz[{j}] missing key '{key}' required for merge.")
+                if not _array_equal_nan_ok(ref, dsj[key]):
+                    raise ValueError(f"source npz mismatch for key '{key}' between file[0] and file[{j}].")
+            merged[key] = ref
+
+        # Merge run-axis arrays by concatenation.
+        union_run_keys = set()
+        for ds in datasets:
+            for key in ds.files:
+                if key in run_axis_keys:
+                    union_run_keys.add(key)
+        for key in sorted(union_run_keys):
+            arrs = []
+            for j, ds in enumerate(datasets):
+                if key not in ds.files:
+                    raise KeyError(f"source npz[{j}] missing run-axis key '{key}' required for merge.")
+                arr = np.asarray(ds[key])
+                if arr.ndim == 0:
+                    arr = arr.reshape(1)
+                arrs.append(arr)
+            ref_shape = arrs[0].shape[1:]
+            for j, arr in enumerate(arrs[1:], start=1):
+                if arr.shape[1:] != ref_shape:
+                    raise ValueError(
+                        f"run-axis shape mismatch for '{key}': file[0]={arrs[0].shape}, file[{j}]={arr.shape}"
+                    )
+            merged[key] = np.concatenate(arrs, axis=0)
+
+        # Keep any other metadata fields from the first file.
+        for key in ds0.files:
+            if key in merged:
+                continue
+            merged[key] = ds0[key]
+        return merged
+    finally:
+        for ds in datasets:
+            try:
+                ds.close()
+            except Exception:
+                pass
+
+
+def _run_npz_source(start_t, end_t, region, output_cfg):
+    source_cfg = CONFIG.get("source", {})
+    npz_paths = _resolve_source_npz_paths(source_cfg)
+    if len(npz_paths) == 0:
+        raise ValueError("CONFIG['source']['npz_path'] or CONFIG['source']['npz_paths'] is required when source.mode='npz'.")
+    source = _load_and_merge_source_npz(npz_paths)
+
+    profile_id_all = np.asarray(source["profile_id"]).astype("U")
+    station_id_all = np.asarray(source["station_id"]).astype("U")
+    station_name_all = np.asarray(source["station_name"]).astype("U") if "station_name" in source else np.asarray([""] * len(profile_id_all)).astype("U")
+    lon_all = np.asarray(source["lon"], dtype=float)
+    lat_all = np.asarray(source["lat"], dtype=float)
+    time_obs_all = np.asarray(source["time_obs"], dtype=float)
+    nlev_all = np.asarray(source["nlev"], dtype=int)
+    obs_depth_all = np.asarray(source["obs_depth"], dtype=float)
+    obs_temp_all = np.asarray(source["obs_temp"], dtype=float)
+    obs_sal_all = np.asarray(source["obs_sal"], dtype=float)
+
+    run_names = np.asarray(source["run_names"]).astype("U")
+    nrun = len(run_names)
+    if nrun == 0:
+        raise RuntimeError("No runs found in source npz.")
+
+    model_time_all = np.asarray(source["model_time"], dtype=float) if "model_time" in source else None
+    model_temp_interp_all = np.asarray(source["model_temp"], dtype=float) if "model_temp" in source else None
+    model_sal_interp_all = np.asarray(source["model_sal"], dtype=float) if "model_sal" in source else None
+    model_depth_native_all = np.asarray(source["model_depth_native"], dtype=float) if "model_depth_native" in source else None
+    model_temp_native_all = np.asarray(source["model_temp_native"], dtype=float) if "model_temp_native" in source else None
+    model_sal_native_all = np.asarray(source["model_sal_native"], dtype=float) if "model_sal_native" in source else None
+    model_nlev_native_all = np.asarray(source["model_nlev_native"], dtype=int) if "model_nlev_native" in source else None
+    has_interp_all = np.asarray(source["has_interp"], dtype=int) if "has_interp" in source else np.ones(nrun, dtype=int)
+    has_native_all = np.asarray(source["has_native"], dtype=int) if "has_native" in source else np.zeros(nrun, dtype=int)
+
+    color_lookup = _build_color_lookup_from_config()
+    default_colors = ["b", "g", "m", "c", "y", "k", "tab:orange", "tab:brown"]
+    plot_depth_mode = str(source_cfg.get("plot_depth_mode", "native")).strip().lower()
+    plot_runtime = _prepare_plot_runtime(output_cfg)
+
+    total_profiles = len(profile_id_all)
+    local_indices = [i for i in range(total_profiles) if i % SIZE == RANK]
+    _report_profile_assignment("npz source", total_profiles, local_indices)
+
+    compare_cfg = CONFIG.get("compare", {})
+    station_ids = compare_cfg.get("station_ids")
+    station_names = compare_cfg.get("station_names")
+    if station_ids is not None:
+        station_ids = set(str(s) for s in station_ids)
+    if station_names is not None:
+        station_names = set(str(s) for s in station_names)
+
+    local_pair_rows = []
+    local_summary = {
+        "rank": RANK,
+        "assigned_profiles": len(local_indices),
+        "processed_profiles": 0,
+        "skipped_profiles": 0,
+        "saved_profile_plots": 0,
+    }
+    task_name = str(output_cfg.get("task_name", "ctd"))
+    experiment_id = output_cfg.get("experiment_id")
+
+    for pidx in local_indices:
+        profile_id = str(profile_id_all[pidx]).strip()
+        station_id = str(station_id_all[pidx]).strip()
+        station_name = str(station_name_all[pidx]).strip()
+        lon_pt = _safe_float_scalar(lon_all[pidx])
+        lat_pt = _safe_float_scalar(lat_all[pidx])
+        stime = _safe_float_scalar(time_obs_all[pidx])
+
+        if station_ids is not None and station_id not in station_ids:
+            local_summary["skipped_profiles"] += 1
+            continue
+        if station_names is not None and station_name not in station_names:
+            local_summary["skipped_profiles"] += 1
+            continue
+        if not np.isfinite(stime) or stime < start_t or stime > end_t:
+            local_summary["skipped_profiles"] += 1
+            continue
+        if (not np.isfinite(lon_pt)) or (not np.isfinite(lat_pt)) or (not point_in_region(region, lon_pt, lat_pt)):
+            local_summary["skipped_profiles"] += 1
+            continue
+
+        nz = int(nlev_all[pidx])
+        if nz < 2:
+            local_summary["skipped_profiles"] += 1
+            continue
+        obs_depth0 = np.asarray(obs_depth_all[pidx, :nz], dtype=float)
+        obs_temp0 = np.asarray(obs_temp_all[pidx, :nz], dtype=float)
+        obs_sal0 = np.asarray(obs_sal_all[pidx, :nz], dtype=float)
+        valid_obs = np.isfinite(obs_depth0) & np.isfinite(obs_temp0) & np.isfinite(obs_sal0)
+        if valid_obs.sum() < 4:
+            local_summary["skipped_profiles"] += 1
+            continue
+        keep_idx = np.where(valid_obs)[0]
+        obs_depth = obs_depth0[keep_idx]
+        obs_temp = obs_temp0[keep_idx]
+        obs_sal = obs_sal0[keep_idx]
+        o = np.argsort(obs_depth)
+        keep_idx = keep_idx[o]
+        obs_depth = obs_depth[o]
+        obs_temp = obs_temp[o]
+        obs_sal = obs_sal[o]
+
+        models = []
+        for ir in range(nrun):
+            model_name = str(run_names[ir]).strip() or f"run_{ir + 1}"
+            model_color = color_lookup.get(model_name, default_colors[ir % len(default_colors)])
+            model_time = stime
+            if model_time_all is not None and model_time_all.ndim == 2:
+                model_time = _safe_float_scalar(model_time_all[ir, pidx], default=stime)
+
+            has_interp = bool(ir < len(has_interp_all) and int(has_interp_all[ir]) == 1 and model_temp_interp_all is not None and model_sal_interp_all is not None)
+            has_native = bool(ir < len(has_native_all) and int(has_native_all[ir]) == 1 and model_depth_native_all is not None and model_temp_native_all is not None and model_sal_native_all is not None and model_nlev_native_all is not None)
+
+            cmp_temp = None
+            cmp_salt = None
+
+            # Metrics always on observation grid.
+            if has_interp:
+                mt_i = np.asarray(model_temp_interp_all[ir, pidx, :nz], dtype=float)[keep_idx]
+                ms_i = np.asarray(model_sal_interp_all[ir, pidx, :nz], dtype=float)[keep_idx]
+                cmp_temp = _cmp_from_interp_on_obs_grid(obs_depth, obs_temp, mt_i)
+                cmp_salt = _cmp_from_interp_on_obs_grid(obs_depth, obs_sal, ms_i)
+            if (cmp_temp is None and cmp_salt is None) and has_native:
+                nn = int(model_nlev_native_all[ir, pidx])
+                if nn >= 2:
+                    md = np.asarray(model_depth_native_all[ir, pidx, :nn], dtype=float)
+                    mt = np.asarray(model_temp_native_all[ir, pidx, :nn], dtype=float)
+                    ms = np.asarray(model_sal_native_all[ir, pidx, :nn], dtype=float)
+                    cmp_temp = interpolate_model_to_obs(md, mt, obs_depth, obs_temp)
+                    cmp_salt = interpolate_model_to_obs(md, ms, obs_depth, obs_sal)
+
+            if cmp_temp is None and cmp_salt is None:
+                continue
+
+            # Plot mode can still use native profiles.
+            p_depth = obs_depth
+            p_temp = np.full(obs_depth.shape, np.nan, dtype=float)
+            p_salt = np.full(obs_depth.shape, np.nan, dtype=float)
+            if plot_depth_mode == "native" and has_native:
+                nn = int(model_nlev_native_all[ir, pidx])
+                if nn >= 2:
+                    p_depth = np.asarray(model_depth_native_all[ir, pidx, :nn], dtype=float)
+                    p_temp = np.asarray(model_temp_native_all[ir, pidx, :nn], dtype=float)
+                    p_salt = np.asarray(model_sal_native_all[ir, pidx, :nn], dtype=float)
+            elif has_interp:
+                p_temp = np.asarray(model_temp_interp_all[ir, pidx, :nz], dtype=float)[keep_idx]
+                p_salt = np.asarray(model_sal_interp_all[ir, pidx, :nz], dtype=float)[keep_idx]
+
+            models.append(
+                {
+                    "name": model_name,
+                    "color": model_color,
+                    "depth": p_depth,
+                    "temp": p_temp,
+                    "salt": p_salt,
+                    "time": model_time,
+                    "stats": {
+                        "temp": cmp_temp["stat"] if cmp_temp is not None else None,
+                        "salt": cmp_salt["stat"] if cmp_salt is not None else None,
+                    },
+                    "compare": {"temp": cmp_temp, "salt": cmp_salt},
+                }
+            )
+
+        if len(models) == 0:
+            local_summary["skipped_profiles"] += 1
+            continue
+
+        local_summary["processed_profiles"] += 1
+        obs_time_txt = num2date(stime).strftime("%Y-%m-%d %H:%M:%S")
+        for model in models:
+            model_name = str(model.get("name", "model"))
+            compares = model.get("compare", {})
+            for var in ("temp", "salt"):
+                cmp = compares.get(var)
+                if cmp is None:
+                    continue
+                obs_vals = np.asarray(cmp["obs"], dtype=float)
+                mod_vals = np.asarray(cmp["mod"], dtype=float)
+                dep_vals = np.asarray(cmp["depth"], dtype=float)
+                for j in range(len(obs_vals)):
+                    local_pair_rows.append(
+                        {
+                            "task": task_name,
+                            "experiment_id": experiment_id if experiment_id is not None else model_name,
+                            "model": model_name,
+                            "station_id": station_id,
+                            "station_id_full": station_id,
+                            "station_name": station_name,
+                            "profile_id": profile_id,
+                            "obs_time": obs_time_txt,
+                            "var": var,
+                            "depth": float(dep_vals[j]),
+                            "obs": float(obs_vals[j]),
+                            "model_value": float(mod_vals[j]),
+                            "error": float(mod_vals[j] - obs_vals[j]),
+                        }
+                    )
+
+        if _should_plot_profile(pidx, local_summary["saved_profile_plots"], plot_runtime):
+            obs_plot = {"depth": obs_depth, "temp": obs_temp, "salt": obs_sal}
+            meta = {
+                "lon": lon_pt,
+                "lat": lat_pt,
+                "lon_array": np.array([lon_pt]),
+                "lat_array": np.array([lat_pt]),
+                "obs_time": stime,
+                "profile_id": profile_id,
+                "gm_lon": None,
+                "gm_lat": None,
+            }
+            plot_profiles(meta, region, obs_plot, models, CONFIG["plot"], output_cfg["dir"], plot_runtime=plot_runtime)
+            local_summary["saved_profile_plots"] += 1
+
+    local_summary["pair_samples"] = len(local_pair_rows)
+    if MPI:
+        pair_chunks = COMM.gather(local_pair_rows, root=0)
+        summary_chunks = COMM.gather(local_summary, root=0)
+    else:
+        pair_chunks = [local_pair_rows]
+        summary_chunks = [local_summary]
+
+    if RANK == 0:
+        pair_rows = [r for chunk in pair_chunks for r in chunk]
+        total_summary = {
+            "mpi_size": SIZE,
+            "total_profiles": total_profiles,
+            "assigned_profiles": int(builtins.sum(s["assigned_profiles"] for s in summary_chunks)),
+            "processed_profiles": int(builtins.sum(s["processed_profiles"] for s in summary_chunks)),
+            "skipped_profiles": int(builtins.sum(s["skipped_profiles"] for s in summary_chunks)),
+            "saved_profile_plots": int(builtins.sum(s["saved_profile_plots"] for s in summary_chunks)),
+            "pair_samples": int(builtins.sum(s["pair_samples"] for s in summary_chunks)),
+            "source_mode": "npz",
+            "source_npz": npz_paths[0] if len(npz_paths) == 1 else npz_paths,
+            "source_npz_count": int(len(npz_paths)),
+            "plot_depth_mode": plot_depth_mode,
+        }
+        _write_task_outputs(pair_rows, output_cfg, total_summary)
+        rank_print("done")
+    if MPI:
+        COMM.Barrier()
+
+
 def main():
     start_t, end_t = parse_date_range(CONFIG["date_range"])
     region = setup_region(CONFIG["region"])
     output_cfg = CONFIG.get("output", {})
+    plot_runtime = _prepare_plot_runtime(output_cfg)
+    source_cfg = CONFIG.get("source", {})
+    source_mode = str(source_cfg.get("mode", "raw")).strip().lower()
+
+    if RANK == 0:
+        ensure_output_dir(output_cfg["dir"])
+    if MPI:
+        COMM.Barrier()
+
+    if source_mode == "npz":
+        _run_npz_source(start_t, end_t, region, output_cfg)
+        return
 
     sch_cfg = prepare_schism(CONFIG["schism"])
     gm_cfg = prepare_global_model(CONFIG["global_model"], start_t, end_t)
@@ -1171,11 +1797,6 @@ def main():
     if len(active_models) == 0:
         rank_print("No models selected for comparison. Enable at least one model in CONFIG.")
         return
-
-    if RANK == 0:
-        ensure_output_dir(output_cfg["dir"])
-    if MPI:
-        COMM.Barrier()
 
     teams_cfg = CONFIG["teams"]
     S = loadz(teams_cfg["npz_path"])
@@ -1201,7 +1822,7 @@ def main():
         return
 
     local_indices = [i for i in range(total_profiles) if i % SIZE == RANK]
-    rank_print(f"Assigned {len(local_indices)} of {total_profiles} profiles.")
+    _report_profile_assignment("raw source", total_profiles, local_indices)
 
     compare_cfg = CONFIG.get("compare", {})
     location_only = bool(compare_cfg.get("location_only", False))
@@ -1380,7 +2001,7 @@ def main():
                         }
                     )
 
-        if bool(output_cfg.get("save_profile_plots", True)):
+        if _should_plot_profile(profile_idx, local_summary["saved_profile_plots"], plot_runtime):
             obs_plot = {"depth": obs_depth, "temp": obs_temp, "salt": obs_salt}
             meta = {
                 "lon": lon_pt,
@@ -1392,7 +2013,7 @@ def main():
                 "gm_lon": gm_lon,
                 "gm_lat": gm_lat,
             }
-            plot_profiles(meta, region, obs_plot, models, CONFIG["plot"], output_cfg["dir"])
+            plot_profiles(meta, region, obs_plot, models, CONFIG["plot"], output_cfg["dir"], plot_runtime=plot_runtime)
             local_summary["saved_profile_plots"] += 1
 
     local_summary["pair_samples"] = len(local_pair_rows)
@@ -1408,11 +2029,11 @@ def main():
         total_summary = {
             "mpi_size": SIZE,
             "total_profiles": total_profiles,
-            "assigned_profiles": int(sum(s["assigned_profiles"] for s in summary_chunks)),
-            "processed_profiles": int(sum(s["processed_profiles"] for s in summary_chunks)),
-            "skipped_profiles": int(sum(s["skipped_profiles"] for s in summary_chunks)),
-            "saved_profile_plots": int(sum(s["saved_profile_plots"] for s in summary_chunks)),
-            "pair_samples": int(sum(s["pair_samples"] for s in summary_chunks)),
+            "assigned_profiles": int(builtins.sum(s["assigned_profiles"] for s in summary_chunks)),
+            "processed_profiles": int(builtins.sum(s["processed_profiles"] for s in summary_chunks)),
+            "skipped_profiles": int(builtins.sum(s["skipped_profiles"] for s in summary_chunks)),
+            "saved_profile_plots": int(builtins.sum(s["saved_profile_plots"] for s in summary_chunks)),
+            "pair_samples": int(builtins.sum(s["pair_samples"] for s in summary_chunks)),
         }
         _write_task_outputs(pair_rows, output_cfg, total_summary)
         rank_print("done")

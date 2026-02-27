@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -27,6 +29,64 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from pylib import loadz, read_schism_bpfile, datenum, num2date, read
+
+MPI = None
+COMM = None
+RANK = 0
+SIZE = 1
+
+
+def _env_int(names: Sequence[str], default: int = 0) -> int:
+    for name in names:
+        val = os.environ.get(name)
+        if val is None:
+            continue
+        try:
+            return int(val)
+        except Exception:
+            continue
+    return default
+
+
+def _looks_like_mpi_launch() -> bool:
+    size = _env_int(
+        [
+            "OMPI_COMM_WORLD_SIZE",
+            "PMI_SIZE",
+            "PMIX_SIZE",
+            "MPI_LOCALNRANKS",
+            "SLURM_NTASKS",
+        ],
+        default=0,
+    )
+    return size > 1
+
+
+USE_MPI = (
+    "--mpi" in sys.argv
+    or os.environ.get("ENABLE_MPI", "0") == "1"
+    or _looks_like_mpi_launch()
+)
+if "--no-mpi" in sys.argv:
+    USE_MPI = False
+if "--mpi" in sys.argv:
+    sys.argv.remove("--mpi")
+if "--no-mpi" in sys.argv:
+    sys.argv.remove("--no-mpi")
+
+if USE_MPI:
+    try:
+        from mpi4py import MPI
+
+        COMM = MPI.COMM_WORLD
+        RANK = COMM.Get_rank()
+        SIZE = COMM.Get_size()
+    except (ImportError, Exception) as exc:
+        print(f"[WARN] MPI requested but initialization failed: {exc}. Falling back to serial mode.")
+        MPI = None
+        COMM = None
+        RANK = 0
+        SIZE = 1
 
 
 CONFIG: Dict[str, Any] = dict(
@@ -65,6 +125,32 @@ CONFIG: Dict[str, Any] = dict(
     scatter_size=9,
     scatter_cmap="viridis",
 )
+
+
+def rank_print(*args: Any, **kwargs: Any) -> None:
+    if "flush" not in kwargs:
+        kwargs["flush"] = True
+    print(f"[Rank {RANK}]", *args, **kwargs)
+
+
+def _report_station_assignment(tag: str, total_count: int, local_indices: Sequence[int]) -> None:
+    nloc = len(local_indices)
+    if nloc > 0:
+        first_idx = int(local_indices[0])
+        last_idx = int(local_indices[-1])
+    else:
+        first_idx = -1
+        last_idx = -1
+    rank_print(
+        f"{tag} assignment: local={nloc}/{total_count}, "
+        f"index_range=[{first_idx},{last_idx}], stride={SIZE}"
+    )
+    if MPI:
+        counts = COMM.gather(nloc, root=0)
+        if RANK == 0:
+            summary = ", ".join([f"r{i}:{c}" for i, c in enumerate(counts)])
+            rank_print(f"{tag} distribution by rank -> {summary}")
+        COMM.Barrier()
 
 
 def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -578,15 +664,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     cfg = _build_runtime_config(args)
 
     outdir = Path(cfg["outdir"]).expanduser().resolve()
-    outdir.mkdir(parents=True, exist_ok=True)
+    if RANK == 0:
+        outdir.mkdir(parents=True, exist_ok=True)
+    if MPI:
+        COMM.Barrier()
 
-    with open(outdir / "th_config_used.json", "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    if RANK == 0:
+        with open(outdir / "th_config_used.json", "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    if MPI:
+        COMM.Barrier()
 
     teams = loadz(str(Path(cfg["teams_npz"]).expanduser()))
     schism_models = _load_schism_models(cfg)
     if not schism_models:
-        print("[ERROR] No SCHISM NPZ provided.")
+        rank_print("[ERROR] No SCHISM NPZ provided.")
         return
 
     gd = None
@@ -594,7 +686,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         try:
             gd = read(cfg["grid"])
         except Exception as exc:
-            print(f"[WARN] Failed to read grid {cfg['grid']}: {exc}")
+            rank_print(f"[WARN] Failed to read grid {cfg['grid']}: {exc}")
 
     bp_names = _station_names_from_bp(cfg["bpfile"])
     if cfg["station_list"]:
@@ -607,25 +699,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 filtered.append(n)
         bp_names = filtered
 
-    station_rows: List[Dict[str, Any]] = []
-    raw_rows: List[Dict[str, Any]] = []
+    local_indices = [i for i in range(len(bp_names)) if (i % SIZE) == RANK]
+    _report_station_assignment("station loop", len(bp_names), local_indices)
 
-    summary = {
-        "stations_requested": len(bp_names),
+    station_rows_local: List[Dict[str, Any]] = []
+    raw_rows_local: List[Dict[str, Any]] = []
+
+    summary_local = {
         "stations_with_obs": 0,
         "station_var_pairs": 0,
         "station_var_pairs_with_overlap": 0,
-        "models": [m["label"] for m in schism_models],
     }
 
-    for idx, name in enumerate(bp_names):
+    for idx in local_indices:
+        name = bp_names[idx]
         sid_full = _extract_station_id(name)
         sid_short = _station_id_short(name)
         station_depth = _teams_station_depth_mean(teams, sid_short)
 
         station_has_obs = False
         for var in cfg["vars"]:
-            summary["station_var_pairs"] += 1
+            summary_local["station_var_pairs"] += 1
             obs_times, obs_vals = _teams_station_series(
                 teams,
                 sid_short,
@@ -636,7 +730,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             if obs_times is None:
                 if cfg.get("debug_times", False):
-                    print(f"[WARN] No TEAMS data for station={sid_full}, var={var}")
+                    rank_print(f"[WARN] No TEAMS data for station={sid_full}, var={var}")
                 continue
             station_has_obs = True
 
@@ -658,14 +752,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     sta_idx = idx
                 else:
                     if cfg.get("debug_times", False):
-                        print(f"[WARN] No SCHISM station match for {name} in {model['label']}")
+                        rank_print(f"[WARN] No SCHISM station match for {name} in {model['label']}")
                     continue
 
                 try:
                     arr = _get_schism_var(schism, var)
                 except KeyError as exc:
                     if cfg.get("debug_times", False):
-                        print(f"[WARN] {exc}")
+                        rank_print(f"[WARN] {exc}")
                     continue
 
                 arr = _time_first(arr, len(getattr(schism, "time")))
@@ -687,7 +781,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 common = obs_series.index.intersection(mod_series.index)
                 if len(common) == 0:
                     if cfg.get("debug_times", False):
-                        print(f"[WARN] No overlap for station={sid_full}, var={var}, model={label}")
+                        rank_print(f"[WARN] No overlap for station={sid_full}, var={var}, model={label}")
                     continue
 
                 var_had_overlap = True
@@ -695,7 +789,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 mod_c = mod_series.loc[common].values.astype(float)
                 mm = _compute_metrics(obs_c, mod_c)
 
-                station_rows.append(
+                station_rows_local.append(
                     {
                         "model": label,
                         "station_name": str(name),
@@ -717,7 +811,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 task_name = str(cfg.get("task_name", "th"))
                 exp_id = cfg.get("experiment_id") or label
                 for t, o, m in zip(common, obs_c, mod_c):
-                    raw_rows.append(
+                    raw_rows_local.append(
                         {
                             "task": task_name,
                             "experiment_id": exp_id,
@@ -735,7 +829,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     )
 
             if var_had_overlap:
-                summary["station_var_pairs_with_overlap"] += 1
+                summary_local["station_var_pairs_with_overlap"] += 1
 
             if not cfg.get("save_plots", True):
                 continue
@@ -795,7 +889,29 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             plt.close(fig)
 
         if station_has_obs:
-            summary["stations_with_obs"] += 1
+            summary_local["stations_with_obs"] += 1
+
+    if MPI:
+        station_chunks = COMM.gather(station_rows_local, root=0)
+        raw_chunks = COMM.gather(raw_rows_local, root=0)
+        summary_chunks = COMM.gather(summary_local, root=0)
+    else:
+        station_chunks = [station_rows_local]
+        raw_chunks = [raw_rows_local]
+        summary_chunks = [summary_local]
+
+    if RANK != 0:
+        return
+
+    station_rows = [row for part in station_chunks for row in part]
+    raw_rows = [row for part in raw_chunks for row in part]
+    summary = {
+        "stations_requested": len(bp_names),
+        "stations_with_obs": int(sum(s["stations_with_obs"] for s in summary_chunks)),
+        "station_var_pairs": int(sum(s["station_var_pairs"] for s in summary_chunks)),
+        "station_var_pairs_with_overlap": int(sum(s["station_var_pairs_with_overlap"] for s in summary_chunks)),
+        "models": [m["label"] for m in schism_models],
+    }
 
     model_rows = _aggregate_model_metrics(raw_rows)
 
@@ -851,21 +967,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         _write_csv(stats_path, station_rows, station_fields)
         _write_csv(raw_path, raw_rows, raw_fields)
         _write_csv(model_path, model_rows, model_fields)
-        print(f"Wrote stats to {stats_path}")
-        print(f"Wrote raw pairs to {raw_path}")
-        print(f"Wrote model summary to {model_path}")
+        rank_print(f"Wrote stats to {stats_path}")
+        rank_print(f"Wrote raw pairs to {raw_path}")
+        rank_print(f"Wrote model summary to {model_path}")
     else:
-        print("write_task_metrics=False: skipped CSV output.")
+        rank_print("write_task_metrics=False: skipped CSV output.")
 
     scatter_files: List[str] = []
     if cfg.get("write_integrated_scatter", True):
         scatter_files = _write_integrated_scatter(raw_rows, cfg, outdir)
         for sf in scatter_files:
-            print(f"Wrote scatter: {sf}")
+            rank_print(f"Wrote scatter: {sf}")
 
     manifest = {
         "summary": {
             **summary,
+            "mpi_size": int(SIZE),
             "station_rows": len(station_rows),
             "raw_rows": len(raw_rows),
             "model_rows": len(model_rows),
