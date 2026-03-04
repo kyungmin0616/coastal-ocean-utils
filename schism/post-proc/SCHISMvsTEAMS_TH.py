@@ -159,7 +159,7 @@ TH_MODEL_FIELDS = [
 # MPI setup
 # =============================================================================
 MPI, COMM, RANK, SIZE, USE_MPI = init_mpi_runtime(sys.argv)
-SCRIPT_DIR = Path(__file__).resolve().parent
+PATH_BASE_DIR = Path.cwd()
 
 # =============================================================================
 # Core helpers
@@ -181,6 +181,27 @@ def _report_station_assignment(tag: str, total_count: int, local_indices: Sequen
         mpi_enabled=bool(MPI),
         logger=rank_print,
     )
+
+
+def _set_path_base(config_path_like: Optional[str]) -> Optional[Path]:
+    global PATH_BASE_DIR
+    if config_path_like:
+        cfg_path = Path(str(config_path_like)).expanduser()
+        if not cfg_path.is_absolute():
+            cfg_path = (Path.cwd() / cfg_path).resolve()
+        else:
+            cfg_path = cfg_path.resolve()
+        PATH_BASE_DIR = cfg_path.parent
+        return cfg_path
+    PATH_BASE_DIR = Path.cwd()
+    return None
+
+
+def _resolve_path(path_like: str) -> Path:
+    path = Path(str(path_like)).expanduser()
+    if path.is_absolute():
+        return path
+    return (PATH_BASE_DIR / path).resolve()
 
 
 def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -483,7 +504,8 @@ def _load_schism_models(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     labels = cfg.get("schism_labels")
     models: List[Dict[str, Any]] = []
     for i, p in enumerate(paths):
-        ds = loadz(p)
+        p_resolved = _resolve_path(str(p))
+        ds = loadz(str(p_resolved))
         label = labels[i] if labels and i < len(labels) else Path(p).stem
         names = _get_schism_station_names(ds)
         time_index = _npz_time_to_datetime_index(
@@ -496,7 +518,7 @@ def _load_schism_models(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         )
         models.append(
             {
-                "path": p,
+                "path": str(p_resolved),
                 "label": label,
                 "data": ds,
                 "names": names,
@@ -530,9 +552,7 @@ def _resolve_map_region(region_cfg: Dict[str, Any]) -> Dict[str, Any]:
     use_shapefile = bool(region_cfg.get("use_shapefile", bool(shapefile)))
     px = py = None
     if use_shapefile and shapefile:
-        shp_path = Path(str(shapefile))
-        if not shp_path.is_absolute():
-            shp_path = (SCRIPT_DIR / shp_path).resolve()
+        shp_path = _resolve_path(str(shapefile))
         if shp_path.exists():
             try:
                 bp = read_shapefile_data(str(shp_path))
@@ -736,8 +756,9 @@ def _write_integrated_scatter(raw_rows: List[Dict[str, Any]], cfg: Dict[str, Any
 
 def _build_canonical_config(args: argparse.Namespace) -> Dict[str, Any]:
     cfg = copy.deepcopy(CONFIG)
-    if args.config:
-        with open(args.config, "r", encoding="utf-8") as f:
+    config_path = _set_path_base(args.config)
+    if config_path:
+        with open(config_path, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
         cfg = _deep_update(cfg, user_cfg)
 
@@ -884,7 +905,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     canonical_cfg = _build_canonical_config(args)
     cfg = _canonical_to_runtime_config(canonical_cfg)
 
-    outdir = Path(cfg["outdir"]).expanduser().resolve()
+    outdir = _resolve_path(str(cfg["outdir"]))
     if RANK == 0:
         outdir.mkdir(parents=True, exist_ok=True)
     if MPI:
@@ -896,7 +917,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if MPI:
         COMM.Barrier()
 
-    teams = loadz(str(Path(cfg["teams_npz"]).expanduser()))
+    teams = loadz(str(_resolve_path(str(cfg["teams_npz"]))))
     teams_station_index = _build_teams_station_index(teams)
     schism_models = _load_schism_models(cfg)
     if not schism_models:
@@ -906,12 +927,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     gd = None
     if cfg.get("grid"):
         try:
-            gd = read(cfg["grid"])
+            gd = read(str(_resolve_path(str(cfg["grid"]))))
         except Exception as exc:
             rank_print(f"[WARN] Failed to read grid {cfg['grid']}: {exc}")
     region = _resolve_map_region(cfg.get("map_region", {}))
 
-    bp_names = _station_names_from_bp(cfg["bpfile"])
+    bp_names = _station_names_from_bp(str(_resolve_path(str(cfg["bpfile"]))))
     if cfg["station_list"]:
         keep = {str(x) for x in cfg["station_list"]}
         filtered = []

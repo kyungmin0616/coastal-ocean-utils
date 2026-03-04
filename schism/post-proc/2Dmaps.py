@@ -107,6 +107,8 @@ MPI, _COMM, _RANK, _SIZE, _USE_MPI = init_mpi_runtime(sys.argv, consume_flags=Fa
 # -------------------------
 # Helpers
 # -------------------------
+PATH_BASE_DIR = Path.cwd()
+
 VAR_DEFAULTS = {
     "ssh":  {"cmap": "cmocean.balance", "clim": (-1.5, 1.5), "title": "Sea Surface Height (m)"},
     "uv":   {"cmap": "cmocean.speed",   "clim": (0.0, 1.0),   "title": "Surface Current Speed (m s$^{-1}$)"},
@@ -246,13 +248,21 @@ def _to_scalar(v, default=None):
         return v[0]
     return v
 
+def _resolve_path(path_like):
+    if path_like is None:
+        return None
+    path = Path(str(path_like)).expanduser()
+    if path.is_absolute():
+        return str(path)
+    return str((PATH_BASE_DIR / path).resolve())
+
 def _resolve_run_root(run_path):
-    p = Path(run_path).resolve()
+    p = Path(_resolve_path(run_path))
     return p.parent if p.name == "outputs" else p
 
 def _get_model_start_datenum(run_path, param_nml=None, apply_utc_start=False):
     if param_nml:
-        pfile = Path(param_nml)
+        pfile = Path(_resolve_path(param_nml))
     else:
         pfile = _resolve_run_root(run_path) / "param.nml"
 
@@ -766,6 +776,10 @@ def _merge_config(args):
         "accum_dtype": str(runtime_cfg.get("accum_dtype", "float32")),
         "no_mpi": bool(ad.get("no_mpi", False)),
     }
+
+    for key in ("base_run_dir", "base_outdir", "hgrid", "run", "outdir", "param_nml"):
+        if merged.get(key) is not None:
+            merged[key] = _resolve_path(merged.get(key))
 
     missing = [k for k in ("hgrid", "run", "outdir") if merged.get(k) is None]
     if missing:

@@ -101,7 +101,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     signal = None
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+PATH_BASE_DIR = Path.cwd()
 
 # =============================================================================
 # MPI setup
@@ -128,11 +128,25 @@ def _report_station_assignment(tag: str, total_count: int, local_indices: Sequen
     )
 
 
+def _set_path_base(config_path_like: Optional[str]) -> Optional[Path]:
+    global PATH_BASE_DIR
+    if config_path_like:
+        cfg_path = Path(os.path.expanduser(str(config_path_like)))
+        if not cfg_path.is_absolute():
+            cfg_path = (Path.cwd() / cfg_path).resolve()
+        else:
+            cfg_path = cfg_path.resolve()
+        PATH_BASE_DIR = cfg_path.parent
+        return cfg_path
+    PATH_BASE_DIR = Path.cwd()
+    return None
+
+
 def _resolve_path(path_like: str) -> Path:
     path = Path(os.path.expanduser(path_like))
     if path.is_absolute():
         return path
-    return (SCRIPT_DIR / path).resolve()
+    return (PATH_BASE_DIR / path).resolve()
 
 
 def _resolve_map_region(region_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -140,9 +154,7 @@ def _resolve_map_region(region_cfg: Dict[str, Any]) -> Dict[str, Any]:
     use_shapefile = bool(region_cfg.get("use_shapefile", bool(shapefile)))
     px = py = None
     if use_shapefile and shapefile:
-        shp_path = Path(str(shapefile))
-        if not shp_path.is_absolute():
-            shp_path = (SCRIPT_DIR / shp_path).resolve()
+        shp_path = _resolve_path(str(shapefile))
         if shp_path.exists():
             try:
                 bp = read_shapefile_data(str(shp_path))
@@ -429,8 +441,9 @@ def _build_station_info(bpfile: Path) -> Tuple[List[str], List[str], np.ndarray,
 
 def _build_canonical_config(args: argparse.Namespace) -> Dict[str, Any]:
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    if args.config:
-        with open(args.config, "r", encoding="utf-8") as f:
+    config_path = _set_path_base(args.config)
+    if config_path:
+        with open(config_path, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
         cfg = deep_update_dict(cfg, user_cfg, merge_list_of_dicts=False)
 

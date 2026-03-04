@@ -117,6 +117,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 from matplotlib import rc
 import matplotlib.pyplot as plt
 from scipy import interpolate
@@ -159,7 +160,7 @@ rc("figure", titlesize=BIGGER_SIZE)
 CONFIG = {}
 CANONICAL_CONFIG = pycopy.deepcopy(DEFAULT_CONFIG)
 CANONICAL_LON_MODE = DEFAULT_CONFIG.get("model", {}).get("coordinates", {}).get("canonical", "180")
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PATH_BASE_DIR = Path.cwd()
 
 # =============================================================================
 # MPI runtime state
@@ -169,6 +170,29 @@ MPI, COMM, RANK, SIZE, USE_MPI = init_mpi_runtime(sys.argv)
 
 def _deep_update(base, override):
     return deep_update_dict(base, override, merge_list_of_dicts=True)
+
+
+def _set_path_base(config_path_like):
+    global PATH_BASE_DIR
+    if config_path_like:
+        cfg_path = Path(str(config_path_like)).expanduser()
+        if not cfg_path.is_absolute():
+            cfg_path = (Path.cwd() / cfg_path).resolve()
+        else:
+            cfg_path = cfg_path.resolve()
+        PATH_BASE_DIR = cfg_path.parent
+        return str(cfg_path)
+    PATH_BASE_DIR = Path.cwd()
+    return None
+
+
+def _resolve_path(path_like):
+    if path_like is None:
+        return None
+    path = Path(str(path_like)).expanduser()
+    if path.is_absolute():
+        return str(path)
+    return str((PATH_BASE_DIR / path).resolve())
 
 
 def _parse_args(argv=None):
@@ -211,6 +235,25 @@ def _canonical_to_runtime_config(canonical_cfg):
     start_val = list(start_raw) if start_raw is not None else [2012, 2, 1]
     end_val = list(end_raw) if end_raw is not None else [2014, 12, 31]
 
+    region_cfg = pycopy.deepcopy(map_cfg.get("region", {}))
+    if region_cfg.get("shapefile"):
+        region_cfg["shapefile"] = _resolve_path(region_cfg.get("shapefile"))
+
+    source_npz_raw = model_cfg.get("source_npz_paths") or []
+    source_npz_paths = []
+    for p in source_npz_raw:
+        if str(p).strip():
+            source_npz_paths.append(_resolve_path(p))
+
+    schism_cfg = pycopy.deepcopy(model_cfg.get("schism", []))
+    for item in schism_cfg:
+        if isinstance(item, dict) and item.get("run_dir"):
+            item["run_dir"] = _resolve_path(item.get("run_dir"))
+
+    global_cfg = pycopy.deepcopy(model_cfg.get("global", {}))
+    if isinstance(global_cfg, dict) and global_cfg.get("data_dir"):
+        global_cfg["data_dir"] = _resolve_path(global_cfg.get("data_dir"))
+
     runtime_cfg = {
         "coordinates": pycopy.deepcopy(model_cfg.get("coordinates", {"canonical": "180"})),
         "date_range": {
@@ -224,14 +267,14 @@ def _canonical_to_runtime_config(canonical_cfg):
             "location_only_time": time_cfg.get("location_only_time"),
             "match_month_day": time_cfg.get("match_month_day"),
         },
-        "region": pycopy.deepcopy(map_cfg.get("region", {})),
+        "region": region_cfg,
         "source": {
             "mode": model_cfg.get("source_mode", "raw"),
-            "npz_paths": pycopy.deepcopy(model_cfg.get("source_npz_paths")),
+            "npz_paths": source_npz_paths,
             "plot_depth_mode": model_cfg.get("plot_depth_mode", "native"),
         },
         "teams": {
-            "npz_path": obs_cfg.get("path"),
+            "npz_path": _resolve_path(obs_cfg.get("path")),
             "lon_name": fields_cfg.get("lon", "lon"),
             "lat_name": fields_cfg.get("lat", "lat"),
             "time_name": fields_cfg.get("time", "time"),
@@ -241,9 +284,12 @@ def _canonical_to_runtime_config(canonical_cfg):
             "station_id_name": fields_cfg.get("station_id", "station_id"),
             "station_name_name": fields_cfg.get("station_name", "station_name"),
         },
-        "schism": pycopy.deepcopy(model_cfg.get("schism", [])),
-        "global_model": pycopy.deepcopy(model_cfg.get("global", {})),
-        "output": output_cfg,
+        "schism": schism_cfg,
+        "global_model": global_cfg,
+        "output": {
+            **output_cfg,
+            "dir": _resolve_path(output_cfg.get("dir")),
+        },
         "plot": plot_cfg,
     }
     return runtime_cfg
@@ -251,8 +297,9 @@ def _canonical_to_runtime_config(canonical_cfg):
 
 def _build_canonical_config(args):
     cfg = pycopy.deepcopy(DEFAULT_CONFIG)
-    if args.config:
-        with open(args.config, "r", encoding="utf-8") as f:
+    config_path = _set_path_base(args.config)
+    if config_path:
+        with open(config_path, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
         cfg = _deep_update(cfg, user_cfg)
 
@@ -366,31 +413,28 @@ def setup_region(region_cfg):
     use_shapefile = region_cfg.get("use_shapefile", bool(shapefile_path))
     px = py = None
     if use_shapefile and shapefile_path:
-        shp_candidates = [str(shapefile_path)]
-        if not os.path.isabs(str(shapefile_path)):
-            shp_candidates.append(os.path.join(SCRIPT_DIR, str(shapefile_path)))
-
-        shp_path = None
-        for cand in shp_candidates:
-            if os.path.exists(cand):
-                shp_path = cand
-                break
-
+        shp_path = _resolve_path(shapefile_path)
         if shp_path is None:
             rank_print(
                 f"[WARN] Shapefile not found: {shapefile_path}. "
                 "Proceeding without shapefile region filter."
             )
         else:
-            try:
-                bp = read_shapefile_data(shp_path)
-                px, py = bp.xy.T
-                px = normalize_longitudes(px, CANONICAL_LON_MODE)
-            except Exception as exc:
+            if not os.path.exists(shp_path):
                 rank_print(
-                    f"[WARN] Failed to read shapefile '{shp_path}': {exc}. "
+                    f"[WARN] Shapefile not found: {shp_path}. "
                     "Proceeding without shapefile region filter."
                 )
+            else:
+                try:
+                    bp = read_shapefile_data(shp_path)
+                    px, py = bp.xy.T
+                    px = normalize_longitudes(px, CANONICAL_LON_MODE)
+                except Exception as exc:
+                    rank_print(
+                        f"[WARN] Failed to read shapefile '{shp_path}': {exc}. "
+                        "Proceeding without shapefile region filter."
+                    )
     bbox = region_cfg.get("subset_bbox")
     bbox = normalize_bbox(bbox, CANONICAL_LON_MODE)
     return {"px": px, "py": py, "bbox": bbox}
@@ -1371,8 +1415,8 @@ def _resolve_source_npz_paths(source_cfg):
     if raw_paths is None:
         return []
     if isinstance(raw_paths, (list, tuple, np.ndarray)):
-        return [str(p) for p in raw_paths if str(p).strip()]
-    return [str(raw_paths)]
+        return [_resolve_path(p) for p in raw_paths if str(p).strip()]
+    return [_resolve_path(raw_paths)]
 
 
 def _array_equal_nan_ok(a, b):
