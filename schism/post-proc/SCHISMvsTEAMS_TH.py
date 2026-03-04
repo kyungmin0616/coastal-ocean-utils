@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -28,67 +27,24 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from pylib import loadz, read_schism_bpfile, datenum, num2date, read
-
-MPI = None
-COMM = None
-RANK = 0
-SIZE = 1
-
-
-def _env_int(names: Sequence[str], default: int = 0) -> int:
-    for name in names:
-        val = os.environ.get(name)
-        if val is None:
-            continue
-        try:
-            return int(val)
-        except Exception:
-            continue
-    return default
-
-
-def _looks_like_mpi_launch() -> bool:
-    size = _env_int(
-        [
-            "OMPI_COMM_WORLD_SIZE",
-            "PMI_SIZE",
-            "PMIX_SIZE",
-            "MPI_LOCALNRANKS",
-            "SLURM_NTASKS",
-        ],
-        default=0,
-    )
-    return size > 1
-
-
-USE_MPI = (
-    "--mpi" in sys.argv
-    or os.environ.get("ENABLE_MPI", "0") == "1"
-    or _looks_like_mpi_launch()
+from pylib import (
+    loadz,
+    read_schism_bpfile,
+    datenum,
+    num2date,
+    read,
+    deep_update_dict,
+    init_mpi_runtime,
+    rank_log,
+    report_work_assignment,
+    compute_skill_metrics,
+    write_csv_rows,
+    read_csv_rows,
 )
-if "--no-mpi" in sys.argv:
-    USE_MPI = False
-if "--mpi" in sys.argv:
-    sys.argv.remove("--mpi")
-if "--no-mpi" in sys.argv:
-    sys.argv.remove("--no-mpi")
 
-if USE_MPI:
-    try:
-        from mpi4py import MPI
-
-        COMM = MPI.COMM_WORLD
-        RANK = COMM.Get_rank()
-        SIZE = COMM.Get_size()
-    except (ImportError, Exception) as exc:
-        print(f"[WARN] MPI requested but initialization failed: {exc}. Falling back to serial mode.")
-        MPI = None
-        COMM = None
-        RANK = 0
-        SIZE = 1
-
-
+# =============================================================================
+# Configuration
+# =============================================================================
 CONFIG: Dict[str, Any] = dict(
     teams_npz="/scratch2/08924/kmpark/post-proc/npz/sendai_d2_timeseries.npz",
     schism_npzs=[
@@ -126,41 +82,82 @@ CONFIG: Dict[str, Any] = dict(
     scatter_cmap="viridis",
 )
 
+TH_STATION_FIELDS = [
+    "model",
+    "station_name",
+    "station_id",
+    "station_id_full",
+    "var",
+    "n",
+    "bias",
+    "rmse",
+    "corr",
+    "obs_std",
+    "mod_std",
+    "nrmse_std",
+    "wss",
+    "crmsd",
+]
 
+TH_RAW_FIELDS = [
+    "task",
+    "experiment_id",
+    "model",
+    "station_name",
+    "station_id",
+    "station_id_full",
+    "var",
+    "time",
+    "obs",
+    "model_value",
+    "error",
+    "station_depth",
+]
+
+TH_MODEL_FIELDS = [
+    "model",
+    "task",
+    "var",
+    "n",
+    "bias",
+    "rmse",
+    "corr",
+    "obs_std",
+    "mod_std",
+    "nrmse_std",
+    "wss",
+    "crmsd",
+]
+
+# =============================================================================
+# MPI setup
+# =============================================================================
+MPI, COMM, RANK, SIZE, USE_MPI = init_mpi_runtime(sys.argv)
+
+# =============================================================================
+# Core helpers
+# =============================================================================
 def rank_print(*args: Any, **kwargs: Any) -> None:
-    if "flush" not in kwargs:
-        kwargs["flush"] = True
-    print(f"[Rank {RANK}]", *args, **kwargs)
+    rank0_only = bool(kwargs.pop("rank0_only", False))
+    msg = " ".join(str(a) for a in args)
+    rank_log(msg, rank=RANK, size=SIZE, rank0_only=rank0_only)
 
 
 def _report_station_assignment(tag: str, total_count: int, local_indices: Sequence[int]) -> None:
-    nloc = len(local_indices)
-    if nloc > 0:
-        first_idx = int(local_indices[0])
-        last_idx = int(local_indices[-1])
-    else:
-        first_idx = -1
-        last_idx = -1
-    rank_print(
-        f"{tag} assignment: local={nloc}/{total_count}, "
-        f"index_range=[{first_idx},{last_idx}], stride={SIZE}"
+    report_work_assignment(
+        tag,
+        total_count,
+        local_indices,
+        rank=RANK,
+        size=SIZE,
+        comm=COMM,
+        mpi_enabled=bool(MPI),
+        logger=rank_print,
     )
-    if MPI:
-        counts = COMM.gather(nloc, root=0)
-        if RANK == 0:
-            summary = ", ".join([f"r{i}:{c}" for i, c in enumerate(counts)])
-            rank_print(f"{tag} distribution by rank -> {summary}")
-        COMM.Barrier()
 
 
 def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    out = copy.deepcopy(base)
-    for key, val in override.items():
-        if isinstance(val, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_update(out[key], val)
-        else:
-            out[key] = copy.deepcopy(val)
-    return out
+    return deep_update_dict(base, override, merge_list_of_dicts=False)
 
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -274,6 +271,53 @@ def _extract_station_id(name: Any) -> str:
     return str(name).strip() if name is not None else ""
 
 
+def _build_station_index_lookup(station_names: List[str]) -> Dict[str, int]:
+    lookup: Dict[str, int] = {}
+    id_hits: Dict[str, List[int]] = {}
+    for i, name in enumerate(station_names):
+        key = str(name)
+        lookup[key] = i
+        sid = _extract_station_id(name)
+        if sid:
+            id_hits.setdefault(sid, []).append(i)
+            id_hits.setdefault(sid.lstrip("0"), []).append(i)
+    for sid, idxs in id_hits.items():
+        if len(idxs) == 1:
+            lookup[sid] = idxs[0]
+    return lookup
+
+
+def _build_teams_station_index(teams: Any) -> Dict[str, np.ndarray]:
+    sid_raw = np.asarray(teams.station_id).astype(str)
+    index: Dict[str, List[int]] = {}
+    for i, sid in enumerate(sid_raw):
+        sid_n = _normalize_station_id(sid)
+        sid_nz = sid_n.lstrip("0")
+        index.setdefault(sid_n, []).append(i)
+        index.setdefault(sid_nz, []).append(i)
+    out: Dict[str, np.ndarray] = {}
+    for key, vals in index.items():
+        out[key] = np.asarray(sorted(set(vals)), dtype=int)
+    return out
+
+
+def _teams_indices_for_station(teams: Any, station_id: str, station_index: Optional[Dict[str, np.ndarray]]) -> np.ndarray:
+    target = _normalize_station_id(station_id)
+    target_nz = target.lstrip("0")
+    if station_index is not None:
+        idx = station_index.get(target)
+        if idx is None:
+            idx = station_index.get(target_nz)
+        if idx is not None:
+            return np.asarray(idx, dtype=int)
+
+    sid = np.asarray(teams.station_id).astype(str)
+    sid_norm = np.array([_normalize_station_id(x) for x in sid])
+    sid_nz = np.array([s.lstrip("0") for s in sid_norm])
+    mask = (sid_norm == target) | (sid_nz == target_nz)
+    return np.where(mask)[0].astype(int)
+
+
 def _match_station(target_name: str, schism_names: List[str]) -> Optional[str]:
     if target_name in schism_names:
         return target_name
@@ -342,25 +386,36 @@ def _load_schism_models(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     for i, p in enumerate(paths):
         ds = loadz(p)
         label = labels[i] if labels and i < len(labels) else Path(p).stem
+        names = _get_schism_station_names(ds)
+        time_index = _as_datetime_index(
+            getattr(ds, "time"),
+            str(cfg["model_time_units"]),
+            float(cfg["model_time_offset"]),
+        )
         models.append(
             {
                 "path": p,
                 "label": label,
                 "data": ds,
-                "names": _get_schism_station_names(ds),
+                "names": names,
+                "station_lookup": _build_station_index_lookup(names),
+                "time_index": time_index,
                 "nsta": _infer_station_count(ds, ["temp", "sal", "salt"]),
             }
         )
     return models
 
 
-def _teams_station_location(teams: Any, station_id: str) -> Tuple[Optional[float], Optional[float]]:
-    sid = np.asarray(teams.station_id).astype(str)
-    mask = sid == station_id
-    if not mask.any():
+def _teams_station_location(
+    teams: Any,
+    station_id: str,
+    station_index: Optional[Dict[str, np.ndarray]] = None,
+) -> Tuple[Optional[float], Optional[float]]:
+    idx = _teams_indices_for_station(teams, station_id, station_index)
+    if len(idx) == 0:
         return None, None
-    lat = np.asarray(teams.lat)[mask]
-    lon = np.asarray(teams.lon)[mask]
+    lat = np.asarray(teams.lat)[idx]
+    lon = np.asarray(teams.lon)[idx]
     lat = lat[np.isfinite(lat)]
     lon = lon[np.isfinite(lon)]
     if lat.size == 0 or lon.size == 0:
@@ -368,12 +423,15 @@ def _teams_station_location(teams: Any, station_id: str) -> Tuple[Optional[float
     return float(np.nanmedian(lat)), float(np.nanmedian(lon))
 
 
-def _teams_station_depth_mean(teams: Any, station_id: str) -> float:
-    sid = np.asarray(teams.station_id).astype(str)
-    mask = sid == station_id
-    if not mask.any() or not hasattr(teams, "depth"):
+def _teams_station_depth_mean(
+    teams: Any,
+    station_id: str,
+    station_index: Optional[Dict[str, np.ndarray]] = None,
+) -> float:
+    idx = _teams_indices_for_station(teams, station_id, station_index)
+    if len(idx) == 0 or not hasattr(teams, "depth"):
         return float("nan")
-    dep = np.asarray(teams.depth, dtype=float)[mask]
+    dep = np.asarray(teams.depth, dtype=float)[idx]
     dep = dep[np.isfinite(dep)]
     if dep.size == 0:
         return float("nan")
@@ -387,14 +445,10 @@ def _teams_station_series(
     depth: Optional[float] = None,
     depth_tol: float = 0.5,
     depth_policy: str = "mean",
+    station_index: Optional[Dict[str, np.ndarray]] = None,
 ) -> Tuple[Optional[pd.DatetimeIndex], Optional[np.ndarray]]:
-    sid = np.asarray(teams.station_id).astype(str)
-    sid_norm = np.array([_normalize_station_id(x) for x in sid])
-    target = _normalize_station_id(station_id)
-    target_nz = target.lstrip("0")
-    sid_nz = np.array([s.lstrip("0") for s in sid_norm])
-    mask = (sid_norm == target) | (sid_nz == target_nz)
-    if not mask.any():
+    idx = _teams_indices_for_station(teams, station_id, station_index)
+    if len(idx) == 0:
         return None, None
 
     obs_var = _display_var_name(var)
@@ -402,9 +456,9 @@ def _teams_station_series(
     times = np.asarray(teams.time)
     depths = np.asarray(getattr(teams, "depth", np.nan))
 
-    vals = vals[mask]
-    times = times[mask]
-    depths = depths[mask] if depths is not None else None
+    vals = vals[idx]
+    times = times[idx]
+    depths = depths[idx] if depths is not None else None
 
     if depth is not None and depths is not None:
         dmask = np.isfinite(depths) & (np.abs(depths - depth) <= depth_tol)
@@ -424,59 +478,15 @@ def _teams_station_series(
 
 
 def _compute_metrics(obs: np.ndarray, mod: np.ndarray) -> Dict[str, float]:
-    obs = np.asarray(obs, dtype=float)
-    mod = np.asarray(mod, dtype=float)
-    valid = np.isfinite(obs) & np.isfinite(mod)
-    n = int(valid.sum())
-    if n < 2:
-        return {
-            "n": n,
-            "bias": np.nan,
-            "rmse": np.nan,
-            "corr": np.nan,
-            "obs_std": np.nan,
-            "mod_std": np.nan,
-            "nrmse_std": np.nan,
-            "wss": np.nan,
-            "crmsd": np.nan,
-        }
-
-    obs = obs[valid]
-    mod = mod[valid]
-    diff = mod - obs
-    bias = float(np.mean(diff))
-    rmse = float(np.sqrt(np.mean(diff**2)))
-    obs_std = float(np.std(obs))
-    mod_std = float(np.std(mod))
-    corr = float(np.corrcoef(obs, mod)[0, 1]) if n > 1 else np.nan
-    nrmse = float(rmse / obs_std) if obs_std > 0 else np.nan
-    obs_mean = float(np.mean(obs))
-    denom = np.sum((np.abs(mod - obs_mean) + np.abs(obs - obs_mean)) ** 2)
-    wss = float(1.0 - np.sum((mod - obs) ** 2) / denom) if denom > 0 else np.nan
-    obs_anom = obs - obs_mean
-    mod_anom = mod - float(np.mean(mod))
-    crmsd = float(np.sqrt(np.mean((mod_anom - obs_anom) ** 2)))
-    return {
-        "n": n,
-        "bias": bias,
-        "rmse": rmse,
-        "corr": corr,
-        "obs_std": obs_std,
-        "mod_std": mod_std,
-        "nrmse_std": nrmse,
-        "wss": wss,
-        "crmsd": crmsd,
-    }
+    return compute_skill_metrics(obs, mod, min_n=2)
 
 
 def _write_csv(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
-    import csv
+    write_csv_rows(path, rows, fieldnames)
 
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+
+def _read_csv_rows(path: Path) -> List[Dict[str, Any]]:
+    return read_csv_rows(path)
 
 
 def _aggregate_model_metrics(raw_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -676,6 +686,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         COMM.Barrier()
 
     teams = loadz(str(Path(cfg["teams_npz"]).expanduser()))
+    teams_station_index = _build_teams_station_index(teams)
     schism_models = _load_schism_models(cfg)
     if not schism_models:
         rank_print("[ERROR] No SCHISM NPZ provided.")
@@ -715,7 +726,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         name = bp_names[idx]
         sid_full = _extract_station_id(name)
         sid_short = _station_id_short(name)
-        station_depth = _teams_station_depth_mean(teams, sid_short)
+        station_depth = _teams_station_depth_mean(teams, sid_short, station_index=teams_station_index)
 
         station_has_obs = False
         for var in cfg["vars"]:
@@ -727,6 +738,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 depth=cfg["depth"],
                 depth_tol=float(cfg["depth_tol"]),
                 depth_policy=str(cfg["depth_policy"]),
+                station_index=teams_station_index,
             )
             if obs_times is None:
                 if cfg.get("debug_times", False):
@@ -742,15 +754,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             model_series_list: List[Tuple[str, pd.Series]] = []
             for model in schism_models:
                 schism = model["data"]
-                schism_names = model["names"]
+                schism_lookup = model["station_lookup"]
                 schism_nsta = model["nsta"]
 
-                schism_match = _match_station(name, schism_names) if schism_names else None
-                if schism_match is not None:
-                    sta_idx = schism_names.index(schism_match)
-                elif schism_nsta is not None and idx < schism_nsta:
+                sta_idx = schism_lookup.get(name)
+                if sta_idx is None:
+                    sta_idx = schism_lookup.get(sid_full)
+                if sta_idx is None and schism_nsta is not None and idx < schism_nsta:
                     sta_idx = idx
-                else:
+                if sta_idx is None:
                     if cfg.get("debug_times", False):
                         rank_print(f"[WARN] No SCHISM station match for {name} in {model['label']}")
                     continue
@@ -764,12 +776,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
                 arr = _time_first(arr, len(getattr(schism, "time")))
                 mod_vals = arr[:, sta_idx]
-                mod_times = _as_datetime_index(
-                    getattr(schism, "time"),
-                    str(cfg["model_time_units"]),
-                    float(cfg["model_time_offset"]),
-                )
-                mod_series = _resample_series(mod_times, mod_vals, cfg["resample"])
+                mod_series = _resample_series(model["time_index"], mod_vals, cfg["resample"])
                 mod_series = _slice_time_window(mod_series, cfg.get("start"), cfg.get("end"))
                 model_series_list.append((str(model["label"]), mod_series))
 
@@ -866,7 +873,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ax_ts.grid(True, alpha=0.3)
 
             if gd is not None:
-                lat0, lon0 = _teams_station_location(teams, sid_short)
+                lat0, lon0 = _teams_station_location(teams, sid_short, station_index=teams_station_index)
                 if lat0 is None or lon0 is None:
                     ax_map.set_axis_off()
                 else:
@@ -891,20 +898,32 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if station_has_obs:
             summary_local["stations_with_obs"] += 1
 
+    chunk_dir = outdir / ".th_rank_chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    station_chunk_path = chunk_dir / f"station_rank_{RANK:04d}.csv"
+    raw_chunk_path = chunk_dir / f"raw_rank_{RANK:04d}.csv"
+    _write_csv(station_chunk_path, station_rows_local, TH_STATION_FIELDS)
+    _write_csv(raw_chunk_path, raw_rows_local, TH_RAW_FIELDS)
+
     if MPI:
-        station_chunks = COMM.gather(station_rows_local, root=0)
-        raw_chunks = COMM.gather(raw_rows_local, root=0)
         summary_chunks = COMM.gather(summary_local, root=0)
+        COMM.Barrier()
     else:
-        station_chunks = [station_rows_local]
-        raw_chunks = [raw_rows_local]
         summary_chunks = [summary_local]
 
     if RANK != 0:
         return
 
-    station_rows = [row for part in station_chunks for row in part]
-    raw_rows = [row for part in raw_chunks for row in part]
+    if MPI:
+        station_rows = []
+        raw_rows = []
+        for rr in range(SIZE):
+            station_rows.extend(_read_csv_rows(chunk_dir / f"station_rank_{rr:04d}.csv"))
+            raw_rows.extend(_read_csv_rows(chunk_dir / f"raw_rank_{rr:04d}.csv"))
+    else:
+        station_rows = station_rows_local
+        raw_rows = raw_rows_local
+
     summary = {
         "stations_requested": len(bp_names),
         "stations_with_obs": int(sum(s["stations_with_obs"] for s in summary_chunks)),
@@ -920,53 +939,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     model_path = outdir / str(cfg.get("metrics_model_name", "TH_stats_by_model.csv"))
 
     if cfg.get("write_task_metrics", True):
-        station_fields = [
-            "model",
-            "station_name",
-            "station_id",
-            "station_id_full",
-            "var",
-            "n",
-            "bias",
-            "rmse",
-            "corr",
-            "obs_std",
-            "mod_std",
-            "nrmse_std",
-            "wss",
-            "crmsd",
-        ]
-        raw_fields = [
-            "task",
-            "experiment_id",
-            "model",
-            "station_name",
-            "station_id",
-            "station_id_full",
-            "var",
-            "time",
-            "obs",
-            "model_value",
-            "error",
-            "station_depth",
-        ]
-        model_fields = [
-            "model",
-            "task",
-            "var",
-            "n",
-            "bias",
-            "rmse",
-            "corr",
-            "obs_std",
-            "mod_std",
-            "nrmse_std",
-            "wss",
-            "crmsd",
-        ]
-        _write_csv(stats_path, station_rows, station_fields)
-        _write_csv(raw_path, raw_rows, raw_fields)
-        _write_csv(model_path, model_rows, model_fields)
+        _write_csv(stats_path, station_rows, TH_STATION_FIELDS)
+        _write_csv(raw_path, raw_rows, TH_RAW_FIELDS)
+        _write_csv(model_path, model_rows, TH_MODEL_FIELDS)
         rank_print(f"Wrote stats to {stats_path}")
         rank_print(f"Wrote raw pairs to {raw_path}")
         rank_print(f"Wrote model summary to {model_path}")
@@ -997,6 +972,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     manifest_path = outdir / str(cfg.get("manifest_name", "TH_manifest.json"))
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
+
+    for fp in chunk_dir.glob("*rank_*.csv"):
+        try:
+            fp.unlink()
+        except Exception:
+            pass
+    try:
+        chunk_dir.rmdir()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

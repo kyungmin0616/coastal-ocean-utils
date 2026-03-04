@@ -99,18 +99,10 @@ import cmocean
 from netCDF4 import Dataset
 
 # ---- SCHISM helpers ----
-from pylib import read_schism_hgrid, read_schism_param, datenum, num2date
+from pylib import read_schism_hgrid, read_schism_param, datenum, num2date, init_mpi_runtime
 
 # ---- MPI (optional) ----
-try:
-    from mpi4py import MPI  # type: ignore
-    _COMM = MPI.COMM_WORLD
-    _RANK = _COMM.Get_rank()
-    _SIZE = _COMM.Get_size()
-except Exception:
-    _COMM = None
-    _RANK = 0
-    _SIZE = 1
+MPI, _COMM, _RANK, _SIZE, _USE_MPI = init_mpi_runtime(sys.argv, consume_flags=False)
 
 # -------------------------
 # Helpers
@@ -574,6 +566,53 @@ def format_geoaxes(ax, gd, extent, title_txt=None, data_crs=None,
         except Exception:
             gd.plot_bnd(ax=ax)
 
+
+def _render_map_figure(gd, proj, data_crs, args, vars_to_plot, field_map, suptitle, fpath, extent=None):
+    fig, axes = make_axes(len(vars_to_plot), proj, args.layout)
+    want_cbar_each = (args.cbars == "each")
+    want_cbar_none = (args.cbars == "none")
+
+    for ax, var in zip(axes, vars_to_plot):
+        cfg = VAR_DEFAULTS[var]
+        cmap = _get_cmap(cfg["cmap"])
+        clim = cfg["clim"]
+        format_geoaxes(
+            ax,
+            gd,
+            args.extent if extent is None else extent,
+            title_txt=cfg["title"],
+            data_crs=data_crs,
+            show_coastline=args.coastline,
+            show_bnd=args.bnd,
+            bnd_color=args.bnd_color,
+            bnd_lw=args.bnd_lw,
+        )
+
+        plt.sca(ax)
+        m = gd.plot(fmt=1, value=field_map[var], cmap=cmap, clim=clim, cb=False, ax=ax)
+        if not want_cbar_none and want_cbar_each:
+            plt.colorbar(
+                m,
+                ax=ax,
+                orientation="vertical" if len(vars_to_plot) in (1, 2) else "horizontal",
+                fraction=0.05,
+                pad=0.10,
+            )
+
+    fig.suptitle(suptitle, fontsize=11, fontweight="bold")
+    if not fig.get_constrained_layout():
+        fig.tight_layout()
+    fig.savefig(fpath, dpi=args.dpi)
+    plt.close(fig)
+
+
+def _maybe_collect(counter, every=8):
+    if every <= 0:
+        return
+    if int(counter) % int(every) == 0:
+        gc.collect()
+
+
 def _merge_config(args):
     ad = vars(args).copy()
     use_cfg = USER_CONFIG.get("enable", False) and not ad.get("no_config", False)
@@ -825,9 +864,6 @@ def main():
 
                 del arr2d
 
-            want_cbar_each = (args.cbars == "each")
-            want_cbar_none = (args.cbars == "none")
-
             if str(args.agg) == "file-mean":
                 plot_fields = {}
                 for var in vars_to_plot:
@@ -848,31 +884,16 @@ def main():
                 if skip_existing and fpath.exists():
                     rlog(f"skip existing {fname}")
                 else:
-                    fig, axes = make_axes(len(vars_to_plot), proj, args.layout)
-                    for ax, var in zip(axes, vars_to_plot):
-                        cfg = VAR_DEFAULTS[var]
-                        cmap = _get_cmap(cfg["cmap"]); clim = cfg["clim"]
-                        format_geoaxes(
-                            ax, gd, args.extent, title_txt=cfg["title"], data_crs=data_crs,
-                            show_coastline=args.coastline, show_bnd=args.bnd,
-                            bnd_color=args.bnd_color, bnd_lw=args.bnd_lw
-                        )
-
-                        plt.sca(ax)
-                        m = gd.plot(fmt=1, value=plot_fields[var], cmap=cmap, clim=clim, cb=False, ax=ax)
-
-                        if not want_cbar_none and want_cbar_each:
-                            plt.colorbar(
-                                m, ax=ax,
-                                orientation="vertical" if len(vars_to_plot) in (1, 2) else "horizontal",
-                                fraction=0.05, pad=0.10
-                            )
-
-                    fig.suptitle(suptitle, fontsize=11, fontweight="bold")
-                    if not fig.get_constrained_layout():
-                        fig.tight_layout()
-                    fig.savefig(fpath, dpi=args.dpi)
-                    plt.close(fig)
+                    _render_map_figure(
+                        gd,
+                        proj,
+                        data_crs,
+                        args,
+                        vars_to_plot,
+                        plot_fields,
+                        suptitle,
+                        fpath,
+                    )
                     rlog(f"wrote {fname}")
                 del plot_fields
 
@@ -899,31 +920,16 @@ def main():
                             x[dry] = np.nan
                         plot_fields[var] = x
 
-                    fig, axes = make_axes(len(vars_to_plot), proj, args.layout)
-                    for ax, var in zip(axes, vars_to_plot):
-                        cfg = VAR_DEFAULTS[var]
-                        cmap = _get_cmap(cfg["cmap"]); clim = cfg["clim"]
-                        format_geoaxes(
-                            ax, gd, args.extent, title_txt=cfg["title"], data_crs=data_crs,
-                            show_coastline=args.coastline, show_bnd=args.bnd,
-                            bnd_color=args.bnd_color, bnd_lw=args.bnd_lw
-                        )
-
-                        plt.sca(ax)
-                        m = gd.plot(fmt=1, value=plot_fields[var], cmap=cmap, clim=clim, cb=False, ax=ax)
-
-                        if not want_cbar_none and want_cbar_each:
-                            plt.colorbar(
-                                m, ax=ax,
-                                orientation="vertical" if len(vars_to_plot) in (1, 2) else "horizontal",
-                                fraction=0.05, pad=0.10
-                            )
-
-                    fig.suptitle(suptitle, fontsize=11, fontweight="bold")
-                    if not fig.get_constrained_layout():
-                        fig.tight_layout()
-                    fig.savefig(fpath, dpi=args.dpi)
-                    plt.close(fig)
+                    _render_map_figure(
+                        gd,
+                        proj,
+                        data_crs,
+                        args,
+                        vars_to_plot,
+                        plot_fields,
+                        suptitle,
+                        fpath,
+                    )
 
                     if (it == 0) or ((it + 1) % 10 == 0) or ((it + 1) == n_steps):
                         rlog(f"stack {istack}: wrote step {it + 1}/{n_steps}")
@@ -935,7 +941,7 @@ def main():
             for var in list(stack_masks.keys()):
                 del stack_masks[var]
             del stack_fields, stack_masks, ctime_ref
-            gc.collect()
+            _maybe_collect(done_count + 1, every=4)
 
         else:
             first_var_seen = True
@@ -983,7 +989,7 @@ def main():
                     counts[var][key][valid] += 1.0
 
                 del arr2d
-                gc.collect()
+            _maybe_collect(done_count + 1, every=4)
 
         done_count += 1
         if (done_count % log_every == 0) or (done_count == total_local):
@@ -1064,42 +1070,26 @@ def main():
                 for var in list(mean_fields.keys()):
                     del mean_fields[var]
                 del mean_fields
-                gc.collect()
+                _maybe_collect(ikey + 1, every=6)
                 continue
 
-            fig, axes = make_axes(len(vars_to_plot), proj, args.layout)
-            want_cbar_each = (args.cbars == "each")
-            want_cbar_none = (args.cbars == "none")
-            for ax, var in zip(axes, vars_to_plot):
-                cfg = VAR_DEFAULTS[var]
-                cmap = _get_cmap(cfg["cmap"]); clim = cfg["clim"]
-                format_geoaxes(
-                    ax, gd, None, title_txt=cfg["title"], data_crs=data_crs,
-                    show_coastline=args.coastline, show_bnd=args.bnd,
-                    bnd_color=args.bnd_color, bnd_lw=args.bnd_lw
-                )
-
-                plt.sca(ax)  # ensure drawing on THIS axes
-                m = gd.plot(fmt=1, value=mean_fields[var], cmap=cmap, clim=clim, cb=False, ax=ax)
-
-                if not want_cbar_none and want_cbar_each:
-                    plt.colorbar(
-                        m, ax=ax,
-                        orientation="vertical" if len(vars_to_plot) in (1, 2) else "horizontal",
-                        fraction=0.05, pad=0.10
-                    )
-
-            fig.suptitle(label + "  (mean)", fontsize=11, fontweight="bold")
-            if not fig.get_constrained_layout():
-                fig.tight_layout()
-            fig.savefig(fpath, dpi=args.dpi)
-            plt.close(fig)
+            _render_map_figure(
+                gd,
+                proj,
+                data_crs,
+                args,
+                vars_to_plot,
+                mean_fields,
+                label + "  (mean)",
+                fpath,
+                extent=None,
+            )
             print(f"[rank {rank}] wrote {fname}", flush=True)
 
         for var in list(mean_fields.keys()):
             del mean_fields[var]
         del mean_fields
-        gc.collect()
+        _maybe_collect(ikey + 1, every=6)
 
     if mpi_enabled:
         _COMM.Barrier()

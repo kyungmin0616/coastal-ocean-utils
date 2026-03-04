@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -24,75 +23,28 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from pylib import datenum, loadz, num2date, read, read_schism_bpfile
+from pylib import (
+    datenum,
+    loadz,
+    num2date,
+    read,
+    read_schism_bpfile,
+    init_mpi_runtime,
+    rank_log,
+    report_work_assignment,
+    compute_skill_metrics,
+)
 
 try:
     from scipy import signal
 except Exception:  # pragma: no cover - optional dependency
     signal = None
 
-MPI = None
-COMM = None
-RANK = 0
-SIZE = 1
-
-
-def _env_int(names: Sequence[str], default: int = 0) -> int:
-    for name in names:
-        val = os.environ.get(name)
-        if val is None:
-            continue
-        try:
-            return int(val)
-        except Exception:
-            continue
-    return default
-
-
-def _looks_like_mpi_launch() -> bool:
-    size = _env_int(
-        [
-            "OMPI_COMM_WORLD_SIZE",
-            "PMI_SIZE",
-            "PMIX_SIZE",
-            "MPI_LOCALNRANKS",
-            "SLURM_NTASKS",
-        ],
-        default=0,
-    )
-    return size > 1
-
-
-USE_MPI = (
-    "--mpi" in sys.argv
-    or os.environ.get("ENABLE_MPI", "0") == "1"
-    or _looks_like_mpi_launch()
-)
-if "--no-mpi" in sys.argv:
-    USE_MPI = False
-if "--mpi" in sys.argv:
-    sys.argv.remove("--mpi")
-if "--no-mpi" in sys.argv:
-    sys.argv.remove("--no-mpi")
-
-if USE_MPI:
-    try:
-        from mpi4py import MPI
-
-        COMM = MPI.COMM_WORLD
-        RANK = COMM.Get_rank()
-        SIZE = COMM.Get_size()
-    except (ImportError, Exception) as exc:
-        print(f"[WARN] MPI requested but initialization failed: {exc}. Falling back to serial mode.")
-        MPI = None
-        COMM = None
-        RANK = 0
-        SIZE = 1
-
-
+# =============================================================================
+# Configuration
+# =============================================================================
 SCRIPT_DIR = Path(__file__).resolve().parent
 OBS_DEFAULT = SCRIPT_DIR / "npz" / "jodc_tide_all.npz"
-
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "runs": ["/scratch2/08924/kmpark/SOB/post-proc/npz/RUN01g_JODC.npz","/scratch2/08924/kmpark/SOB/post-proc/npz/RUN03a_JODC.npz","/scratch2/08924/kmpark/SOB/post-proc/npz/RUN04a_JODC.npz","/scratch2/08924/kmpark/SOB/post-proc/npz/RUN05a_JODC.npz"],
@@ -128,33 +80,29 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "obs_station_offsets": {"MA11": -2.609, "0112": -1.89, "2003": -0.875},
 }
 
+# =============================================================================
+# MPI setup
+# =============================================================================
+MPI, COMM, RANK, SIZE, USE_MPI = init_mpi_runtime()
 
+# =============================================================================
+# Utility helpers
+# =============================================================================
 def log(msg: str, rank0_only: bool = False) -> None:
-    if rank0_only and RANK != 0:
-        return
-    prefix = f"[rank {RANK}/{SIZE}] " if SIZE > 1 else ""
-    print(prefix + msg, flush=True)
+    rank_log(msg, rank=RANK, size=SIZE, rank0_only=rank0_only)
 
 
 def _report_station_assignment(tag: str, total_count: int, local_indices: Sequence[int]) -> None:
-    nloc = len(local_indices)
-    if nloc > 0:
-        first_idx = int(local_indices[0])
-        last_idx = int(local_indices[-1])
-    else:
-        first_idx = -1
-        last_idx = -1
-    log(
-        f"{tag} assignment: local={nloc}/{total_count}, "
-        f"index_range=[{first_idx},{last_idx}], stride={SIZE}",
-        rank0_only=False,
+    report_work_assignment(
+        tag,
+        total_count,
+        local_indices,
+        rank=RANK,
+        size=SIZE,
+        comm=COMM,
+        mpi_enabled=bool(MPI),
+        logger=lambda text: log(text, rank0_only=False),
     )
-    if MPI:
-        counts = COMM.gather(nloc, root=0)
-        if RANK == 0:
-            summary = ", ".join([f"r{i}:{c}" for i, c in enumerate(counts)])
-            log(f"{tag} distribution by rank -> {summary}", rank0_only=True)
-        COMM.Barrier()
 
 
 def _resolve_path(path_like: str) -> Path:
@@ -179,16 +127,26 @@ def _expand_scalar_or_list(values: Sequence[Any], n: int) -> List[Any]:
     return seq
 
 
-def _resample(times: np.ndarray, values: np.ndarray, freq: Optional[str]) -> pd.Series:
+def _to_datetime_index(times: np.ndarray) -> pd.DatetimeIndex:
     if len(times) == 0:
+        return pd.DatetimeIndex([], tz="UTC")
+    stamps = [num2date(float(t)).strftime("%Y-%m-%d %H:%M:%S") for t in np.asarray(times, dtype=float)]
+    return pd.to_datetime(stamps, utc=True)
+
+
+def _resample_with_index(index: pd.DatetimeIndex, values: np.ndarray, freq: Optional[str]) -> pd.Series:
+    if len(index) == 0 or len(values) == 0:
         return pd.Series(dtype=float)
-    stamps = [num2date(float(t)).strftime("%Y-%m-%d %H:%M:%S") for t in times]
-    s = pd.Series(values.astype(float), index=pd.to_datetime(stamps, utc=True)).sort_index()
+    s = pd.Series(np.asarray(values, dtype=float), index=index).sort_index()
     s = s[~s.index.duplicated(keep="last")]
     if freq:
         f = str(freq).strip().lower()
         s = s.resample(f).mean()
     return s.dropna()
+
+
+def _resample(times: np.ndarray, values: np.ndarray, freq: Optional[str]) -> pd.Series:
+    return _resample_with_index(_to_datetime_index(np.asarray(times, dtype=float)), values, freq)
 
 
 def _time_range_text(times: np.ndarray) -> Tuple[float, float, int, str, str]:
@@ -280,60 +238,7 @@ def _apply_lowpass(
 
 
 def _compute_metrics(obs: np.ndarray, mod: np.ndarray) -> Dict[str, float]:
-    if len(obs) == 0 or len(mod) == 0:
-        return {
-            "n": 0,
-            "bias": np.nan,
-            "rmse": np.nan,
-            "corr": np.nan,
-            "obs_std": np.nan,
-            "mod_std": np.nan,
-            "nrmse_std": np.nan,
-            "wss": np.nan,
-            "crmsd": np.nan,
-        }
-    obs = np.asarray(obs, dtype=float)
-    mod = np.asarray(mod, dtype=float)
-    valid = np.isfinite(obs) & np.isfinite(mod)
-    obs = obs[valid]
-    mod = mod[valid]
-    n = int(len(obs))
-    if n == 0:
-        return {
-            "n": 0,
-            "bias": np.nan,
-            "rmse": np.nan,
-            "corr": np.nan,
-            "obs_std": np.nan,
-            "mod_std": np.nan,
-            "nrmse_std": np.nan,
-            "wss": np.nan,
-            "crmsd": np.nan,
-        }
-    diff = mod - obs
-    bias = float(np.mean(diff))
-    rmse = float(np.sqrt(np.mean(diff * diff)))
-    obs_std = float(np.std(obs))
-    mod_std = float(np.std(mod))
-    corr = float(np.corrcoef(obs, mod)[0, 1]) if n > 1 else np.nan
-    nrmse = float(rmse / obs_std) if obs_std > 0 else np.nan
-    obs_mean = float(np.mean(obs))
-    denom = np.sum((np.abs(mod - obs_mean) + np.abs(obs - obs_mean)) ** 2)
-    wss = float(1.0 - np.sum((mod - obs) ** 2) / denom) if denom > 0 else np.nan
-    obs_anom = obs - obs_mean
-    mod_anom = mod - float(np.mean(mod))
-    crmsd = float(np.sqrt(np.mean((mod_anom - obs_anom) ** 2)))
-    return {
-        "n": n,
-        "bias": bias,
-        "rmse": rmse,
-        "corr": corr,
-        "obs_std": obs_std,
-        "mod_std": mod_std,
-        "nrmse_std": nrmse,
-        "wss": wss,
-        "crmsd": crmsd,
-    }
+    return compute_skill_metrics(obs, mod, min_n=1)
 
 
 def _load_observations(obs_path: Path) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
@@ -454,8 +359,10 @@ def _load_model_run(
     else:
         raise ValueError(f"{path}: cannot align elev shape {elev.shape} with nt={nt}")
 
+    time_index = _to_datetime_index(np.asarray(time_days, dtype=float))
     return {
         "time": time_days,
+        "time_index": time_index,
         "elev": elev,
         "source_kind": source_kind,
         "time_mode_used": mode_used,
@@ -769,6 +676,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             npz_time_mode=str(cfg.get("npz_time_mode", "absolute")),
             apply_offset_to_npz=bool(cfg.get("apply_offset_to_npz", False)),
         )
+        model_mask = (np.asarray(model["time"], dtype=float) >= start_dnum) & (
+            np.asarray(model["time"], dtype=float) <= end_dnum
+        )
+        model["time_window_mask"] = model_mask
+        model["time_window"] = np.asarray(model["time"], dtype=float)[model_mask]
+        model["time_index_window"] = model["time_index"][model_mask]
         model_runs.append({"path": str(rp), "tag": tag, **model})
         tmin = float(np.nanmin(model["time"])) if len(model["time"]) > 0 else np.nan
         tmax = float(np.nanmax(model["time"])) if len(model["time"]) > 0 else np.nan
@@ -875,13 +788,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             for model in model_runs:
                 if sidx >= model["elev"].shape[0]:
                     continue
-                mti = model["time"]
-                myi = model["elev"][sidx, :].astype(float)
-                mmask = (mti >= start_dnum) & (mti <= end_dnum)
-                mti = mti[mmask]
-                myi = myi[mmask]
+                mti = np.asarray(model["time_window"], dtype=float)
+                mti_idx = model["time_index_window"]
+                myi = model["elev"][sidx, model["time_window_mask"]].astype(float)
                 valid = np.isfinite(myi)
                 mti = mti[valid]
+                mti_idx = mti_idx[valid]
                 myi = myi[valid]
                 if len(mti) == 0:
                     continue
@@ -893,7 +805,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         int(cfg["butterworth_order"]),
                     )
 
-                model_series = _resample(mti, myi, cfg.get("resample_model"))
+                model_series = _resample_with_index(mti_idx, myi, cfg.get("resample_model"))
                 if len(model_series) == 0:
                     continue
                 if cfg.get("demean", True):

@@ -6,74 +6,58 @@ Compare SCHISM profiles against TEAMS CTD observations stored in NPZ.
 import argparse
 import builtins
 import copy as pycopy
-import csv
 import json
 import os
 import sys
 import time
-from pylib import *
+from matplotlib import rc
+from matplotlib.pyplot import (
+    clf,
+    close,
+    figure,
+    gca,
+    gcf,
+    legend,
+    plot,
+    savefig,
+    setp,
+    subplot,
+    subplots,
+    title,
+    xlabel,
+    xlim,
+    ylabel,
+    ylim,
+)
+from numpy import arange, argsort, array, c_, concatenate, isnan, ma, nanmax, nanmin, unravel_index
+from scipy import interpolate
+from pylib import (
+    ReadNC,
+    datenum,
+    deep_update_dict,
+    get_stat,
+    init_mpi_runtime,
+    inside_polygon,
+    loadz,
+    num2date,
+    rank_log,
+    read_schism_output,
+    read_shapefile_data,
+    report_work_assignment,
+    compute_skill_metrics,
+    write_csv_rows,
+    read_csv_rows,
+    write_rank_csv_chunk,
+    collect_rank_csv_chunks,
+    cleanup_rank_csv_chunks,
+)
 import numpy as np
 
 NaN = np.nan
 
-MPI = None
-COMM = None
-RANK = 0
-SIZE = 1
-
-def _env_int(names, default=0):
-    for name in names:
-        val = os.environ.get(name)
-        if val is None:
-            continue
-        try:
-            return int(val)
-        except Exception:
-            continue
-    return default
-
-
-def _looks_like_mpi_launch():
-    size = _env_int(
-        [
-            "OMPI_COMM_WORLD_SIZE",
-            "PMI_SIZE",
-            "PMIX_SIZE",
-            "MPI_LOCALNRANKS",
-            "SLURM_NTASKS",
-        ],
-        default=0,
-    )
-    return size > 1
-
-
-USE_MPI = (
-    "--mpi" in sys.argv
-    or os.environ.get("ENABLE_MPI", "0") == "1"
-    or _looks_like_mpi_launch()
-)
-if "--no-mpi" in sys.argv:
-    USE_MPI = False
-if "--mpi" in sys.argv:
-    sys.argv.remove("--mpi")
-if "--no-mpi" in sys.argv:
-    sys.argv.remove("--no-mpi")
-
-if USE_MPI:
-    try:
-        from mpi4py import MPI
-
-        COMM = MPI.COMM_WORLD
-        RANK = COMM.Get_rank()
-        SIZE = COMM.Get_size()
-    except (ImportError, Exception) as exc:
-        print(f"[WARN] MPI requested but initialization failed: {exc}. Falling back to serial mode.")
-        MPI = None
-        COMM = None
-        RANK = 0
-        SIZE = 1
-
-
+# =============================================================================
+# Configuration
+# =============================================================================
 CONFIG = {
     "coordinates": {
         "canonical": "180",  # use "180" for [-180, 180], "360" for [0, 360)
@@ -200,29 +184,14 @@ rc("figure", titlesize=BIGGER_SIZE)
 CANONICAL_LON_MODE = CONFIG["coordinates"].get("canonical", "180")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# =============================================================================
+# MPI runtime state
+# =============================================================================
+MPI, COMM, RANK, SIZE, USE_MPI = init_mpi_runtime(sys.argv)
+
 
 def _deep_update(base, override):
-    out = pycopy.deepcopy(base)
-    for key, val in override.items():
-        if isinstance(val, dict) and isinstance(out.get(key), dict):
-            out[key] = _deep_update(out[key], val)
-        elif (
-            isinstance(val, list)
-            and isinstance(out.get(key), list)
-            and all(isinstance(v, dict) for v in val)
-            and all(isinstance(v, dict) for v in out.get(key, []))
-            and len(out.get(key, [])) > 0
-        ):
-            # Merge list-of-dicts by index using existing defaults as templates.
-            merged = []
-            base_list = out.get(key, [])
-            for i, item in enumerate(val):
-                tmpl = base_list[i] if i < len(base_list) else base_list[0]
-                merged.append(_deep_update(tmpl, item))
-            out[key] = merged
-        else:
-            out[key] = pycopy.deepcopy(val)
-    return out
+    return deep_update_dict(base, override, merge_list_of_dicts=True)
 
 
 def _parse_args(argv=None):
@@ -334,31 +303,22 @@ def normalize_bbox(bbox, mode):
 
 
 def rank_print(*args, **kwargs):
-    if "flush" not in kwargs:
-        kwargs["flush"] = True
-    print(f"[Rank {RANK}]", *args, **kwargs)
+    rank0_only = bool(kwargs.pop("rank0_only", False))
+    msg = " ".join(str(a) for a in args)
+    rank_log(msg, rank=RANK, size=SIZE, rank0_only=rank0_only)
 
 
 def _report_profile_assignment(tag, total_profiles, local_indices):
-    nloc = len(local_indices)
-    if nloc > 0:
-        first_idx = int(local_indices[0])
-        last_idx = int(local_indices[-1])
-    else:
-        first_idx = -1
-        last_idx = -1
-
-    rank_print(
-        f"{tag} assignment: local={nloc}/{total_profiles}, "
-        f"index_range=[{first_idx},{last_idx}], stride={SIZE}"
+    report_work_assignment(
+        tag,
+        total_profiles,
+        local_indices,
+        rank=RANK,
+        size=SIZE,
+        comm=COMM,
+        mpi_enabled=bool(MPI),
+        logger=rank_print,
     )
-
-    if MPI:
-        counts = COMM.gather(nloc, root=0)
-        if RANK == 0:
-            summary = ", ".join([f"r{i}:{c}" for i, c in enumerate(counts)])
-            rank_print(f"{tag} distribution by rank -> {summary}")
-        COMM.Barrier()
 
 
 def parse_date_range(date_cfg):
@@ -459,48 +419,7 @@ def compute_model_stats(model_depth, model_values, obs_depth, obs_values):
 
 
 def compute_basic_metrics(obs, mod):
-    obs = np.asarray(obs, dtype=float)
-    mod = np.asarray(mod, dtype=float)
-    valid = np.isfinite(obs) & np.isfinite(mod)
-    if valid.sum() < 2:
-        return {
-            "n": int(valid.sum()),
-            "bias": np.nan,
-            "rmse": np.nan,
-            "corr": np.nan,
-            "obs_std": np.nan,
-            "mod_std": np.nan,
-            "nrmse_std": np.nan,
-            "wss": np.nan,
-            "crmsd": np.nan,
-        }
-    obs = obs[valid]
-    mod = mod[valid]
-    diff = mod - obs
-    n = int(len(obs))
-    bias = float(np.mean(diff))
-    rmse = float(np.sqrt(np.mean(diff**2)))
-    obs_std = float(np.std(obs))
-    mod_std = float(np.std(mod))
-    corr = float(np.corrcoef(obs, mod)[0, 1]) if n > 1 else np.nan
-    nrmse = float(rmse / obs_std) if obs_std > 0 else np.nan
-    obs_mean = float(np.mean(obs))
-    denom = np.sum((np.abs(mod - obs_mean) + np.abs(obs - obs_mean)) ** 2)
-    wss = float(1.0 - np.sum((mod - obs) ** 2) / denom) if denom > 0 else np.nan
-    obs_anom = obs - obs_mean
-    mod_anom = mod - float(np.mean(mod))
-    crmsd = float(np.sqrt(np.mean((mod_anom - obs_anom) ** 2)))
-    return {
-        "n": n,
-        "bias": bias,
-        "rmse": rmse,
-        "corr": corr,
-        "obs_std": obs_std,
-        "mod_std": mod_std,
-        "nrmse_std": nrmse,
-        "wss": wss,
-        "crmsd": crmsd,
-    }
+    return compute_skill_metrics(obs, mod, min_n=2)
 
 
 def interpolate_model_to_obs(model_depth, model_values, obs_depth, obs_values):
@@ -1076,11 +995,48 @@ def _sanitize_name(text):
 
 
 def _write_csv_rows(path, rows, fieldnames):
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    write_csv_rows(path, rows, fieldnames)
+
+
+CTD_PAIR_FIELDS = [
+    "task",
+    "experiment_id",
+    "model",
+    "station_id",
+    "station_id_full",
+    "station_name",
+    "profile_id",
+    "obs_time",
+    "var",
+    "depth",
+    "obs",
+    "model_value",
+    "error",
+]
+
+
+def _read_csv_rows(path):
+    return read_csv_rows(path)
+
+
+def _write_pair_chunk(outdir, chunk_name, rank, rows):
+    cdir, cpath = write_rank_csv_chunk(
+        outdir,
+        chunk_name,
+        rank,
+        rows,
+        CTD_PAIR_FIELDS,
+        prefix="pair",
+    )
+    return str(cdir), str(cpath)
+
+
+def _collect_pair_chunks(cdir, nrank):
+    return collect_rank_csv_chunks(cdir, nrank, prefix="pair")
+
+
+def _cleanup_pair_chunks(cdir):
+    cleanup_rank_csv_chunks(cdir, prefix="pair")
 
 
 def _aggregate_metric_rows(pair_rows):
@@ -1274,22 +1230,7 @@ def _write_task_outputs(pair_rows, output_cfg, run_summary):
         raw_file = os.path.join(outdir, output_cfg.get("metrics_raw_name", "CTD_metrics_raw.csv"))
         station_file = os.path.join(outdir, output_cfg.get("metrics_station_name", "CTD_stats.csv"))
         model_file = os.path.join(outdir, output_cfg.get("metrics_model_name", "CTD_stats_by_model.csv"))
-        raw_fields = [
-            "task",
-            "experiment_id",
-            "model",
-            "station_id",
-            "station_id_full",
-            "station_name",
-            "profile_id",
-            "obs_time",
-            "var",
-            "depth",
-            "obs",
-            "model_value",
-            "error",
-        ]
-        _write_csv_rows(raw_file, pair_rows, raw_fields)
+        _write_csv_rows(raw_file, pair_rows, CTD_PAIR_FIELDS)
 
         station_rows, model_rows = _aggregate_metric_rows(pair_rows)
         station_fields = [
@@ -1559,6 +1500,113 @@ def _load_and_merge_source_npz(npz_paths):
                 pass
 
 
+def _append_pair_rows(
+    pair_rows,
+    compares,
+    task_name,
+    experiment_id,
+    model_name,
+    station_id,
+    station_name,
+    profile_id,
+    obs_time_txt,
+):
+    for var in ("temp", "salt"):
+        cmp = compares.get(var)
+        if cmp is None:
+            continue
+        obs_vals = np.asarray(cmp["obs"], dtype=float)
+        mod_vals = np.asarray(cmp["mod"], dtype=float)
+        dep_vals = np.asarray(cmp["depth"], dtype=float)
+        for j in range(len(obs_vals)):
+            pair_rows.append(
+                {
+                    "task": task_name,
+                    "experiment_id": experiment_id if experiment_id is not None else model_name,
+                    "model": model_name,
+                    "station_id": station_id,
+                    "station_id_full": station_id,
+                    "station_name": station_name,
+                    "profile_id": profile_id,
+                    "obs_time": obs_time_txt,
+                    "var": var,
+                    "depth": float(dep_vals[j]),
+                    "obs": float(obs_vals[j]),
+                    "model_value": float(mod_vals[j]),
+                    "error": float(mod_vals[j] - obs_vals[j]),
+                }
+            )
+
+
+def _build_total_summary(total_profiles, summary_chunks, extras=None):
+    summary = {
+        "mpi_size": SIZE,
+        "total_profiles": int(total_profiles),
+        "assigned_profiles": int(builtins.sum(s["assigned_profiles"] for s in summary_chunks)),
+        "processed_profiles": int(builtins.sum(s["processed_profiles"] for s in summary_chunks)),
+        "skipped_profiles": int(builtins.sum(s["skipped_profiles"] for s in summary_chunks)),
+        "saved_profile_plots": int(builtins.sum(s["saved_profile_plots"] for s in summary_chunks)),
+        "pair_samples": int(builtins.sum(s["pair_samples"] for s in summary_chunks)),
+    }
+    if extras:
+        summary.update(extras)
+    return summary
+
+
+def _finalize_pair_outputs(local_pair_rows, local_summary, total_profiles, output_cfg, chunk_name, summary_extras=None):
+    local_summary["pair_samples"] = len(local_pair_rows)
+    chunk_dir, _ = _write_pair_chunk(output_cfg["dir"], chunk_name, RANK, local_pair_rows)
+    if MPI:
+        summary_chunks = COMM.gather(local_summary, root=0)
+        COMM.Barrier()
+    else:
+        summary_chunks = [local_summary]
+
+    if RANK == 0:
+        if MPI:
+            pair_rows = _collect_pair_chunks(chunk_dir, SIZE)
+        else:
+            pair_rows = local_pair_rows
+        total_summary = _build_total_summary(total_profiles, summary_chunks, extras=summary_extras)
+        _write_task_outputs(pair_rows, output_cfg, total_summary)
+        _cleanup_pair_chunks(chunk_dir)
+        rank_print("done")
+    if MPI:
+        COMM.Barrier()
+
+
+def _load_teams_raw_source(teams_cfg):
+    teams = loadz(teams_cfg["npz_path"])
+    lon = np.asarray(getattr(teams, teams_cfg["lon_name"]))
+    lat = np.asarray(getattr(teams, teams_cfg["lat_name"]))
+    depth = np.asarray(getattr(teams, teams_cfg["depth_name"]))
+    temp = np.asarray(getattr(teams, teams_cfg["temp_name"]))
+    salt = np.asarray(getattr(teams, teams_cfg["salt_name"]))
+    station_id = np.asarray(getattr(teams, teams_cfg["station_id_name"]))
+    station_name = None
+    station_name_field = teams_cfg.get("station_name_name")
+    if station_name_field and hasattr(teams, station_name_field):
+        station_name = np.asarray(getattr(teams, station_name_field))
+
+    time_raw = np.asarray(getattr(teams, teams_cfg["time_name"]))
+    time_str = time_raw.astype("datetime64[s]").astype(str)
+    obs_time = np.array([datenum(t) for t in time_str], dtype=float)
+    uniq_keys, inv, _ = build_profile_groups(station_id, time_raw)
+    return {
+        "lon": lon,
+        "lat": lat,
+        "depth": depth,
+        "temp": temp,
+        "salt": salt,
+        "station_id": station_id,
+        "station_name": station_name,
+        "time_raw": time_raw,
+        "obs_time": obs_time,
+        "uniq_keys": uniq_keys,
+        "inv": inv,
+    }
+
+
 def _run_npz_source(start_t, end_t, region, output_cfg):
     source_cfg = CONFIG.get("source", {})
     npz_paths = _resolve_source_npz_paths(source_cfg)
@@ -1733,31 +1781,17 @@ def _run_npz_source(start_t, end_t, region, output_cfg):
         for model in models:
             model_name = str(model.get("name", "model"))
             compares = model.get("compare", {})
-            for var in ("temp", "salt"):
-                cmp = compares.get(var)
-                if cmp is None:
-                    continue
-                obs_vals = np.asarray(cmp["obs"], dtype=float)
-                mod_vals = np.asarray(cmp["mod"], dtype=float)
-                dep_vals = np.asarray(cmp["depth"], dtype=float)
-                for j in range(len(obs_vals)):
-                    local_pair_rows.append(
-                        {
-                            "task": task_name,
-                            "experiment_id": experiment_id if experiment_id is not None else model_name,
-                            "model": model_name,
-                            "station_id": station_id,
-                            "station_id_full": station_id,
-                            "station_name": station_name,
-                            "profile_id": profile_id,
-                            "obs_time": obs_time_txt,
-                            "var": var,
-                            "depth": float(dep_vals[j]),
-                            "obs": float(obs_vals[j]),
-                            "model_value": float(mod_vals[j]),
-                            "error": float(mod_vals[j] - obs_vals[j]),
-                        }
-                    )
+            _append_pair_rows(
+                local_pair_rows,
+                compares,
+                task_name,
+                experiment_id,
+                model_name,
+                station_id,
+                station_name,
+                profile_id,
+                obs_time_txt,
+            )
 
         if _should_plot_profile(pidx, local_summary["saved_profile_plots"], plot_runtime):
             obs_plot = {"depth": obs_depth, "temp": obs_temp, "salt": obs_sal}
@@ -1774,52 +1808,22 @@ def _run_npz_source(start_t, end_t, region, output_cfg):
             plot_profiles(meta, region, obs_plot, models, CONFIG["plot"], output_cfg["dir"], plot_runtime=plot_runtime)
             local_summary["saved_profile_plots"] += 1
 
-    local_summary["pair_samples"] = len(local_pair_rows)
-    if MPI:
-        pair_chunks = COMM.gather(local_pair_rows, root=0)
-        summary_chunks = COMM.gather(local_summary, root=0)
-    else:
-        pair_chunks = [local_pair_rows]
-        summary_chunks = [local_summary]
-
-    if RANK == 0:
-        pair_rows = [r for chunk in pair_chunks for r in chunk]
-        total_summary = {
-            "mpi_size": SIZE,
-            "total_profiles": total_profiles,
-            "assigned_profiles": int(builtins.sum(s["assigned_profiles"] for s in summary_chunks)),
-            "processed_profiles": int(builtins.sum(s["processed_profiles"] for s in summary_chunks)),
-            "skipped_profiles": int(builtins.sum(s["skipped_profiles"] for s in summary_chunks)),
-            "saved_profile_plots": int(builtins.sum(s["saved_profile_plots"] for s in summary_chunks)),
-            "pair_samples": int(builtins.sum(s["pair_samples"] for s in summary_chunks)),
+    _finalize_pair_outputs(
+        local_pair_rows,
+        local_summary,
+        total_profiles,
+        output_cfg,
+        ".ctd_pair_chunks_npz",
+        summary_extras={
             "source_mode": "npz",
             "source_npz": npz_paths[0] if len(npz_paths) == 1 else npz_paths,
             "source_npz_count": int(len(npz_paths)),
             "plot_depth_mode": plot_depth_mode,
-        }
-        _write_task_outputs(pair_rows, output_cfg, total_summary)
-        rank_print("done")
-    if MPI:
-        COMM.Barrier()
+        },
+    )
 
 
-def main():
-    start_t, end_t = parse_date_range(CONFIG["date_range"])
-    region = setup_region(CONFIG["region"])
-    output_cfg = CONFIG.get("output", {})
-    plot_runtime = _prepare_plot_runtime(output_cfg)
-    source_cfg = CONFIG.get("source", {})
-    source_mode = str(source_cfg.get("mode", "raw")).strip().lower()
-
-    if RANK == 0:
-        ensure_output_dir(output_cfg["dir"])
-    if MPI:
-        COMM.Barrier()
-
-    if source_mode == "npz":
-        _run_npz_source(start_t, end_t, region, output_cfg)
-        return
-
+def _run_raw_source(start_t, end_t, region, output_cfg, plot_runtime):
     sch_cfg = prepare_schism(CONFIG["schism"])
     gm_cfg = prepare_global_model(CONFIG["global_model"], start_t, end_t)
     sch_list = sch_cfg if isinstance(sch_cfg, list) else ([sch_cfg] if sch_cfg is not None else [])
@@ -1828,24 +1832,18 @@ def main():
         rank_print("No models selected for comparison. Enable at least one model in CONFIG.")
         return
 
-    teams_cfg = CONFIG["teams"]
-    S = loadz(teams_cfg["npz_path"])
-    lon = np.asarray(getattr(S, teams_cfg["lon_name"]))
-    lat = np.asarray(getattr(S, teams_cfg["lat_name"]))
-    depth = np.asarray(getattr(S, teams_cfg["depth_name"]))
-    temp = np.asarray(getattr(S, teams_cfg["temp_name"]))
-    salt = np.asarray(getattr(S, teams_cfg["salt_name"]))
-    st_id = np.asarray(getattr(S, teams_cfg["station_id_name"]))
-    st_name = None
-    st_name_field = teams_cfg.get("station_name_name")
-    if st_name_field and hasattr(S, st_name_field):
-        st_name = np.asarray(getattr(S, st_name_field))
+    teams = _load_teams_raw_source(CONFIG["teams"])
+    lon = teams["lon"]
+    lat = teams["lat"]
+    depth = teams["depth"]
+    temp = teams["temp"]
+    salt = teams["salt"]
+    st_id = teams["station_id"]
+    st_name = teams["station_name"]
+    obs_time = teams["obs_time"]
+    uniq_keys = teams["uniq_keys"]
+    inv = teams["inv"]
 
-    time_raw = np.asarray(getattr(S, teams_cfg["time_name"]))
-    time_str = time_raw.astype("datetime64[s]").astype(str)
-    obs_time = np.array([datenum(t) for t in time_str], dtype=float)
-
-    uniq_keys, inv, _ = build_profile_groups(st_id, time_raw)
     total_profiles = len(uniq_keys)
     if total_profiles == 0:
         rank_print("No TEAMS profiles found.")
@@ -2005,31 +2003,17 @@ def main():
             model.setdefault("stats", {"temp": None, "salt": None})
             model_name = str(model.get("name", "model"))
             compares = model.get("compare", {})
-            for var in ("temp", "salt"):
-                cmp = compares.get(var)
-                if cmp is None:
-                    continue
-                obs_vals = np.asarray(cmp["obs"], dtype=float)
-                mod_vals = np.asarray(cmp["mod"], dtype=float)
-                dep_vals = np.asarray(cmp["depth"], dtype=float)
-                for j in range(len(obs_vals)):
-                    local_pair_rows.append(
-                        {
-                            "task": task_name,
-                            "experiment_id": experiment_id if experiment_id is not None else model_name,
-                            "model": model_name,
-                            "station_id": station_id,
-                            "station_id_full": station_id,
-                            "station_name": station_name,
-                            "profile_id": profile_id,
-                            "obs_time": obs_time_txt,
-                            "var": var,
-                            "depth": float(dep_vals[j]),
-                            "obs": float(obs_vals[j]),
-                            "model_value": float(mod_vals[j]),
-                            "error": float(mod_vals[j] - obs_vals[j]),
-                        }
-                    )
+            _append_pair_rows(
+                local_pair_rows,
+                compares,
+                task_name,
+                experiment_id,
+                model_name,
+                station_id,
+                station_name,
+                profile_id,
+                obs_time_txt,
+            )
 
         if _should_plot_profile(profile_idx, local_summary["saved_profile_plots"], plot_runtime):
             obs_plot = {"depth": obs_depth, "temp": obs_temp, "salt": obs_salt}
@@ -2046,29 +2030,33 @@ def main():
             plot_profiles(meta, region, obs_plot, models, CONFIG["plot"], output_cfg["dir"], plot_runtime=plot_runtime)
             local_summary["saved_profile_plots"] += 1
 
-    local_summary["pair_samples"] = len(local_pair_rows)
-    if MPI:
-        pair_chunks = COMM.gather(local_pair_rows, root=0)
-        summary_chunks = COMM.gather(local_summary, root=0)
-    else:
-        pair_chunks = [local_pair_rows]
-        summary_chunks = [local_summary]
+    _finalize_pair_outputs(
+        local_pair_rows,
+        local_summary,
+        total_profiles,
+        output_cfg,
+        ".ctd_pair_chunks_raw",
+    )
+
+
+def main():
+    start_t, end_t = parse_date_range(CONFIG["date_range"])
+    region = setup_region(CONFIG["region"])
+    output_cfg = CONFIG.get("output", {})
+    plot_runtime = _prepare_plot_runtime(output_cfg)
+    source_cfg = CONFIG.get("source", {})
+    source_mode = str(source_cfg.get("mode", "raw")).strip().lower()
 
     if RANK == 0:
-        pair_rows = [r for chunk in pair_chunks for r in chunk]
-        total_summary = {
-            "mpi_size": SIZE,
-            "total_profiles": total_profiles,
-            "assigned_profiles": int(builtins.sum(s["assigned_profiles"] for s in summary_chunks)),
-            "processed_profiles": int(builtins.sum(s["processed_profiles"] for s in summary_chunks)),
-            "skipped_profiles": int(builtins.sum(s["skipped_profiles"] for s in summary_chunks)),
-            "saved_profile_plots": int(builtins.sum(s["saved_profile_plots"] for s in summary_chunks)),
-            "pair_samples": int(builtins.sum(s["pair_samples"] for s in summary_chunks)),
-        }
-        _write_task_outputs(pair_rows, output_cfg, total_summary)
-        rank_print("done")
+        ensure_output_dir(output_cfg["dir"])
     if MPI:
         COMM.Barrier()
+
+    if source_mode == "npz":
+        _run_npz_source(start_t, end_t, region, output_cfg)
+        return
+
+    _run_raw_source(start_t, end_t, region, output_cfg, plot_runtime)
 
 
 if __name__ == "__main__":
