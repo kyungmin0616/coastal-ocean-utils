@@ -95,13 +95,13 @@ OBS_DEFAULT = SCRIPT_DIR / "npz" / "jodc_tide_all.npz"
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "runs": ["/scratch2/08924/kmpark/post-proc/npz/RUN01e_JODC.npz", "/scratch2/08924/kmpark/post-proc/npz/RUN01f_JODC.npz", "/scratch2/08924/kmpark/post-proc/npz/RUN02a_JODC.npz", "/scratch2/08924/kmpark/post-proc/npz/RUN02b_JODC.npz"],
-    "tags": ["RUN01e", "RUN01f", "RUN02a", "RUN02b"],
-    "bpfile": "/scratch2/08924/kmpark/post-proc/station_jodc.bp",
-    "outdir": "/scratch2/08924/kmpark/post-proc/ESIMAGES/CompJODC_01ef02ab",
-    "obs_path": "/scratch2/08924/kmpark/post-proc/npz/jodc_tide_all.npz",
-    "start": "2017-04-14 00:00:00",
-    "end": "2017-04-30 00:00:00",
+    "runs": ["/scratch2/08924/kmpark/SOB/post-proc/npz/RUN01g_JODC.npz","/scratch2/08924/kmpark/SOB/post-proc/npz/RUN03a_JODC.npz","/scratch2/08924/kmpark/SOB/post-proc/npz/RUN04a_JODC.npz","/scratch2/08924/kmpark/SOB/post-proc/npz/RUN05a_JODC.npz"],
+    "tags": ["RUN01g", "RUN03a", "RUN04a", "RUN05a"],
+    "bpfile": "/scratch2/08924/kmpark/SOB/post-proc/station_jodc.bp",
+    "outdir": "/scratch2/08924/kmpark/SOB/post-proc/CompJODC_01g03a04a05a",
+    "obs_path": "/scratch2/08924/kmpark/SOB/post-proc/npz/jodc_tide_all.npz",
+    "start": "2012-03-1 00:00:00",
+    "end": "2012-03-14 00:00:00",
     "model_start": None,
     "model_time_offset_days": [0.0],
     "npz_time_mode": "absolute",  # absolute | relative | auto
@@ -112,14 +112,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "plot_ylim": [-1.5, 1.5],
     "line_width": 1.8,
     "save_plots": True,
+    "log_station_skips": True,
     "filter_obs": False,
     "filter_model": False,
     "cutoff_period_hours": 34.0,
     "butterworth_order": 4,
     "station_list": None,
     "progress_every": 1,
-    "grid": None,  # optional hgrid.gr3 for map boundary
+    "grid": "/scratch2/08924/kmpark/SOB/run/RUN01d/hgrid.gr3",  # optional hgrid.gr3 for map boundary
     "map_zoom": 0.1,  # half-width in degree around active station
+    # Optional station-specific observation datum offsets (meters).
+    # Positive offset means: obs_corrected = obs_raw + offset.
+    # Example:
+    # "obs_station_offsets": {"Abashiri": 0.12, "1234": -0.08}
+    "obs_station_offsets": {"MA11": -2.609, "0112": -1.89, "2003": -0.875},
 }
 
 
@@ -183,6 +189,64 @@ def _resample(times: np.ndarray, values: np.ndarray, freq: Optional[str]) -> pd.
         f = str(freq).strip().lower()
         s = s.resample(f).mean()
     return s.dropna()
+
+
+def _time_range_text(times: np.ndarray) -> Tuple[float, float, int, str, str]:
+    arr = np.asarray(times, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return np.nan, np.nan, 0, "nan", "nan"
+    tmin = float(np.nanmin(arr))
+    tmax = float(np.nanmax(arr))
+    tmin_txt = num2date(tmin).strftime("%Y-%m-%d %H:%M:%S")
+    tmax_txt = num2date(tmax).strftime("%Y-%m-%d %H:%M:%S")
+    return tmin, tmax, int(arr.size), tmin_txt, tmax_txt
+
+
+def _build_station_offset_map(raw: Any) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if raw is None:
+        return out
+    if isinstance(raw, dict):
+        items = raw.items()
+    elif isinstance(raw, (list, tuple)):
+        items = []
+        for entry in raw:
+            if isinstance(entry, dict):
+                sid = entry.get("station", entry.get("id", entry.get("name")))
+                off = entry.get("offset")
+                items.append((sid, off))
+            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                items.append((entry[0], entry[1]))
+    else:
+        return out
+
+    for sid, off in items:
+        if sid is None:
+            continue
+        key = _normalize_station_id(str(sid))
+        if key == "":
+            continue
+        try:
+            out[key] = float(off)
+        except Exception:
+            continue
+    return out
+
+
+def _lookup_station_offset(offset_map: Dict[str, float], sid: str, obs_key: Optional[str] = None) -> float:
+    keys = []
+    sid_n = _normalize_station_id(sid)
+    keys.append(sid_n)
+    keys.append(sid_n.lstrip("0"))
+    if obs_key is not None:
+        ok = _normalize_station_id(obs_key)
+        keys.append(ok)
+        keys.append(ok.lstrip("0"))
+    for k in keys:
+        if k in offset_map:
+            return float(offset_map[k])
+    return 0.0
 
 
 def _apply_lowpass(
@@ -445,6 +509,8 @@ def _load_config(args: argparse.Namespace) -> Dict[str, Any]:
         cfg["demean"] = bool(args.demean)
     if args.save_plots is not None:
         cfg["save_plots"] = bool(args.save_plots)
+    if args.log_station_skips is not None:
+        cfg["log_station_skips"] = bool(args.log_station_skips)
     if args.filter_obs is not None:
         cfg["filter_obs"] = bool(args.filter_obs)
     if args.filter_model is not None:
@@ -549,6 +615,19 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--save-plots", dest="save_plots", action="store_true", help="Write station plots.")
     p.add_argument("--no-save-plots", dest="save_plots", action="store_false", help="Skip plotting.")
     p.set_defaults(save_plots=None)
+    p.add_argument(
+        "--log-station-skips",
+        dest="log_station_skips",
+        action="store_true",
+        help="Log per-station skip reasons.",
+    )
+    p.add_argument(
+        "--no-log-station-skips",
+        dest="log_station_skips",
+        action="store_false",
+        help="Do not log per-station skip reasons.",
+    )
+    p.set_defaults(log_station_skips=None)
     p.add_argument("--filter-obs", dest="filter_obs", action="store_true", help="Low-pass filter obs.")
     p.add_argument("--no-filter-obs", dest="filter_obs", action="store_false", help="Do not filter obs.")
     p.set_defaults(filter_obs=None)
@@ -609,7 +688,68 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     t0 = time.time()
     obs_map = _load_observations(obs_path)
     obs_lookup = _build_station_lookup(obs_map)
+    raw_offsets = cfg.get("obs_station_offsets", cfg.get("obs_datum_offsets", {}))
+    obs_station_offsets = _build_station_offset_map(raw_offsets)
     log(f"Loaded observations for {len(obs_map)} stations", rank0_only=True)
+    if obs_station_offsets:
+        show = ", ".join(f"{k}:{v:+.4f}" for k, v in sorted(obs_station_offsets.items()))
+        log(
+            f"Configured observation datum offsets ({len(obs_station_offsets)}): {show}",
+            rank0_only=True,
+        )
+    else:
+        log("Configured observation datum offsets: none", rank0_only=True)
+    obs_tmin = np.nan
+    obs_tmax = np.nan
+    obs_count = 0
+    for oti_raw, _ in obs_map.values():
+        tmin_i, tmax_i, n_i, _, _ = _time_range_text(oti_raw)
+        if n_i == 0:
+            continue
+        obs_count += n_i
+        if not np.isfinite(obs_tmin) or tmin_i < obs_tmin:
+            obs_tmin = tmin_i
+        if not np.isfinite(obs_tmax) or tmax_i > obs_tmax:
+            obs_tmax = tmax_i
+    if np.isfinite(obs_tmin) and np.isfinite(obs_tmax):
+        log(
+            f"Observation global coverage: n={obs_count}, "
+            f"range=[{num2date(obs_tmin).strftime('%Y-%m-%d %H:%M:%S')} .. {num2date(obs_tmax).strftime('%Y-%m-%d %H:%M:%S')}]",
+            rank0_only=True,
+        )
+    else:
+        log("Observation global coverage: no finite timestamps", rank0_only=True)
+
+    matched_obs = []
+    for sidx in wl_indices:
+        sid = station_ids[sidx]
+        obs_key = obs_lookup.get(_normalize_station_id(sid))
+        if obs_key is None:
+            obs_key = obs_lookup.get(_normalize_station_id(sid).lstrip("0"))
+        if obs_key is None:
+            continue
+        tmin_i, tmax_i, n_i, tmin_txt, tmax_txt = _time_range_text(obs_map[obs_key][0])
+        if n_i <= 0:
+            continue
+        off_i = _lookup_station_offset(obs_station_offsets, sid=sid, obs_key=obs_key)
+        matched_obs.append((sid, n_i, tmin_i, tmax_i, tmin_txt, tmax_txt, off_i))
+
+    if matched_obs:
+        mmn = min(item[2] for item in matched_obs)
+        mmx = max(item[3] for item in matched_obs)
+        log(
+            f"Observation matched-station coverage: nsta={len(matched_obs)}/{len(wl_indices)}, "
+            f"range=[{num2date(mmn).strftime('%Y-%m-%d %H:%M:%S')} .. {num2date(mmx).strftime('%Y-%m-%d %H:%M:%S')}]",
+            rank0_only=True,
+        )
+        for sid, n_i, _, _, tmin_txt, tmax_txt, off_i in matched_obs:
+            log(
+                f"Loaded observation {sid}: n={n_i}, range=[{tmin_txt} .. {tmax_txt}], datum_offset={off_i:+.4f} m",
+                rank0_only=True,
+            )
+    else:
+        log("Observation matched-station coverage: no matching station/time records", rank0_only=True)
+
     gd = None
     if cfg.get("grid"):
         grid_path = _resolve_path(str(cfg["grid"]))
@@ -642,191 +782,234 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
 
     rows_local: List[Dict[str, Any]] = []
+    skip_counts_local: Dict[str, int] = {}
+    plots_saved_local = 0
     progress_every = max(1, int(cfg.get("progress_every", 20)))
+
+    def _note_skip(reason: str, sid: str) -> None:
+        skip_counts_local[reason] = int(skip_counts_local.get(reason, 0)) + 1
+        if bool(cfg.get("log_station_skips", True)):
+            log(f"[SKIP] station={sid} reason={reason}")
 
     for p, sidx in enumerate(local_indices, start=1):
         sid = station_ids[sidx]
-        obs_key = obs_lookup.get(_normalize_station_id(sid))
-        if obs_key is None:
-            obs_key = obs_lookup.get(_normalize_station_id(sid).lstrip("0"))
-        if obs_key is None:
-            continue
-        oti_raw, oyi_raw = obs_map[obs_key]
-        mask = (oti_raw >= start_dnum) & (oti_raw <= end_dnum)
-        oti = oti_raw[mask]
-        oyi = oyi_raw[mask]
-        if len(oti) == 0:
-            continue
-
-        if cfg.get("filter_obs", False):
-            oyi = _apply_lowpass(
-                oyi,
-                oti,
-                float(cfg["cutoff_period_hours"]),
-                int(cfg["butterworth_order"]),
-            )
-        obs_series = _resample(oti, oyi, cfg.get("resample_obs"))
-        if len(obs_series) == 0:
-            continue
-        if cfg.get("demean", True):
-            obs_mean = float(obs_series.mean())
-            if np.isfinite(obs_mean):
-                obs_series = obs_series - obs_mean
-
-        fig = None
-        ax_map = None
-        ax_ts = None
-        if cfg.get("save_plots", True):
-            fig, (ax_map, ax_ts) = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [1.0, 2.2]})
-            ax_ts.plot(
-                obs_series.index,
-                obs_series.values,
-                linestyle="None",
-                marker="o",
-                markersize=2.5,
-                color="red",
-                alpha=0.8,
-                label="Obs",
-            )
-
-            # left panel: station location map
-            if gd is not None:
-                try:
-                    gd.plot_bnd(ax=ax_map)
-                except Exception as exc:
-                    log(f"[WARN] grid boundary plotting failed: {exc}", rank0_only=True)
-            finite_all = np.isfinite(station_lon) & np.isfinite(station_lat)
-            if np.any(finite_all):
-                ax_map.plot(station_lon[finite_all], station_lat[finite_all], ".", color="0.65", ms=3.0, label="Stations")
-            lon0 = float(station_lon[sidx]) if sidx < len(station_lon) else np.nan
-            lat0 = float(station_lat[sidx]) if sidx < len(station_lat) else np.nan
-            if np.isfinite(lon0) and np.isfinite(lat0):
-                ax_map.plot(lon0, lat0, "ro", ms=5, label="Obs site")
-                dz = float(cfg.get("map_zoom", 0.1))
-                if np.isfinite(dz) and dz > 0:
-                    ax_map.set_xlim(lon0 - dz, lon0 + dz)
-                    ax_map.set_ylim(lat0 - dz, lat0 + dz)
-            ax_map.set_title(f"Station {sid}")
-            ax_map.set_xlabel("Lon")
-            ax_map.set_ylabel("Lat")
-            ax_map.grid(alpha=0.3)
-            ax_map.legend(loc="best", fontsize=8)
-
-        text_lines = []
-        for model in model_runs:
-            if sidx >= model["elev"].shape[0]:
+        try:
+            obs_key = obs_lookup.get(_normalize_station_id(sid))
+            if obs_key is None:
+                obs_key = obs_lookup.get(_normalize_station_id(sid).lstrip("0"))
+            if obs_key is None:
+                _note_skip("obs_station_not_found", sid)
                 continue
-            mti = model["time"]
-            myi = model["elev"][sidx, :].astype(float)
-            mmask = (mti >= start_dnum) & (mti <= end_dnum)
-            mti = mti[mmask]
-            myi = myi[mmask]
-            valid = np.isfinite(myi)
-            mti = mti[valid]
-            myi = myi[valid]
-            if len(mti) == 0:
+            oti_raw, oyi_raw = obs_map[obs_key]
+            mask = (oti_raw >= start_dnum) & (oti_raw <= end_dnum)
+            oti = oti_raw[mask]
+            oyi = oyi_raw[mask]
+            if len(oti) == 0:
+                _note_skip("no_obs_in_time_window", sid)
                 continue
-            if cfg.get("filter_model", False):
-                myi = _apply_lowpass(
-                    myi,
-                    mti,
+            obs_offset = _lookup_station_offset(obs_station_offsets, sid=sid, obs_key=obs_key)
+            if obs_offset != 0.0:
+                oyi = oyi + float(obs_offset)
+                log(
+                    f"Applied obs datum offset: station={sid}, obs_key={obs_key}, offset={obs_offset:+.4f} m",
+                    rank0_only=False,
+                )
+
+            if cfg.get("filter_obs", False):
+                oyi = _apply_lowpass(
+                    oyi,
+                    oti,
                     float(cfg["cutoff_period_hours"]),
                     int(cfg["butterworth_order"]),
                 )
-
-            model_series = _resample(mti, myi, cfg.get("resample_model"))
-            if len(model_series) == 0:
+            obs_series = _resample(oti, oyi, cfg.get("resample_obs"))
+            if len(obs_series) == 0:
+                _note_skip("obs_empty_after_resample", sid)
                 continue
             if cfg.get("demean", True):
-                mod_mean = float(model_series.mean())
-                if np.isfinite(mod_mean):
-                    model_series = model_series - mod_mean
+                obs_mean = float(obs_series.mean())
+                if np.isfinite(obs_mean):
+                    obs_series = obs_series - obs_mean
 
-            if len(model_series.index) < 2:
-                continue
-            obs_clip = obs_series[
-                (obs_series.index >= model_series.index.min())
-                & (obs_series.index <= model_series.index.max())
-            ]
-            if len(obs_clip) == 0:
-                continue
-            interp_series = (
-                model_series.reindex(model_series.index.union(obs_clip.index))
-                .sort_index()
-                .interpolate(method="time")
-                .reindex(obs_clip.index)
-            )
-            valid = obs_clip.notna() & interp_series.notna()
-            if valid.sum() < 2:
-                continue
-            obs_vals = obs_clip[valid].to_numpy(dtype=float)
-            mod_vals = interp_series[valid].to_numpy(dtype=float)
-            metrics = _compute_metrics(obs_vals, mod_vals)
-            row = {
-                "model": model["tag"],
-                "station": sid,
-                "station_index_1based": sidx + 1,
-                "n": metrics["n"],
-                "bias": metrics["bias"],
-                "rmse": metrics["rmse"],
-                "corr": metrics["corr"],
-                "obs_std": metrics["obs_std"],
-                "mod_std": metrics["mod_std"],
-                "nrmse_std": metrics["nrmse_std"],
-                "wss": metrics["wss"],
-                "crmsd": metrics["crmsd"],
-            }
-            rows_local.append(row)
-            text_lines.append(
-                f"{model['tag']}: R={metrics['corr']:.2f}, RMSE={metrics['rmse']:.3f}, "
-                f"Bias={metrics['bias']:.3f}, WSS={metrics['wss']:.3f}"
-            )
-
-            if ax_ts is not None:
+            fig = None
+            ax_map = None
+            ax_ts = None
+            if cfg.get("save_plots", True):
+                fig, (ax_map, ax_ts) = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [1.0, 2.2]})
                 ax_ts.plot(
-                    model_series.index,
-                    model_series.values,
-                    linewidth=float(cfg["line_width"]),
-                    label=model["tag"],
+                    obs_series.index,
+                    obs_series.values,
+                    linestyle="None",
+                    marker="o",
+                    markersize=2.5,
+                    color="red",
+                    alpha=0.8,
+                    label="Obs",
                 )
 
-        if ax_ts is not None and len(ax_ts.lines) > 1:
-            ax_ts.set_title(f"WL station {sid}")
-            ax_ts.set_xlabel("Time")
-            ax_ts.set_ylabel("Water level (m)")
-            if cfg.get("plot_ylim") is not None:
-                y0, y1 = cfg["plot_ylim"]
-                if y0 is not None and y1 is not None:
-                    ax_ts.set_ylim(float(y0), float(y1))
-            ax_ts.grid(alpha=0.3)
-            ax_ts.legend(loc="best")
-            if text_lines:
-                ax_ts.text(
-                    0.01,
-                    0.02,
-                    "\n".join(text_lines[:6]),
-                    transform=ax_ts.transAxes,
-                    va="bottom",
-                    fontsize=8,
-                    bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+                # left panel: station location map
+                if gd is not None:
+                    try:
+                        gd.plot_bnd(ax=ax_map)
+                    except Exception as exc:
+                        log(f"[WARN] grid boundary plotting failed: {exc}", rank0_only=True)
+                finite_all = np.isfinite(station_lon) & np.isfinite(station_lat)
+                if np.any(finite_all):
+                    ax_map.plot(station_lon[finite_all], station_lat[finite_all], ".", color="0.65", ms=3.0, label="Stations")
+                lon0 = float(station_lon[sidx]) if sidx < len(station_lon) else np.nan
+                lat0 = float(station_lat[sidx]) if sidx < len(station_lat) else np.nan
+                if np.isfinite(lon0) and np.isfinite(lat0):
+                    ax_map.plot(lon0, lat0, "ro", ms=5, label="Obs site")
+                    dz = float(cfg.get("map_zoom", 0.1))
+                    if np.isfinite(dz) and dz > 0:
+                        ax_map.set_xlim(lon0 - dz, lon0 + dz)
+                        ax_map.set_ylim(lat0 - dz, lat0 + dz)
+                ax_map.set_title(f"Station {sid}")
+                ax_map.set_xlabel("Lon")
+                ax_map.set_ylabel("Lat")
+                ax_map.grid(alpha=0.3)
+                ax_map.legend(loc="best", fontsize=8)
+
+            text_lines = []
+            rows_before_station = len(rows_local)
+            for model in model_runs:
+                if sidx >= model["elev"].shape[0]:
+                    continue
+                mti = model["time"]
+                myi = model["elev"][sidx, :].astype(float)
+                mmask = (mti >= start_dnum) & (mti <= end_dnum)
+                mti = mti[mmask]
+                myi = myi[mmask]
+                valid = np.isfinite(myi)
+                mti = mti[valid]
+                myi = myi[valid]
+                if len(mti) == 0:
+                    continue
+                if cfg.get("filter_model", False):
+                    myi = _apply_lowpass(
+                        myi,
+                        mti,
+                        float(cfg["cutoff_period_hours"]),
+                        int(cfg["butterworth_order"]),
+                    )
+
+                model_series = _resample(mti, myi, cfg.get("resample_model"))
+                if len(model_series) == 0:
+                    continue
+                if cfg.get("demean", True):
+                    mod_mean = float(model_series.mean())
+                    if np.isfinite(mod_mean):
+                        model_series = model_series - mod_mean
+
+                # Always plot available model series for the selected window.
+                # Metrics may still be skipped below if overlap with observations is too short.
+                if ax_ts is not None:
+                    ax_ts.plot(
+                        model_series.index,
+                        model_series.values,
+                        linewidth=float(cfg["line_width"]),
+                        label=model["tag"],
+                    )
+
+                if len(model_series.index) < 2:
+                    continue
+                obs_clip = obs_series[
+                    (obs_series.index >= model_series.index.min())
+                    & (obs_series.index <= model_series.index.max())
+                ]
+                if len(obs_clip) == 0:
+                    continue
+                interp_series = (
+                    model_series.reindex(model_series.index.union(obs_clip.index))
+                    .sort_index()
+                    .interpolate(method="time")
+                    .reindex(obs_clip.index)
                 )
-            fig.tight_layout()
-            fig.savefig(outdir / f"WL_station_{sid}.png", dpi=180)
-        if fig is not None:
-            plt.close(fig)
+                valid = obs_clip.notna() & interp_series.notna()
+                if valid.sum() < 2:
+                    continue
+                obs_vals = obs_clip[valid].to_numpy(dtype=float)
+                mod_vals = interp_series[valid].to_numpy(dtype=float)
+                metrics = _compute_metrics(obs_vals, mod_vals)
+                row = {
+                    "model": model["tag"],
+                    "station": sid,
+                    "station_index_1based": sidx + 1,
+                    "n": metrics["n"],
+                    "bias": metrics["bias"],
+                    "rmse": metrics["rmse"],
+                    "corr": metrics["corr"],
+                    "obs_std": metrics["obs_std"],
+                    "mod_std": metrics["mod_std"],
+                    "nrmse_std": metrics["nrmse_std"],
+                    "wss": metrics["wss"],
+                    "crmsd": metrics["crmsd"],
+                }
+                rows_local.append(row)
+                text_lines.append(
+                    f"{model['tag']}: R={metrics['corr']:.2f}, RMSE={metrics['rmse']:.3f}, "
+                    f"Bias={metrics['bias']:.3f}, WSS={metrics['wss']:.3f}"
+                )
 
-        if p == 1 or p % progress_every == 0 or p == len(local_indices):
-            log(f"Processed {p}/{len(local_indices)} assigned stations")
+            if len(rows_local) == rows_before_station:
+                _note_skip("no_valid_model_obs_overlap_for_metrics", sid)
 
+            if ax_ts is not None and len(ax_ts.lines) > 1:
+                ax_ts.set_title(f"WL station {sid}")
+                ax_ts.set_xlabel("Time")
+                ax_ts.set_ylabel("Water level (m)")
+                if cfg.get("plot_ylim") is not None:
+                    y0, y1 = cfg["plot_ylim"]
+                    if y0 is not None and y1 is not None:
+                        ax_ts.set_ylim(float(y0), float(y1))
+                ax_ts.grid(alpha=0.3)
+                ax_ts.legend(loc="best")
+                if text_lines:
+                    ax_ts.text(
+                        0.01,
+                        0.02,
+                        "\n".join(text_lines[:6]),
+                        transform=ax_ts.transAxes,
+                        va="bottom",
+                        fontsize=8,
+                        bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+                    )
+                fig.tight_layout()
+                fig.savefig(outdir / f"WL_station_{sid}.png", dpi=180)
+                plots_saved_local += 1
+            elif cfg.get("save_plots", True):
+                _note_skip("plot_not_saved_no_model_series_in_window", sid)
+            if fig is not None:
+                plt.close(fig)
+        finally:
+            if p == 1 or p % progress_every == 0 or p == len(local_indices):
+                log(f"Processed {p}/{len(local_indices)} assigned stations")
+
+    payload_local = {
+        "rows": rows_local,
+        "skip_counts": skip_counts_local,
+        "plots_saved": int(plots_saved_local),
+    }
     if MPI:
-        all_rows = COMM.gather(rows_local, root=0)
+        all_payload = COMM.gather(payload_local, root=0)
     else:
-        all_rows = [rows_local]
+        all_payload = [payload_local]
 
     if RANK == 0:
-        flat_rows = [row for part in all_rows for row in part]
+        flat_rows = [row for part in all_payload for row in part.get("rows", [])]
         df = pd.DataFrame(flat_rows)
         stats_csv = outdir / "WL_stats.csv"
+        skip_counts_global: Dict[str, int] = {}
+        total_plots_saved = 0
+        for part in all_payload:
+            total_plots_saved += int(part.get("plots_saved", 0))
+            for key, val in dict(part.get("skip_counts", {})).items():
+                skip_counts_global[str(key)] = int(skip_counts_global.get(str(key), 0)) + int(val)
+        if skip_counts_global:
+            summary_txt = ", ".join(f"{k}:{v}" for k, v in sorted(skip_counts_global.items()))
+            log(f"Station skip summary -> {summary_txt}", rank0_only=True)
+        log(f"Saved station plot files: {total_plots_saved}", rank0_only=True)
+
         if len(df) > 0:
             df.sort_values(["model", "station"]).to_csv(stats_csv, index=False)
             by_model = []

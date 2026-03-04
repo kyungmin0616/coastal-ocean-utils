@@ -51,10 +51,6 @@ DEFAULT_VQS_CFG = {
         (360.0, 26),
     ],
     "dz_bot_min": 0.1,
-    "VSTRETCHING": 1,  # 1: current gen_vqs.py method; 2/3/4: Rutgers/ROMS stretching
-    "RTHETA_S": 5.0,  # Rutgers surface stretching (used for VSTRETCHING=2/3/4)
-    "RTHETA_B": 3.0,  # Rutgers bottom stretching (used for VSTRETCHING=2/3/4)
-    "TCLINE": 5.0,  # Rutgers critical depth hc (m), must be > 0 for VSTRETCHING=2/3/4
     "n_generated_masters": None,  # None: auto-use all master_levels; int N: apply auto-stretch only to first N masters (must be 1..len(master_levels)).
     "require_non_decreasing_layers": False,  # True: enforce nlev(i+1) >= nlev(i) with increasing depth; False: allow local decreases if intentionally specified.
 }
@@ -112,127 +108,6 @@ def _parse_master_levels(master_levels):
     return np.asarray(hsm, dtype=float), np.asarray(nv_vqs, dtype=int)
 
 
-def _sigma_rutgers_sc_cs(kb, vstretching, rtheta_s, rtheta_b):
-    kb = int(kb)
-    if kb < 2:
-        raise ValueError(f"Rutgers stretching requires kb>=2, got {kb}")
-    kbm1 = kb - 1
-    ds = 1.0 / float(kbm1)
-    sc_w = np.zeros(kb + 1, dtype=float)  # Fortran-like index 0..kb
-    cs_w = np.zeros(kb + 1, dtype=float)
-
-    if int(vstretching) == 2:
-        aweight = 1.0
-        bweight = 1.0
-        for k in range(kbm1 - 1, 0, -1):
-            cff = ds * float(k - kbm1)
-            sc_w[k] = cff
-            if rtheta_s > 0.0:
-                denom = np.cosh(rtheta_s) - 1.0
-                if abs(denom) < 1.0e-14:
-                    csur = cff
-                else:
-                    csur = (1.0 - np.cosh(rtheta_s * cff)) / denom
-                if rtheta_b > 0.0:
-                    cbot = np.sinh(rtheta_b * (cff + 1.0)) / np.sinh(rtheta_b) - 1.0
-                    cweight = (cff + 1.0) ** aweight * (
-                        1.0 + (aweight / bweight) * (1.0 - (cff + 1.0) ** bweight)
-                    )
-                    cs_w[k] = cweight * csur + (1.0 - cweight) * cbot
-                else:
-                    cs_w[k] = csur
-            else:
-                cs_w[k] = cff
-        sc_w[0] = -1.0
-        cs_w[0] = -1.0
-    elif int(vstretching) == 3:
-        hscale = 3.0
-        exp_sur = rtheta_s
-        exp_bot = rtheta_b
-        sc_w[kbm1] = 0.0
-        cs_w[kbm1] = 0.0
-        den = np.log(np.cosh(hscale))
-        if abs(den) < 1.0e-14:
-            den = 1.0
-        for k in range(kbm1 - 1, 0, -1):
-            cff = ds * float(k - kbm1)
-            sc_w[k] = cff
-            cbot = np.log(np.cosh(hscale * (cff + 1.0) ** exp_bot)) / den - 1.0
-            csur = -np.log(np.cosh(hscale * (abs(cff) ** exp_sur))) / den
-            cweight = 0.5 * (1.0 - np.tanh(hscale * (cff + 0.5)))
-            cs_w[k] = cweight * cbot + (1.0 - cweight) * csur
-        sc_w[0] = -1.0
-        cs_w[0] = -1.0
-    elif int(vstretching) == 4:
-        sc_w[kbm1] = 0.0
-        cs_w[kbm1] = 0.0
-        for k in range(kbm1 - 1, 0, -1):
-            cff = ds * float(k - kbm1)
-            sc_w[k] = cff
-            if rtheta_s > 0.0:
-                denom = np.cosh(rtheta_s) - 1.0
-                if abs(denom) < 1.0e-14:
-                    csur = -(cff**2)
-                else:
-                    csur = (1.0 - np.cosh(rtheta_s * cff)) / denom
-            else:
-                csur = -(cff**2)
-            if rtheta_b > 0.0:
-                den = 1.0 - np.exp(-rtheta_b)
-                if abs(den) < 1.0e-14:
-                    cs_w[k] = csur
-                else:
-                    cs_w[k] = (np.exp(rtheta_b * csur) - 1.0) / den
-            else:
-                cs_w[k] = csur
-        sc_w[0] = -1.0
-        cs_w[0] = -1.0
-    else:
-        raise ValueError(f"Unsupported VSTRETCHING={vstretching}; expected 2,3,4")
-    return sc_w, cs_w
-
-
-def _sigma_rutgers_vec(h, kb, sc_w, cs_w, tcline):
-    kb = int(kb)
-    kbm1 = kb - 1
-    h = float(h)
-    hc = float(tcline)
-    z_w = np.zeros(kb + 1, dtype=float)  # Fortran-like index 0..kb
-    z_w[0] = -1.0
-    for k in range(1, kbm1 + 1):
-        cff_w = hc * sc_w[k]
-        cff1_w = cs_w[k]
-        hinv = 1.0 / (hc + h)
-        z_w[k] = (cff_w + cff1_w * h) * hinv
-    # Wrapper from ROMS-like order to SCHISM-like order (Fortran-compatible).
-    out = np.zeros(kb, dtype=float)
-    for k in range(1, kb + 1):
-        kk = kb - k + 1
-        out[k - 1] = z_w[kk]
-    return out
-
-
-def _sigma_rutgers_mat(depths, hsm1, kb, sc_w, cs_w, tcline):
-    depths = np.asarray(depths, dtype=float)
-    kb = int(kb)
-    kbm1 = kb - 1
-    hc = float(tcline)
-    h = np.minimum(depths, float(hsm1))
-    npnt = int(depths.size)
-    z_w = np.zeros((npnt, kb + 1), dtype=float)  # [node, 0..kb]
-    z_w[:, 0] = -1.0
-    for k in range(1, kbm1 + 1):
-        cff_w = hc * sc_w[k]
-        cff1_w = cs_w[k]
-        hinv = 1.0 / (hc + h)
-        z_w[:, k] = (cff_w + cff1_w * h) * hinv
-    out = np.zeros((kb, npnt), dtype=float)  # [k, node]
-    for k in range(1, kb + 1):
-        kk = kb - k + 1
-        out[k - 1, :] = z_w[:, kk]
-    return out
-
-
 def build_master_grid(vqs_cfg=None):
     vqs_cfg = vqs_cfg or DEFAULT_VQS_CFG
     hsm, nv_vqs = _parse_master_levels(vqs_cfg.get("master_levels", []))
@@ -241,10 +116,6 @@ def build_master_grid(vqs_cfg=None):
     n_gen_cfg = vqs_cfg.get("n_generated_masters", None)
     n_generated_masters = m_vqs if n_gen_cfg is None else int(n_gen_cfg)
     require_non_decreasing = bool(vqs_cfg.get("require_non_decreasing_layers", False))
-    vstretching = int(vqs_cfg.get("VSTRETCHING", 1))
-    rtheta_s = float(vqs_cfg.get("RTHETA_S", 5.0))
-    rtheta_b = float(vqs_cfg.get("RTHETA_B", 3.0))
-    tcline = float(vqs_cfg.get("TCLINE", 5.0))
 
     if m_vqs < 2:
         raise ValueError(f"Check vgrid.in: m_vqs={m_vqs}")
@@ -256,14 +127,10 @@ def build_master_grid(vqs_cfg=None):
         raise ValueError("Check master_levels: all nlev must be >= 2")
     if require_non_decreasing and np.any(nv_vqs[1:] < nv_vqs[:-1]):
         raise ValueError("Check master_levels: nlev must be non-decreasing with depth")
-    if vstretching not in {1, 2, 3, 4}:
-        raise ValueError(f"VSTRETCHING must be 1,2,3,4; got {vstretching}")
     if n_generated_masters < 1 or n_generated_masters > m_vqs:
         raise ValueError(
             f"n_generated_masters must be within [1, m_vqs={m_vqs}], got {n_generated_masters}"
         )
-    if vstretching in {2, 3, 4} and tcline <= 0.0:
-        raise ValueError(f"TCLINE must be >0 for VSTRETCHING={vstretching}; got {tcline}")
 
     a_vqs0 = 0.0
     theta_b = 0.0
@@ -273,53 +140,41 @@ def build_master_grid(vqs_cfg=None):
     print(f"nvrt in master vgrid={nvrt_m}")
     z_mas = np.full((nvrt_m, m_vqs), -1.0e5, dtype=float)
 
-    if vstretching == 1:
-        # Build first n_generated_masters master grids from current method.
-        for m in range(n_generated_masters):
-            m1 = m + 1
-            if m1 <= 7:
-                theta_f = 0.0001
-            elif m1 <= 17:
-                theta_f = min(1.0, max(0.0001, (m1 - 4) / 10.0)) * 3.0
-            else:
-                theta_f = 4.4
-            if m1 == 14:
-                theta_f -= 0.1
-            if m1 == 15:
-                theta_f += 0.1
-            if m1 == 16:
-                theta_f += 0.55
-            if m1 == 17:
-                theta_f += 0.97
+    # Build first n_generated_masters master grids from formula.
+    for m in range(n_generated_masters):
+        m1 = m + 1
+        if m1 <= 7:
+            theta_f = 0.0001
+        elif m1 <= 17:
+            theta_f = min(1.0, max(0.0001, (m1 - 4) / 10.0)) * 3.0
+        else:
+            theta_f = 4.4
+        if m1 == 14:
+            theta_f -= 0.1
+        if m1 == 15:
+            theta_f += 0.1
+        if m1 == 16:
+            theta_f += 0.55
+        if m1 == 17:
+            theta_f += 0.97
 
-            nvi = int(nv_vqs[m])
-            k = np.arange(nvi, dtype=float)
-            sigma = k / (1.0 - nvi)
-            cs = (1 - theta_b) * np.sinh(theta_f * sigma) / np.sinh(theta_f) + theta_b * (
-                np.tanh(theta_f * (sigma + 0.5)) - np.tanh(theta_f * 0.5)
-            ) / (2.0 * np.tanh(theta_f * 0.5))
-            z_mas[:nvi, m] = etal * (1.0 + sigma) + hsm[0] * sigma + (hsm[m] - hsm[0]) * cs
+        nvi = int(nv_vqs[m])
+        k = np.arange(nvi, dtype=float)
+        sigma = k / (1.0 - nvi)
+        cs = (1 - theta_b) * np.sinh(theta_f * sigma) / np.sinh(theta_f) + theta_b * (
+            np.tanh(theta_f * (sigma + 0.5)) - np.tanh(theta_f * 0.5)
+        ) / (2.0 * np.tanh(theta_f * 0.5))
+        z_mas[:nvi, m] = etal * (1.0 + sigma) + hsm[0] * sigma + (hsm[m] - hsm[0]) * cs
 
-        # Force downward steps for first few master grids (legacy behavior).
-        for m in range(1, min(6, m_vqs)):
-            n_prev = int(nv_vqs[m - 1])
-            n_cur = int(nv_vqs[m])
-            z_mas[:n_prev, m] = np.minimum(z_mas[:n_prev, m], z_mas[:n_prev, m - 1])
-            if n_cur > n_prev:
-                tmp = (z_mas[n_cur - 1, m] - z_mas[n_prev - 1, m]) / (n_cur - n_prev)
-                for k in range(n_prev, n_cur):
-                    z_mas[k, m] = z_mas[k - 1, m] + tmp
-    else:
-        if n_generated_masters != m_vqs:
-            print(
-                f"[INFO] VSTRETCHING={vstretching}: ignoring n_generated_masters={n_generated_masters}; using all {m_vqs} masters.",
-                flush=True,
-            )
-        for m in range(m_vqs):
-            nvi = int(nv_vqs[m])
-            sc_w, cs_w = _sigma_rutgers_sc_cs(nvi, vstretching, rtheta_s, rtheta_b)
-            sigma_vec = _sigma_rutgers_vec(hsm[m], nvi, sc_w, cs_w, tcline)
-            z_mas[:nvi, m] = sigma_vec * hsm[m]
+    # Force downward steps for first few master grids (legacy behavior).
+    for m in range(1, min(6, m_vqs)):
+        n_prev = int(nv_vqs[m - 1])
+        n_cur = int(nv_vqs[m])
+        z_mas[:n_prev, m] = np.minimum(z_mas[:n_prev, m], z_mas[:n_prev, m - 1])
+        if n_cur > n_prev:
+            tmp = (z_mas[n_cur - 1, m] - z_mas[n_prev - 1, m]) / (n_cur - n_prev)
+            for k in range(n_prev, n_cur):
+                z_mas[k, m] = z_mas[k - 1, m] + tmp
 
     return {
         "m_vqs": m_vqs,
@@ -330,10 +185,6 @@ def build_master_grid(vqs_cfg=None):
         "a_vqs0": a_vqs0,
         "theta_b": theta_b,
         "etal": etal,
-        "vstretching": vstretching,
-        "rtheta_s": rtheta_s,
-        "rtheta_b": rtheta_b,
-        "tcline": tcline,
         "nvrt_m": nvrt_m,
         "z_mas": z_mas,
     }
@@ -345,10 +196,6 @@ def compute_vgrid(gd, params):
     dz_bot_min = params["dz_bot_min"]
     a_vqs0 = params["a_vqs0"]
     etal = params["etal"]
-    vstretching = int(params.get("vstretching", 1))
-    rtheta_s = float(params.get("rtheta_s", 5.0))
-    rtheta_b = float(params.get("rtheta_b", 3.0))
-    tcline = float(params.get("tcline", 5.0))
     nvrt_m = params["nvrt_m"]
     z_mas = params["z_mas"]
 
@@ -363,25 +210,15 @@ def compute_vgrid(gd, params):
     znd = np.full((nvrt_m, npnt), -1.0e6, dtype=float)
     kbp = np.zeros(npnt, dtype=int)
     m0 = np.zeros(npnt, dtype=int)
-    s_rutgers = None
-    if vstretching in {2, 3, 4}:
-        nvs = int(nv_vqs[0])
-        sc_w, cs_w = _sigma_rutgers_sc_cs(nvs, vstretching, rtheta_s, rtheta_b)
-        s_rutgers = _sigma_rutgers_mat(dp, hsm[0], nvs, sc_w, cs_w, tcline)
 
     for i in range(npnt):
         if dp[i] <= hsm[0]:
             kbp[i] = int(nv_vqs[0])
             nvi = int(nv_vqs[0])
-            if vstretching == 1:
-                for k in range(nvi):
-                    sigma = k / (1.0 - nvi)
-                    sigma_vqs[k, i] = a_vqs0 * sigma * sigma + (1.0 + a_vqs0) * sigma
-                    znd[k, i] = sigma_vqs[k, i] * (eta2[i] + dp[i]) + eta2[i]
-            else:
-                for k in range(nvi):
-                    sigma_vqs[k, i] = s_rutgers[k, i]
-                    znd[k, i] = sigma_vqs[k, i] * (eta2[i] + dp[i]) + eta2[i]
+            for k in range(nvi):
+                sigma = k / (1.0 - nvi)
+                sigma_vqs[k, i] = a_vqs0 * sigma * sigma + (1.0 + a_vqs0) * sigma
+                znd[k, i] = sigma_vqs[k, i] * (eta2[i] + dp[i]) + eta2[i]
             continue
 
         zrat = None
@@ -821,8 +658,8 @@ def _build_transect_profile(bp_path, gd, kbp, dp, znd):
 
     zplot = np.full((nsta, nvrt), np.nan, dtype=float)
     for i, nd in enumerate(imap):
-        # Legacy Fortran/MATLAB style: include full bottom-extended levels.
-        zplot[i, :] = znd[:nvrt, nd]
+        nl = int(nlev[i])
+        zplot[i, :nl] = znd[:nl, nd]
 
     seg_flag = None
     if hasattr(bp, "dp"):
@@ -886,8 +723,6 @@ def _build_transect_profile_from_vgrid(bp_path, gd, vgrid):
         ks = int(kshift[nd])  # 1-based first valid level index in file order
         valid = np.arange(1, nvrt + 1) >= ks
         valid &= np.isfinite(sig) & (sig >= -1.5) & (sig <= 0.5)
-        # For levels above kbp in vgrid.in, mimic legacy bottom extension.
-        zplot[i, :] = -depth[i]
         zvals = sig * depth[i]  # eta=0 reference
         zplot[i, valid] = zvals[valid]
 

@@ -65,18 +65,18 @@ PLOT_SIZE = 2.0
 
 # Tide-station offsets (approx. TP - NLLW, meters) and positions in decimal degrees.
 STATION_OFFSETS = [
-    {"pref": "Aomori", "name": "Hachinohe", "offset_m": 0.75, "lat": 40.533333, "lon": 141.533333},
-    {"pref": "Aomori", "name": "Ominato", "offset_m": 0.62, "lat": 41.250000, "lon": 141.150000},
-    {"pref": "Iwate", "name": "Kuji", "offset_m": 0.81, "lat": 40.200000, "lon": 141.783333},
-    {"pref": "Iwate", "name": "Miyako", "offset_m": 0.84, "lat": 39.633333, "lon": 141.966667},
-    {"pref": "Iwate", "name": "Kamaishi", "offset_m": 0.86, "lat": 39.266667, "lon": 141.883333},
-    {"pref": "Iwate", "name": "Ofunato", "offset_m": 0.88, "lat": 39.016667, "lon": 141.750000},
-    {"pref": "Miyagi", "name": "Kesennuma", "offset_m": 0.88, "lat": 38.900000, "lon": 141.583333},
-    {"pref": "Miyagi", "name": "Ishinomaki", "offset_m": 0.82, "lat": 38.416667, "lon": 141.300000},
+    {"pref": "Fukushima", "name": "Onahama", "offset_m": 0.87, "lat": 36.933333, "lon": 140.900000},
+    {"pref": "Fukushima", "name": "Soma", "offset_m": 0.85, "lat": 37.833333, "lon": 140.950000},
     {"pref": "Miyagi", "name": "Ayukawa", "offset_m": 0.80, "lat": 38.300000, "lon": 141.500000},
     {"pref": "Miyagi", "name": "Sendai/Shiogama", "offset_m": 0.94, "lat": 38.316667, "lon": 141.033333},
-    {"pref": "Fukushima", "name": "Soma", "offset_m": 0.85, "lat": 37.833333, "lon": 140.950000},
-    {"pref": "Fukushima", "name": "Onahama", "offset_m": 0.87, "lat": 36.933333, "lon": 140.900000},
+    {"pref": "Miyagi", "name": "Ishinomaki", "offset_m": 0.82, "lat": 38.416667, "lon": 141.300000},
+    {"pref": "Miyagi", "name": "Kesennuma", "offset_m": 0.88, "lat": 38.900000, "lon": 141.583333},
+    {"pref": "Iwate", "name": "Ofunato", "offset_m": 0.88, "lat": 39.016667, "lon": 141.750000},
+    {"pref": "Iwate", "name": "Kamaishi", "offset_m": 0.86, "lat": 39.266667, "lon": 141.883333},
+    {"pref": "Iwate", "name": "Miyako", "offset_m": 0.84, "lat": 39.633333, "lon": 141.966667},
+    {"pref": "Iwate", "name": "Kuji", "offset_m": 0.81, "lat": 40.200000, "lon": 141.783333},
+    {"pref": "Aomori", "name": "Hachinohe", "offset_m": 0.75, "lat": 40.533333, "lon": 141.533333},
+    {"pref": "Aomori", "name": "Ominato", "offset_m": 0.62, "lat": 41.250000, "lon": 141.150000},
 ]
 
 

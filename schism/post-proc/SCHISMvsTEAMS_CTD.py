@@ -80,7 +80,7 @@ CONFIG = {
     },
     "date_range": {
         "start": (2012, 2, 1),
-        "end": (2012, 12, 31),
+        "end": (2014, 12, 31),
     },
     "compare": {
         "location_only": None,  # True: ignore observation time and use a fixed SCHISM time
@@ -91,8 +91,8 @@ CONFIG = {
     },
     "source": {
         "mode": "npz",  # raw | npz
-        "npz_path": "./npz/RUN01b_OB_D1.npz",  # required when mode=npz
-        "npz_paths": ["./npz/RUN01g_OB_D1.npz","./npz/RUN01h_OB_D1.npz"],
+        "npz_path": "./npz/RUN01g_OB_D1.npz",  # required when mode=npz
+        "npz_paths": ["./npz/RUN01g_OB_D1.npz","./npz/RUN04a_OB_D1.npz","./npz/RUN05a_OB_D1.npz"], #["./npz/RUN01g_OB_D1.npz","./npz/RUN01i_OB_D1.npz"],
         "plot_depth_mode": "native",  # native | interp
     },
     "region": {
@@ -116,17 +116,17 @@ CONFIG = {
         {
         "enabled": True,
         "label": "RUN01g",
-        "color": "g",
-        },
-        {
-        "enabled": True,
-        "label": "RUN01h",
-        "color": "c",
-        },
-        {
-        "enabled": True,
-        "label": "RUN01f",
         "color": "k",
+        },
+        {
+        "enabled": True,
+        "label": "RUN04a",
+        "color": "b",
+        },
+        {
+        "enabled": True,
+        "label": "RUN05a",
+        "color": "g",
         },
     ],
 
@@ -148,7 +148,7 @@ CONFIG = {
         "search_radius": 1,  # grid cells to search for nearest wet point if target is all-NaN
     },
     "output": {
-        "dir": "./ESIMAGES/CompTEAMS_2012_01gh",
+        "dir": "./ESIMAGES/CompTEAMS_2012_01g04a05a",
         "task_name": "ctd",
         "experiment_id": None,
         "write_task_metrics": True,
@@ -1498,6 +1498,11 @@ def _load_and_merge_source_npz(npz_paths):
             for key in ds.files:
                 if key in run_axis_keys:
                     union_run_keys.add(key)
+        native_varlev_keys = {
+            "model_depth_native",
+            "model_temp_native",
+            "model_sal_native",
+        }
         for key in sorted(union_run_keys):
             arrs = []
             for j, ds in enumerate(datasets):
@@ -1507,13 +1512,38 @@ def _load_and_merge_source_npz(npz_paths):
                 if arr.ndim == 0:
                     arr = arr.reshape(1)
                 arrs.append(arr)
-            ref_shape = arrs[0].shape[1:]
-            for j, arr in enumerate(arrs[1:], start=1):
-                if arr.shape[1:] != ref_shape:
-                    raise ValueError(
-                        f"run-axis shape mismatch for '{key}': file[0]={arrs[0].shape}, file[{j}]={arr.shape}"
-                    )
-            merged[key] = np.concatenate(arrs, axis=0)
+            if key in native_varlev_keys:
+                ref_ndim = arrs[0].ndim
+                ref_prefix = arrs[0].shape[1:-1]
+                max_nlev = arrs[0].shape[-1]
+                for j, arr in enumerate(arrs[1:], start=1):
+                    if arr.ndim != ref_ndim or arr.shape[1:-1] != ref_prefix:
+                        raise ValueError(
+                            f"run-axis shape mismatch for '{key}': file[0]={arrs[0].shape}, file[{j}]={arr.shape}"
+                        )
+                    max_nlev = max(max_nlev, int(arr.shape[-1]))
+
+                padded = []
+                for arr in arrs:
+                    arr_use = arr
+                    if arr_use.dtype.kind not in {"f", "c"}:
+                        arr_use = arr_use.astype(float)
+                    pad_nlev = max_nlev - int(arr_use.shape[-1])
+                    if pad_nlev > 0:
+                        pad_shape = list(arr_use.shape)
+                        pad_shape[-1] = pad_nlev
+                        pad_block = np.full(pad_shape, np.nan, dtype=arr_use.dtype)
+                        arr_use = np.concatenate([arr_use, pad_block], axis=-1)
+                    padded.append(arr_use)
+                merged[key] = np.concatenate(padded, axis=0)
+            else:
+                ref_shape = arrs[0].shape[1:]
+                for j, arr in enumerate(arrs[1:], start=1):
+                    if arr.shape[1:] != ref_shape:
+                        raise ValueError(
+                            f"run-axis shape mismatch for '{key}': file[0]={arrs[0].shape}, file[{j}]={arr.shape}"
+                        )
+                merged[key] = np.concatenate(arrs, axis=0)
 
         # Keep any other metadata fields from the first file.
         for key in ds0.files:

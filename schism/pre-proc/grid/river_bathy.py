@@ -42,8 +42,8 @@ except Exception:
 # -----------------------------------------------------------------------------
 # inputs (edit here)
 # -----------------------------------------------------------------------------
-hgrid_in = "/Users/kpark/Documents/Projects/Active/AIMEC_TohokuCoast/01_Data/Grid/04.gr3"
-hgrid_out = "/Users/kpark/Documents/Projects/Active/AIMEC_TohokuCoast/01_Data/Grid/04_river_bathy.gr3"
+hgrid_in = "/Users/kpark/Documents/Projects/Active/AIMEC_TohokuCoast/01_Data/Grid/03_1.gr3"
+hgrid_out = "/Users/kpark/Documents/Projects/Active/AIMEC_TohokuCoast/01_Data/Grid/03.gr3"
 
 region_dir = "/Users/kpark/Documents/Projects/Active/AIMEC_TohokuCoast/01_Data/Grid"
 region_glob = "*.reg"  # use all region files
@@ -56,7 +56,7 @@ bathy_mode = "main_default_deep_limit"
 
 # River smoothing (approximate length scale along grid graph, meters)
 smooth_length_m = 500.0
-smooth_relax = 0.6       # 0..1, larger => stronger smoothing per iteration
+smooth_relax = 0.4       # 0..1, larger => stronger smoothing per iteration
 max_smooth_iter = 20     # safety cap
 anchor_station_nodes = True
 
@@ -67,7 +67,7 @@ blend_mode = "cosine"    # 'linear' or 'cosine'
 # Optional: force selected river open boundaries to be artificially wet
 # bnd2.bp format is the SCHISM boundary-node list (open boundaries first).
 use_open_bnd_wetting = True
-open_bnd_bpfile = "/Users/kpark/Documents/Projects/Active/AIMEC_TohokuCoast/01_Data/Grid/bnd_04.bp"
+open_bnd_bpfile = "/Users/kpark/Documents/Projects/Active/AIMEC_TohokuCoast/01_Data/Grid/bnd_03_1.bp"
 # Keys are 1-based open boundary IDs in bnd2.bp; values are minimum dp (m) at boundary.
 open_bnd_wet_depths = {
     2: 5.0,
@@ -475,12 +475,19 @@ def _apply_open_boundary_wetting(
     dist = _haversine_dist(gd.x[idx], gd.y[idx], gd.x[nearest_seed_nodes], gd.y[nearest_seed_nodes])
 
     # Weight to current field increases inland; at boundary use the artificial wet depth.
+    # Only enforce inland floor inside transition distance so far-away nodes are untouched.
     wcur = _blend_weights(dist, transition_m, mode)
     depth_floor = (1.0 - wcur) * nearest_seed_depth
 
     dp_out = dp_in.copy()
     before = dp_out[idx].copy()
-    dp_out[idx] = np.maximum(dp_out[idx], depth_floor)
+    if transition_m is None or transition_m <= 0:
+        apply_mask = np.zeros(idx.size, dtype=bool)
+    else:
+        apply_mask = dist < float(transition_m)
+    if np.any(apply_mask):
+        ii = idx[apply_mask]
+        dp_out[ii] = np.maximum(dp_out[ii], depth_floor[apply_mask])
     changed = np.zeros(gd.np, dtype=bool)
     changed[idx] = np.abs(dp_out[idx] - before) > 0
 
