@@ -93,9 +93,12 @@ Expected run outputs per campaign:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
+import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -109,6 +112,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+PATH_BASE_DIR = Path.cwd()
+CONTROLLER_CONFIG_PATH: Optional[Path] = None
 
 
 # ---------------------------------------------------------------------------
@@ -132,9 +137,9 @@ CONFIG: Dict[str, Any] = {
     "EXECUTE_SCORECARD": True,
 
     # Script paths
-    "CTD_SCRIPT": "SCHISMvsTEAMS_CTD.py",
-    "TH_SCRIPT": "SCHISMvsTEAMS_TH.py",
-    "WL_SCRIPT": "SCHISMvsJODC_WL.py",
+    "CTD_SCRIPT": str((SCRIPT_DIR / "SCHISMvsTEAMS_CTD.py").resolve()),
+    "TH_SCRIPT": str((SCRIPT_DIR / "SCHISMvsTEAMS_TH.py").resolve()),
+    "WL_SCRIPT": str((SCRIPT_DIR / "SCHISMvsJODC_WL.py").resolve()),
 
     # CTD task config
     "CTD_RUN_DIR_TEMPLATE": "/scratch2/08924/kmpark/{experiment_id}",  # Example: "/scratch/runs/{experiment_id}"
@@ -168,17 +173,149 @@ CONFIG: Dict[str, Any] = {
     # Scorecard config
     "WEIGHTING_MODES": ["station_equal", "sample_count"],
     "J_WEIGHTS": {"wl": 1.0 / 3.0, "salt": 1.0 / 3.0, "temp": 1.0 / 3.0},
+    # MPI launcher control for child task scripts (CTD/TH/WL).
+    "MPI": {
+        "enabled": False,
+        "launcher": ["mpirun", "-np", "{np}"],  # Example: ["srun", "-n", "{np}"]
+        "np": 14,
+        "extra_args": [],
+        "set_thread_env": True,
+        "task": {
+            "ctd": {"enabled": None, "np": None, "extra_args": []},
+            "th": {"enabled": None, "np": None, "extra_args": []},
+            "wl": {"enabled": None, "np": None, "extra_args": []},
+        },
+    },
 }
 
 
 REQUIRED_COLUMNS = ["experiment_id", "is_baseline", "grid", "bathy", "forcing", "river"]
 
 
+def _set_path_base(config_path_like: Optional[str]) -> Optional[Path]:
+    global PATH_BASE_DIR, CONTROLLER_CONFIG_PATH
+    if config_path_like:
+        cfg_path = Path(str(config_path_like)).expanduser()
+        if not cfg_path.is_absolute():
+            cfg_path = (Path.cwd() / cfg_path).resolve()
+        else:
+            cfg_path = cfg_path.resolve()
+        PATH_BASE_DIR = cfg_path.parent
+        CONTROLLER_CONFIG_PATH = cfg_path
+        return cfg_path
+    PATH_BASE_DIR = Path.cwd()
+    CONTROLLER_CONFIG_PATH = None
+    return None
+
+
 def _resolve(path_like: str) -> Path:
     p = Path(path_like).expanduser()
     if p.is_absolute():
         return p
-    return (SCRIPT_DIR / p).resolve()
+    return (PATH_BASE_DIR / p).resolve()
+
+
+def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_update(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def _coerce_str_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def _coerce_bool_or_none(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    return bool(value)
+
+
+def _task_mpi_settings(cfg: Dict[str, Any], task: str) -> Dict[str, Any]:
+    mpi_cfg = cfg.get("MPI", {}) if isinstance(cfg.get("MPI"), dict) else {}
+    task_cfg_all = mpi_cfg.get("task", {}) if isinstance(mpi_cfg.get("task"), dict) else {}
+    task_cfg = task_cfg_all.get(task, {}) if isinstance(task_cfg_all.get(task), dict) else {}
+
+    enabled_global = bool(mpi_cfg.get("enabled", False))
+    enabled_override = _coerce_bool_or_none(task_cfg.get("enabled"))
+    enabled = enabled_global if enabled_override is None else bool(enabled_override)
+
+    np_raw = task_cfg.get("np")
+    if np_raw is None:
+        np_raw = mpi_cfg.get("np", 1)
+    try:
+        np_i = int(np_raw)
+    except Exception as exc:
+        raise ValueError(f"Invalid MPI np for task '{task}': {np_raw}") from exc
+    if np_i < 1:
+        raise ValueError(f"MPI np must be >= 1 for task '{task}', got {np_i}")
+
+    launcher_value = mpi_cfg.get("launcher", ["mpirun", "-np", "{np}"])
+    if launcher_value is None:
+        launcher_value = ["mpirun", "-np", "{np}"]
+    launcher_tokens = _coerce_str_list(launcher_value)
+    extra_global = _coerce_str_list(mpi_cfg.get("extra_args", []))
+    extra_task = _coerce_str_list(task_cfg.get("extra_args", []))
+    set_thread_env = bool(mpi_cfg.get("set_thread_env", True))
+
+    use_mpi = bool(enabled) and (np_i > 1)
+    launcher_cmd = [tok.format(np=np_i, task=task) for tok in launcher_tokens] if use_mpi else []
+
+    return {
+        "task": task,
+        "enabled": bool(enabled),
+        "use_mpi": bool(use_mpi),
+        "np": int(np_i),
+        "launcher_cmd": launcher_cmd,
+        "extra_args": extra_global + extra_task,
+        "set_thread_env": bool(set_thread_env),
+    }
+
+
+def _validate_mpi_launcher(mpi_settings: Dict[str, Any]) -> Optional[str]:
+    if not bool(mpi_settings.get("use_mpi", False)):
+        return None
+    launcher_cmd = list(mpi_settings.get("launcher_cmd", []))
+    if not launcher_cmd:
+        return "MPI is enabled but launcher command is empty."
+    exe = launcher_cmd[0]
+    exe_path = Path(exe).expanduser()
+    if exe_path.is_absolute():
+        if not exe_path.exists():
+            return f"MPI launcher not found: {exe_path}"
+        return None
+    if shutil.which(exe) is None:
+        return f"MPI launcher not found in PATH: {exe}"
+    return None
+
+
+def _build_task_command(
+    cfg: Dict[str, Any],
+    script_path: Path,
+    config_path: Path,
+    mpi_settings: Dict[str, Any],
+) -> List[str]:
+    base_cmd = [str(cfg["PYTHON"]), str(script_path), "--config", str(config_path)]
+    if bool(mpi_settings.get("use_mpi", False)):
+        return list(mpi_settings.get("launcher_cmd", [])) + list(mpi_settings.get("extra_args", [])) + base_cmd
+    return base_cmd
+
+
+def _build_task_env(mpi_settings: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    if (not bool(mpi_settings.get("use_mpi", False))) or (not bool(mpi_settings.get("set_thread_env", True))):
+        return None
+    env = os.environ.copy()
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        env.setdefault(name, "1")
+    return env
 
 
 def _read_csv_rows(path: Path) -> List[Dict[str, str]]:
@@ -326,11 +463,17 @@ def _status_record(exp_id: str, task: str, status: str, message: str, cmd: List[
     }
 
 
-def _run_cmd(cmd: List[str], cwd: Path, stdout_log: Path, stderr_log: Path) -> Tuple[bool, str]:
+def _run_cmd(
+    cmd: List[str],
+    cwd: Path,
+    stdout_log: Path,
+    stderr_log: Path,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[bool, str]:
     stdout_log.parent.mkdir(parents=True, exist_ok=True)
     stderr_log.parent.mkdir(parents=True, exist_ok=True)
     with open(stdout_log, "w", encoding="utf-8") as fo, open(stderr_log, "w", encoding="utf-8") as fe:
-        proc = subprocess.run(cmd, cwd=str(cwd), stdout=fo, stderr=fe, check=False)
+        proc = subprocess.run(cmd, cwd=str(cwd), stdout=fo, stderr=fe, check=False, env=env)
     if proc.returncode == 0:
         return True, f"completed (stdout={stdout_log}, stderr={stderr_log})"
 
@@ -372,7 +515,8 @@ def _prepare_ctd_config(cfg: Dict[str, Any], exp_id: str, exp_dir: Path) -> Dict
         },
     }
     if cfg.get("CTD_RUN_DIR_TEMPLATE"):
-        out["schism"][0]["run_dir"] = str(cfg["CTD_RUN_DIR_TEMPLATE"]).format(experiment_id=exp_id)
+        run_dir = str(cfg["CTD_RUN_DIR_TEMPLATE"]).format(experiment_id=exp_id)
+        out["schism"][0]["run_dir"] = str(_resolve(run_dir))
     if cfg.get("CTD_TEAMS_PATH"):
         out["teams"] = {"npz_path": str(_resolve(cfg["CTD_TEAMS_PATH"]))}
     if cfg.get("CTD_START") or cfg.get("CTD_END"):
@@ -401,7 +545,8 @@ def _prepare_th_config(cfg: Dict[str, Any], exp_id: str, exp_dir: Path) -> Dict[
         "save_plots": True,
     }
     if cfg.get("TH_SCHISM_TEMPLATE"):
-        out["schism_npzs"] = [str(cfg["TH_SCHISM_TEMPLATE"]).format(experiment_id=exp_id)]
+        run_npz = str(cfg["TH_SCHISM_TEMPLATE"]).format(experiment_id=exp_id)
+        out["schism_npzs"] = [str(_resolve(run_npz))]
     if cfg.get("TH_TEAMS_PATH"):
         out["teams_npz"] = str(_resolve(cfg["TH_TEAMS_PATH"]))
     if cfg.get("TH_GRID"):
@@ -430,7 +575,8 @@ def _prepare_wl_config(cfg: Dict[str, Any], exp_id: str, exp_dir: Path) -> Dict[
         "progress_every": 20,
     }
     if cfg.get("WL_RUN_TEMPLATE"):
-        out["runs"] = [str(cfg["WL_RUN_TEMPLATE"]).format(experiment_id=exp_id)]
+        run_npz = str(cfg["WL_RUN_TEMPLATE"]).format(experiment_id=exp_id)
+        out["runs"] = [str(_resolve(run_npz))]
     return out
 
 
@@ -445,7 +591,8 @@ def _prepare_ctd_config_joint(cfg: Dict[str, Any], experiments: List[Dict[str, s
             "run_dir": "",
         }
         if cfg.get("CTD_RUN_DIR_TEMPLATE"):
-            item["run_dir"] = str(cfg["CTD_RUN_DIR_TEMPLATE"]).format(experiment_id=exp_id)
+            run_dir = str(cfg["CTD_RUN_DIR_TEMPLATE"]).format(experiment_id=exp_id)
+            item["run_dir"] = str(_resolve(run_dir))
         schism_items.append(item)
 
     out: Dict[str, Any] = {
@@ -489,7 +636,7 @@ def _prepare_th_config_joint(cfg: Dict[str, Any], experiments: List[Dict[str, st
         "save_plots": True,
     }
     if cfg.get("TH_SCHISM_TEMPLATE"):
-        out["schism_npzs"] = [str(cfg["TH_SCHISM_TEMPLATE"]).format(experiment_id=eid) for eid in labels]
+        out["schism_npzs"] = [str(_resolve(str(cfg["TH_SCHISM_TEMPLATE"]).format(experiment_id=eid))) for eid in labels]
     if cfg.get("TH_TEAMS_PATH"):
         out["teams_npz"] = str(_resolve(cfg["TH_TEAMS_PATH"]))
     if cfg.get("TH_GRID"):
@@ -519,18 +666,22 @@ def _prepare_wl_config_joint(cfg: Dict[str, Any], experiments: List[Dict[str, st
         "progress_every": 20,
     }
     if cfg.get("WL_RUN_TEMPLATE"):
-        out["runs"] = [str(cfg["WL_RUN_TEMPLATE"]).format(experiment_id=eid) for eid in tags]
+        out["runs"] = [str(_resolve(str(cfg["WL_RUN_TEMPLATE"]).format(experiment_id=eid))) for eid in tags]
     return out
 
 
 def _validate_run_paths(run_paths: List[str]) -> Optional[str]:
     missing: List[str] = []
     for rp in run_paths:
-        p = Path(str(rp)).expanduser()
+        raw = str(rp).strip()
+        if raw == "":
+            missing.append("<empty path>")
+            continue
+        p = _resolve(raw)
         if p.exists():
             continue
         # Some scripts accept staout prefix/path that may expand internally.
-        if str(p).endswith("staout"):
+        if str(raw).endswith("staout"):
             continue
         missing.append(str(p))
     if not missing:
@@ -940,6 +1091,14 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
 
     p.add_argument(
+        "--config",
+        help=(
+            "Optional JSON file to override in-file CONFIG.\n"
+            "Relative paths in this config are resolved from the config file directory."
+        ),
+    )
+
+    p.add_argument(
         "--catalog",
         help=(
             "Experiment catalog CSV. Must include columns:\n"
@@ -974,6 +1133,62 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=["joint", "per_experiment"],
         help="How to run tasks: one joint multi-model run or legacy per-experiment runs.",
     )
+    p.add_argument(
+        "--mpi",
+        dest="mpi_enabled",
+        action="store_true",
+        help="Enable MPI launcher for child task scripts.",
+    )
+    p.add_argument(
+        "--no-mpi",
+        dest="mpi_enabled",
+        action="store_false",
+        help="Disable MPI launcher for child task scripts.",
+    )
+    p.set_defaults(mpi_enabled=None)
+    p.add_argument(
+        "--mpi-np",
+        type=int,
+        help="Default MPI rank count for task scripts (e.g., 14).",
+    )
+    p.add_argument(
+        "--mpi-launcher",
+        nargs="+",
+        help="MPI launcher template tokens (use {np}), e.g. --mpi-launcher mpirun -np {np}",
+    )
+    p.add_argument(
+        "--mpi-extra-args",
+        nargs="+",
+        help="Extra launcher args inserted before python command.",
+    )
+    p.add_argument(
+        "--mpi-set-thread-env",
+        dest="mpi_set_thread_env",
+        action="store_true",
+        help="Set OMP/MKL/OPENBLAS/NUMEXPR thread env vars to 1 for child runs.",
+    )
+    p.add_argument(
+        "--no-mpi-set-thread-env",
+        dest="mpi_set_thread_env",
+        action="store_false",
+        help="Do not enforce thread env vars for child runs.",
+    )
+    p.set_defaults(mpi_set_thread_env=None)
+    p.add_argument("--ctd-mpi", dest="ctd_mpi_enabled", action="store_true", help="Enable MPI for CTD task.")
+    p.add_argument("--ctd-no-mpi", dest="ctd_mpi_enabled", action="store_false", help="Disable MPI for CTD task.")
+    p.set_defaults(ctd_mpi_enabled=None)
+    p.add_argument("--th-mpi", dest="th_mpi_enabled", action="store_true", help="Enable MPI for TH task.")
+    p.add_argument("--th-no-mpi", dest="th_mpi_enabled", action="store_false", help="Disable MPI for TH task.")
+    p.set_defaults(th_mpi_enabled=None)
+    p.add_argument("--wl-mpi", dest="wl_mpi_enabled", action="store_true", help="Enable MPI for WL task.")
+    p.add_argument("--wl-no-mpi", dest="wl_mpi_enabled", action="store_false", help="Disable MPI for WL task.")
+    p.set_defaults(wl_mpi_enabled=None)
+    p.add_argument("--ctd-mpi-np", type=int, help="MPI rank count override for CTD task.")
+    p.add_argument("--th-mpi-np", type=int, help="MPI rank count override for TH task.")
+    p.add_argument("--wl-mpi-np", type=int, help="MPI rank count override for WL task.")
+    p.add_argument("--ctd-mpi-extra-args", nargs="+", help="Extra MPI launcher args for CTD task.")
+    p.add_argument("--th-mpi-extra-args", nargs="+", help="Extra MPI launcher args for TH task.")
+    p.add_argument("--wl-mpi-extra-args", nargs="+", help="Extra MPI launcher args for WL task.")
 
     p.add_argument(
         "--continue-on-error",
@@ -1180,7 +1395,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def _build_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = dict(CONFIG)
+    cfg = copy.deepcopy(CONFIG)
+    config_path = _set_path_base(getattr(args, "config", None))
+    if config_path:
+        with open(config_path, "r", encoding="utf-8") as f:
+            file_cfg = json.load(f)
+        cfg = _deep_update(cfg, file_cfg)
+
     mapping = {
         "catalog": "CATALOG",
         "out_root": "OUT_ROOT",
@@ -1222,6 +1443,44 @@ def _build_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         val = getattr(args, arg_name, None)
         if val is not None:
             cfg[key] = val
+
+    mpi_cfg = cfg.setdefault("MPI", {})
+    mpi_cfg.setdefault("task", {})
+    for tname in ("ctd", "th", "wl"):
+        mpi_cfg["task"].setdefault(tname, {})
+
+    if getattr(args, "mpi_enabled", None) is not None:
+        mpi_cfg["enabled"] = bool(args.mpi_enabled)
+    if getattr(args, "mpi_np", None) is not None:
+        mpi_cfg["np"] = int(args.mpi_np)
+    if getattr(args, "mpi_launcher", None) is not None:
+        mpi_cfg["launcher"] = [str(x) for x in args.mpi_launcher]
+    if getattr(args, "mpi_extra_args", None) is not None:
+        mpi_cfg["extra_args"] = [str(x) for x in args.mpi_extra_args]
+    if getattr(args, "mpi_set_thread_env", None) is not None:
+        mpi_cfg["set_thread_env"] = bool(args.mpi_set_thread_env)
+
+    if getattr(args, "ctd_mpi_enabled", None) is not None:
+        mpi_cfg["task"]["ctd"]["enabled"] = bool(args.ctd_mpi_enabled)
+    if getattr(args, "th_mpi_enabled", None) is not None:
+        mpi_cfg["task"]["th"]["enabled"] = bool(args.th_mpi_enabled)
+    if getattr(args, "wl_mpi_enabled", None) is not None:
+        mpi_cfg["task"]["wl"]["enabled"] = bool(args.wl_mpi_enabled)
+
+    if getattr(args, "ctd_mpi_np", None) is not None:
+        mpi_cfg["task"]["ctd"]["np"] = int(args.ctd_mpi_np)
+    if getattr(args, "th_mpi_np", None) is not None:
+        mpi_cfg["task"]["th"]["np"] = int(args.th_mpi_np)
+    if getattr(args, "wl_mpi_np", None) is not None:
+        mpi_cfg["task"]["wl"]["np"] = int(args.wl_mpi_np)
+
+    if getattr(args, "ctd_mpi_extra_args", None) is not None:
+        mpi_cfg["task"]["ctd"]["extra_args"] = [str(x) for x in args.ctd_mpi_extra_args]
+    if getattr(args, "th_mpi_extra_args", None) is not None:
+        mpi_cfg["task"]["th"]["extra_args"] = [str(x) for x in args.th_mpi_extra_args]
+    if getattr(args, "wl_mpi_extra_args", None) is not None:
+        mpi_cfg["task"]["wl"]["extra_args"] = [str(x) for x in args.wl_mpi_extra_args]
+
     return cfg
 
 
@@ -1254,6 +1513,17 @@ def main(argv: Optional[List[str]] = None) -> None:
     campaign_dir = _resolve(str(cfg["OUT_ROOT"])) / str(campaign_id)
     campaign_dir.mkdir(parents=True, exist_ok=True)
     _write_csv_rows(campaign_dir / "experiments_used.csv", experiments)
+    with open(campaign_dir / "model_evaluation_config_used.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "config": cfg,
+                "config_path": str(CONTROLLER_CONFIG_PATH) if CONTROLLER_CONFIG_PATH is not None else None,
+                "path_base_dir": str(PATH_BASE_DIR),
+                "script_dir": str(SCRIPT_DIR),
+            },
+            f,
+            indent=2,
+        )
 
     ctd_script = _resolve(str(cfg["CTD_SCRIPT"]))
     th_script = _resolve(str(cfg["TH_SCRIPT"]))
@@ -1298,6 +1568,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         with open(wl_cfg_path, "w", encoding="utf-8") as f:
             json.dump(wl_cfg, f, indent=2)
 
+        ctd_mpi = _task_mpi_settings(cfg, "ctd")
+        th_mpi = _task_mpi_settings(cfg, "th")
+        wl_mpi = _task_mpi_settings(cfg, "wl")
+
         plan_rows.append(
             {
                 "experiment_id": "__joint__",
@@ -1311,6 +1585,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "wl_config_path": str(wl_cfg_path),
                 "experiments": ",".join(exp_ids),
                 "compare_mode": compare_mode,
+                "ctd_mpi": int(ctd_mpi["use_mpi"]),
+                "ctd_mpi_np": int(ctd_mpi["np"]),
+                "th_mpi": int(th_mpi["use_mpi"]),
+                "th_mpi_np": int(th_mpi["np"]),
+                "wl_mpi": int(wl_mpi["use_mpi"]),
+                "wl_mpi_np": int(wl_mpi["np"]),
             }
         )
 
@@ -1321,7 +1601,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "required_ok": bool(cfg.get("CTD_RUN_DIR_TEMPLATE")),
                 "required_msg": "Missing CTD_RUN_DIR_TEMPLATE.",
                 "run_paths": [str(x.get("run_dir", "")) for x in ctd_cfg.get("schism", [])],
-                "cmd": [str(cfg["PYTHON"]), str(ctd_script), "--config", str(ctd_cfg_path)],
+                "mpi": ctd_mpi,
+                "cmd": _build_task_command(cfg, ctd_script, ctd_cfg_path, ctd_mpi),
                 "stdout": campaign_dir / "ctd" / "stdout.log",
                 "stderr": campaign_dir / "ctd" / "stderr.log",
             },
@@ -1331,7 +1612,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "required_ok": bool(cfg.get("TH_SCHISM_TEMPLATE")),
                 "required_msg": "Missing TH_SCHISM_TEMPLATE.",
                 "run_paths": list(th_cfg.get("schism_npzs") or []),
-                "cmd": [str(cfg["PYTHON"]), str(th_script), "--config", str(th_cfg_path)],
+                "mpi": th_mpi,
+                "cmd": _build_task_command(cfg, th_script, th_cfg_path, th_mpi),
                 "stdout": campaign_dir / "th" / "stdout.log",
                 "stderr": campaign_dir / "th" / "stderr.log",
             },
@@ -1341,7 +1623,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "required_ok": bool(cfg.get("WL_RUN_TEMPLATE")),
                 "required_msg": "Missing WL_RUN_TEMPLATE.",
                 "run_paths": list(wl_cfg.get("runs") or []),
-                "cmd": [str(cfg["PYTHON"]), str(wl_script), "--config", str(wl_cfg_path)],
+                "mpi": wl_mpi,
+                "cmd": _build_task_command(cfg, wl_script, wl_cfg_path, wl_mpi),
                 "stdout": campaign_dir / "wl" / "stdout.log",
                 "stderr": campaign_dir / "wl" / "stderr.log",
             },
@@ -1377,7 +1660,15 @@ def main(argv: Optional[List[str]] = None) -> None:
                     raise FileNotFoundError(f"[{ref_id}:{task}] {missing_msg}")
                 continue
 
-            ok, msg = _run_cmd(cmd, SCRIPT_DIR, spec["stdout"], spec["stderr"])
+            mpi_issue = _validate_mpi_launcher(spec.get("mpi", {}))
+            if mpi_issue is not None:
+                statuses.append(_status_record(ref_id, task, "failed", mpi_issue, cmd))
+                if not bool(cfg["CONTINUE_ON_ERROR"]):
+                    raise RuntimeError(f"[{ref_id}:{task}] {mpi_issue}")
+                continue
+
+            env = _build_task_env(spec.get("mpi", {}))
+            ok, msg = _run_cmd(cmd, SCRIPT_DIR, spec["stdout"], spec["stderr"], env=env)
             statuses.append(_status_record(ref_id, task, "ok" if ok else "failed", msg, cmd))
             if (not ok) and (not bool(cfg["CONTINUE_ON_ERROR"])):
                 raise RuntimeError(f"[{ref_id}:{task}] {msg}")
@@ -1400,6 +1691,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             with open(wl_cfg_path, "w", encoding="utf-8") as f:
                 json.dump(wl_cfg, f, indent=2)
 
+            ctd_mpi = _task_mpi_settings(cfg, "ctd")
+            th_mpi = _task_mpi_settings(cfg, "th")
+            wl_mpi = _task_mpi_settings(cfg, "wl")
+
             plan_rows.append(
                 {
                     "experiment_id": exp_id,
@@ -1412,6 +1707,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                     "th_config_path": str(th_cfg_path),
                     "wl_config_path": str(wl_cfg_path),
                     "compare_mode": compare_mode,
+                    "ctd_mpi": int(ctd_mpi["use_mpi"]),
+                    "ctd_mpi_np": int(ctd_mpi["np"]),
+                    "th_mpi": int(th_mpi["use_mpi"]),
+                    "th_mpi_np": int(th_mpi["np"]),
+                    "wl_mpi": int(wl_mpi["use_mpi"]),
+                    "wl_mpi_np": int(wl_mpi["np"]),
                 }
             )
 
@@ -1422,7 +1723,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                     "required_ok": bool(cfg.get("CTD_RUN_DIR_TEMPLATE")),
                     "required_msg": "Missing CTD_RUN_DIR_TEMPLATE.",
                     "run_paths": [((ctd_cfg.get("schism") or [{}])[0]).get("run_dir", "")],
-                    "cmd": [str(cfg["PYTHON"]), str(ctd_script), "--config", str(ctd_cfg_path)],
+                    "mpi": ctd_mpi,
+                    "cmd": _build_task_command(cfg, ctd_script, ctd_cfg_path, ctd_mpi),
                     "stdout": exp_dir / "ctd" / "stdout.log",
                     "stderr": exp_dir / "ctd" / "stderr.log",
                 },
@@ -1432,7 +1734,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                     "required_ok": bool(cfg.get("TH_SCHISM_TEMPLATE")),
                     "required_msg": "Missing TH_SCHISM_TEMPLATE.",
                     "run_paths": [(th_cfg.get("schism_npzs") or [""])[0]],
-                    "cmd": [str(cfg["PYTHON"]), str(th_script), "--config", str(th_cfg_path)],
+                    "mpi": th_mpi,
+                    "cmd": _build_task_command(cfg, th_script, th_cfg_path, th_mpi),
                     "stdout": exp_dir / "th" / "stdout.log",
                     "stderr": exp_dir / "th" / "stderr.log",
                 },
@@ -1442,7 +1745,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                     "required_ok": bool(cfg.get("WL_RUN_TEMPLATE")),
                     "required_msg": "Missing WL_RUN_TEMPLATE.",
                     "run_paths": [(wl_cfg.get("runs") or [""])[0]],
-                    "cmd": [str(cfg["PYTHON"]), str(wl_script), "--config", str(wl_cfg_path)],
+                    "mpi": wl_mpi,
+                    "cmd": _build_task_command(cfg, wl_script, wl_cfg_path, wl_mpi),
                     "stdout": exp_dir / "wl" / "stdout.log",
                     "stderr": exp_dir / "wl" / "stderr.log",
                 },
@@ -1477,7 +1781,15 @@ def main(argv: Optional[List[str]] = None) -> None:
                         raise FileNotFoundError(f"[{exp_id}:{task}] {missing_msg}")
                     continue
 
-                ok, msg = _run_cmd(cmd, SCRIPT_DIR, spec["stdout"], spec["stderr"])
+                mpi_issue = _validate_mpi_launcher(spec.get("mpi", {}))
+                if mpi_issue is not None:
+                    statuses.append(_status_record(exp_id, task, "failed", mpi_issue, cmd))
+                    if not bool(cfg["CONTINUE_ON_ERROR"]):
+                        raise RuntimeError(f"[{exp_id}:{task}] {mpi_issue}")
+                    continue
+
+                env = _build_task_env(spec.get("mpi", {}))
+                ok, msg = _run_cmd(cmd, SCRIPT_DIR, spec["stdout"], spec["stderr"], env=env)
                 statuses.append(_status_record(exp_id, task, "ok" if ok else "failed", msg, cmd))
                 if (not ok) and (not bool(cfg["CONTINUE_ON_ERROR"])):
                     raise RuntimeError(f"[{exp_id}:{task}] {msg}")
@@ -1506,6 +1818,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         "campaign_id": str(campaign_id),
         "catalog": str(catalog_path),
         "campaign_dir": str(campaign_dir),
+        "controller_config_path": str(CONTROLLER_CONFIG_PATH) if CONTROLLER_CONFIG_PATH is not None else None,
+        "path_base_dir": str(PATH_BASE_DIR),
         "baseline_id": baseline_id,
         "experiments": len(experiments),
         "compare_mode": compare_mode,
@@ -1513,6 +1827,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "execute_th": bool(cfg["EXECUTE_TH"] and not cfg["DRY_RUN"]),
         "execute_wl": bool(cfg["EXECUTE_WL"] and not cfg["DRY_RUN"]),
         "execute_scorecard": bool(cfg["EXECUTE_SCORECARD"]),
+        "mpi": cfg.get("MPI", {}),
         "metrics_info": metrics_info,
         "weights": dict(cfg["J_WEIGHTS"]),
     }

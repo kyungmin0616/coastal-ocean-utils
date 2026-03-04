@@ -8,41 +8,26 @@ Features:
 3) Auto stack discovery with lightweight incomplete-file screening.
 """
 
-from pylib import *  # noqa: F403
-import os
-import re
-import time
-from glob import glob
-
-try:
-    from mpi4py import MPI  # type: ignore
-
-    COMM = MPI.COMM_WORLD
-    RANK = COMM.Get_rank()
-    SIZE = COMM.Get_size()
-except Exception:
-    COMM = None
-    RANK = 0
-    SIZE = 1
-
-
+# =============================================================================
+# Configuration
+# =============================================================================
 CONFIG = dict(
     # Legacy single-run mode (kept for backward compatibility)
     RUN="../RUN01c",
     SNAME="./npz/RUN01c_v1",
-    
+
     # Multi-run mode (if RUNS is set, RUN/SNAME are ignored)
     RUNS=[
          {"NAME": "RUN01b", "RUN": "../RUN01b" },
          {"NAME": "RUN01d", "RUN": "../RUN01d"},
-     ],  
+     ],
     # Example:
     # RUNS=[
     #     {"NAME": "RUN01a", "RUN": "../RUN01a", "SNAME": "./npz/RUN01a"},
     #     {"NAME": "RUN02a", "RUN": "../RUN02a", "SNAME": "./npz/RUN02a"},
     # ]
     SNAME_TEMPLATE="./npz/{run_name}_SB_D2",
-    
+
     SVARS=("temp", "salt"),
     BPFILE="./station_sendai_d2.bp",
     ITYPE=0,  # 0: time series of points @xyz; 1: transects @xy
@@ -52,150 +37,122 @@ CONFIG = dict(
     MDT=None,  # time window (day) for averaging output
     RVARS=None,  # rename variables
     PRJ=None,  # e.g. ["epsg:26918", "epsg:4326"]
-    
+
     # Stack screening controls
     STACK_CHECK_MODE="light",  # none | light | size | light+size
     STACK_CHECK_ALL_FILES=False,  # False: check primary stack file only
     STACK_SIZE_RATIO_MIN=0.70,  # for size/light+size: min size ratio against median primary size
     STACK_SIZE_MIN_BYTES=None,  # optional absolute size floor in bytes
-    
+
     # Time offset controls
     APPLY_PARAM_START_TIME=True,
     APPLY_UTC_START=False,  # If True, shift by -utc_start/24 from param.nml
-    
+
     VERBOSE=True,
+    DRY_RUN=False,
+    MANIFEST=None,  # optional JSON summary path
 )
 
+# =============================================================================
+# Imports
+# =============================================================================
+import os
+import sys
+import time
+import argparse
+import json
+from pathlib import Path
 
-def _log(msg):
-    prefix = f"[rank {RANK}/{SIZE}] " if SIZE > 1 else ""
-    print(prefix + str(msg), flush=True)
+from pylib import *  # noqa: F403
+
+
+# =============================================================================
+# Shared Utilities / MPI Runtime
+# =============================================================================
+_COMMON_CANDIDATE_DIRS = []
+_env_pylibs_src = os.environ.get("PYLIBS_SRC")
+if _env_pylibs_src:
+    _COMMON_CANDIDATE_DIRS.append(Path(_env_pylibs_src).expanduser())
+try:
+    # Typical layout: .../Codes/coastal-ocean-utils/schism/post-proc/script.py
+    _COMMON_CANDIDATE_DIRS.append(Path(__file__).resolve().parents[3] / "pylibs" / "src")
+except Exception:
+    pass
+_COMMON_CANDIDATE_DIRS.append(Path.home() / "Documents" / "Codes" / "pylibs" / "src")
+
+for _common_dir in _COMMON_CANDIDATE_DIRS:
+    if _common_dir.is_dir():
+        _common_dir_str = str(_common_dir)
+        if _common_dir_str not in sys.path:
+            sys.path.insert(0, _common_dir_str)
+
+try:
+    from postproc_common import (
+        init_mpi_runtime,
+        rank_log,
+        report_work_assignment,
+        normalize_stack_list,
+        screen_stacks as common_screen_stacks,
+        get_model_start_datenum as common_get_model_start_datenum,
+        normalize_run_specs as common_normalize_run_specs,
+        deep_update_dict,
+    )
+except Exception as exc:
+    missing = [
+        name
+        for name in (
+            "init_mpi_runtime",
+            "rank_log",
+            "report_work_assignment",
+            "normalize_stack_list",
+            "common_screen_stacks",
+            "common_get_model_start_datenum",
+            "common_normalize_run_specs",
+            "deep_update_dict",
+        )
+        if name not in globals()
+    ]
+    if missing:
+        raise ImportError(
+            "Shared helpers not found. Set PYLIBS_SRC to pylibs/src or install "
+            f"postproc_common. Missing: {', '.join(missing)}"
+        ) from exc
+
+MPI, COMM, RANK, SIZE, USE_MPI = init_mpi_runtime(sys.argv)
+
+# =============================================================================
+# Core Helpers
+# =============================================================================
+def _log(msg, rank0_only=False):
+    rank_log(str(msg), rank=RANK, size=SIZE, rank0_only=rank0_only)
+
+
+def _report_extract_assignment(nvars, nstacks):
+    total_count = int(nvars) * int(nstacks)
+    local_indices = [i for i in range(total_count) if ((i + 1) % SIZE) == RANK]
+    report_work_assignment(
+        tag="extract",
+        total_count=total_count,
+        local_indices=local_indices,
+        rank=RANK,
+        size=SIZE,
+        comm=COMM,
+        mpi_enabled=bool(USE_MPI),
+        logger=_log,
+    )
 
 
 def _as_stack_list(stacks, dstacks):
-    if stacks is None:
-        return array(sorted(set([int(i) for i in array(dstacks).ravel()])), dtype=int)  # noqa: F403
-    if isinstance(stacks, (list, tuple)) and len(stacks) == 2:
-        s0 = int(stacks[0])
-        s1 = int(stacks[1])
-        return arange(s0, s1 + 1).astype(int)  # noqa: F403
-    return array(sorted(set([int(i) for i in array(stacks).ravel()])), dtype=int)  # noqa: F403
-
-
-def _to_scalar(v, default=None):
-    if v is None:
-        return default
-    if isinstance(v, (list, tuple, ndarray)):  # noqa: F405
-        if len(v) == 0:
-            return default
-        return v[0]
-    return v
+    return normalize_stack_list(stacks, dstacks)
 
 
 def _get_model_start_datenum(run, apply_utc_start=False):
-    pfile = os.path.join(run, "param.nml")
-    if not fexist(pfile):  # noqa: F403
-        return None, f"param.nml not found in {run}"
-
-    try:
-        p = read_schism_param(pfile, 1)  # noqa: F403
-    except Exception as exc:
-        return None, f"failed to parse param.nml: {exc}"
-
-    keys = ["start_year", "start_month", "start_day", "start_hour"]
-    for key in keys:
-        if key not in p:
-            return None, f"missing {key} in param.nml"
-
-    try:
-        sy = int(_to_scalar(p.get("start_year")))
-        sm = int(_to_scalar(p.get("start_month")))
-        sd = int(_to_scalar(p.get("start_day")))
-        sh = float(_to_scalar(p.get("start_hour"), 0.0))
-        us = float(_to_scalar(p.get("utc_start"), 0.0))
-    except Exception as exc:
-        return None, f"invalid start time fields in param.nml: {exc}"
-
-    d0 = float(datenum(sy, sm, sd))  # noqa: F403
-    d0 = d0 + sh / 24.0
-    if apply_utc_start:
-        d0 = d0 - us / 24.0
-
-    return d0, f"{sy:04d}-{sm:02d}-{sd:02d} {sh:05.2f}h (utc_start={us})"
-
-
-def _stack_num_from_name(path):
-    name = os.path.basename(path)
-    m = re.search(r"_(\d+)\.nc$", name)
-    return int(m.group(1)) if m else None
-
-
-def _primary_stack_file(outputs_dir, stack, outfmt):
-    if outfmt == 0:
-        fn = os.path.join(outputs_dir, f"out2d_{stack}.nc")
-        return fn if fexist(fn) else None  # noqa: F403
-
-    cand = sorted(glob(os.path.join(outputs_dir, f"schout_*_{stack}.nc")))
-    if len(cand) > 0:
-        return cand[0]
-    fn = os.path.join(outputs_dir, f"schout_{stack}.nc")
-    return fn if fexist(fn) else None  # noqa: F403
-
-
-def _stack_files_for_check(outputs_dir, stack, outfmt, check_all_files):
-    primary = _primary_stack_file(outputs_dir, stack, outfmt)
-    if primary is None:
-        return []
-    if not check_all_files:
-        return [primary]
-
-    files = sorted(glob(os.path.join(outputs_dir, f"*_{stack}.nc")))
-    if len(files) == 0:
-        return [primary]
-    if primary not in files:
-        files.insert(0, primary)
-    return files
-
-
-def _header_time_ok(nc_path):
-    c = None
-    try:
-        c = ReadNC(nc_path, 1)  # noqa: F403
-        if "time" not in c.variables:
-            return False, "missing time variable"
-        tvar = c.variables["time"]
-
-        # lightweight validity check: dimension + first value
-        if hasattr(tvar, "shape") and len(tvar.shape) > 0:
-            nt = int(tvar.shape[0])
-        else:
-            nt = int(len(array(tvar)))  # noqa: F403
-        if nt <= 0:
-            return False, "empty time variable"
-
-        _ = float(array(tvar[0]).ravel()[0])  # noqa: F403
-        return True, "ok"
-    except Exception as exc:
-        return False, str(exc)
-    finally:
-        if c is not None:
-            try:
-                c.close()
-            except Exception:
-                pass
-
-
-def _size_ok(path, ref_size, ratio_min=0.70, abs_min_bytes=None):
-    try:
-        size = int(os.path.getsize(path))
-    except Exception as exc:
-        return False, f"size check failed: {exc}"
-    if abs_min_bytes is not None and size < int(abs_min_bytes):
-        return False, f"size={size} < abs_min={int(abs_min_bytes)}"
-    thr = float(ratio_min) * float(ref_size)
-    if size < thr:
-        return False, f"size={size} < ratio_min*median={int(thr)}"
-    return True, "ok"
+    return common_get_model_start_datenum(
+        run,
+        apply_utc_start=bool(apply_utc_start),
+        read_schism_param_func=read_schism_param,  # noqa: F405
+        datenum_func=datenum,  # noqa: F405
+    )
 
 
 def _screen_stacks(
@@ -208,133 +165,31 @@ def _screen_stacks(
     abs_min_bytes=None,
     verbose=True,
 ):
-    stacks = [int(i) for i in array(stacks).ravel()]  # noqa: F403
-    if len(stacks) == 0:
-        return array([], dtype=int), {}  # noqa: F403
-
-    mode = "none" if mode is None else str(mode).lower()
-    if mode == "none":
-        return array(stacks, dtype=int), {}  # noqa: F403
-
-    primary = {}
-    for st in stacks:
-        p = _primary_stack_file(outputs_dir, st, outfmt)
-        if p is not None:
-            primary[st] = p
-    ref_size = None
-    sizes = [os.path.getsize(fp) for fp in primary.values() if fexist(fp)]  # noqa: F403
-    if len(sizes) > 0:
-        ref_size = int(median(array(sizes, dtype=float)))  # noqa: F403
-
-    valid = []
-    skipped = {}
-    for st in stacks:
-        files = _stack_files_for_check(outputs_dir, st, outfmt, check_all_files)
-        if len(files) == 0:
-            skipped[st] = "missing primary stack file"
-            continue
-
-        need_light = mode in {"light", "light+size"}
-        need_size = mode in {"size", "light+size"}
-        ok = True
-        reason = ""
-
-        if need_light:
-            for fn in files:
-                f_ok, f_reason = _header_time_ok(fn)
-                if not f_ok:
-                    ok = False
-                    reason = f"{os.path.basename(fn)}: {f_reason}"
-                    break
-        if ok and need_size and ref_size is not None:
-            for fn in files:
-                s_ok, s_reason = _size_ok(
-                    fn,
-                    ref_size,
-                    ratio_min=ratio_min,
-                    abs_min_bytes=abs_min_bytes,
-                )
-                if not s_ok:
-                    ok = False
-                    reason = f"{os.path.basename(fn)}: {s_reason}"
-                    break
-
-        if ok:
-            valid.append(st)
-        else:
-            skipped[st] = reason
-
-    if verbose and RANK == 0:
-        _log(
-            f"Stack screen ({mode}): requested={len(stacks)}, "
-            f"valid={len(valid)}, skipped={len(skipped)}"
-        )
-        if len(skipped) > 0:
-            for st in sorted(skipped)[:20]:
-                _log(f"  skip stack {st}: {skipped[st]}")
-            if len(skipped) > 20:
-                _log(f"  ... {len(skipped) - 20} more skipped stacks")
-
-    return array(valid, dtype=int), skipped  # noqa: F403
+    logger = _log if (verbose and RANK == 0) else None
+    return common_screen_stacks(
+        outputs_dir=outputs_dir,
+        stacks=stacks,
+        outfmt=outfmt,
+        mode=mode,
+        check_all_files=check_all_files,
+        ratio_min=ratio_min,
+        abs_min_bytes=abs_min_bytes,
+        readnc=lambda p: ReadNC(p, 1),  # noqa: F403
+        logger=logger,
+        log_limit=20,
+    )
 
 
 def _normalize_run_specs(cfg):
-    runs = cfg.get("RUNS")
-    specs = []
-
-    if runs is None:
-        specs.append(
-            dict(
-                NAME=os.path.basename(os.path.abspath(cfg["RUN"])),
-                RUN=cfg["RUN"],
-                SNAME=cfg["SNAME"],
-                SVARS=cfg["SVARS"],
-                BPFILE=cfg["BPFILE"],
-                ITYPE=cfg["ITYPE"],
-                IFS=cfg["IFS"],
-                STACKS=cfg.get("STACKS"),
-                NSPOOL=cfg["NSPOOL"],
-                MDT=cfg["MDT"],
-                RVARS=cfg["RVARS"],
-                PRJ=cfg["PRJ"],
-            )
-        )
-        return specs
-
-    for i, item in enumerate(runs):
-        if isinstance(item, str):
-            item = {"RUN": item}
-        if not isinstance(item, dict):
-            raise ValueError(f"RUNS[{i}] must be dict or string")
-
-        run = item.get("RUN", item.get("run", item.get("run_dir")))
-        if run is None:
-            raise ValueError(f"RUNS[{i}] missing RUN/run_dir")
-
-        name = item.get("NAME", item.get("name", os.path.basename(os.path.abspath(run))))
-        sname = item.get("SNAME", item.get("sname"))
-        if sname is None:
-            template = cfg.get("SNAME_TEMPLATE", "./npz/{run_name}")
-            sname = str(template).format(run_name=name, run=run)
-
-        specs.append(
-            dict(
-                NAME=name,
-                RUN=run,
-                SNAME=sname,
-                SVARS=item.get("SVARS", cfg["SVARS"]),
-                BPFILE=item.get("BPFILE", cfg["BPFILE"]),
-                ITYPE=item.get("ITYPE", cfg["ITYPE"]),
-                IFS=item.get("IFS", cfg["IFS"]),
-                STACKS=item.get("STACKS", cfg.get("STACKS")),
-                NSPOOL=item.get("NSPOOL", cfg["NSPOOL"]),
-                MDT=item.get("MDT", cfg["MDT"]),
-                RVARS=item.get("RVARS", cfg["RVARS"]),
-                PRJ=item.get("PRJ", cfg["PRJ"]),
-            )
-        )
-
-    return specs
+    return common_normalize_run_specs(
+        cfg,
+        run_keys=("RUN", "run", "run_dir"),
+        name_keys=("NAME", "name"),
+        output_keys=("SNAME", "sname"),
+        output_template_key="SNAME_TEMPLATE",
+        default_output_template="./npz/{run_name}_SB_D2",
+        include_keys=("SVARS", "BPFILE", "ITYPE", "IFS", "STACKS", "NSPOOL", "MDT", "RVARS", "PRJ"),
+    )
 
 
 def _normalize_chunk_2d(arr, tvec, expected_nsta=None):
@@ -383,6 +238,7 @@ def _process_one_run(spec, cfg):
     mdt = spec["MDT"]
     rvars = spec["RVARS"] if spec["RVARS"] is not None else svars
     prj = spec["PRJ"]
+    run_name = str(spec.get("NAME", os.path.basename(os.path.abspath(run))))
 
     if len(rvars) != len(svars):
         raise ValueError(f"RVARS must match SVARS length for run {run}")
@@ -417,7 +273,18 @@ def _process_one_run(spec, cfg):
     if len(valid_stacks) == 0:
         if RANK == 0:
             _log(f"No valid stacks for run {run}; skip.")
-        return
+            return dict(
+                run_name=run_name,
+                run_dir=os.path.abspath(run),
+                output=sname,
+                status="skipped_no_valid_stacks",
+                valid_stacks=0,
+                variables=[],
+            )
+        return None
+
+    if cfg.get("VERBOSE", True):
+        _report_extract_assignment(len(svars), len(valid_stacks))
 
     gd, vd = grd(run, fmt=2)  # noqa: F403
     gd.compute_bnd()
@@ -484,9 +351,10 @@ def _process_one_run(spec, cfg):
         S.bp = read(bpfile)  # noqa: F403
         S.time = []
         S.run_dir = os.path.abspath(run)
-        S.run_name = str(spec.get("NAME", os.path.basename(os.path.abspath(run))))
+        S.run_name = run_name
         S.used_stacks = array(valid_stacks, dtype=int)  # noqa: F403
         fnss = []
+        extracted_vars = []
 
         for k, m in zip(svars, rvars):
             fns = [f"{oname}_{k}_{int(n)}.npz" for n in valid_stacks]
@@ -528,6 +396,7 @@ def _process_one_run(spec, cfg):
 
                 if len(data_ok) > 0:
                     S.attr(m, concatenate(data_ok, axis=1))  # noqa: F403
+                    extracted_vars.append(str(m))
                     mtime_cat = concatenate(mtime_ok)  # noqa: F403
                     if len(mtime_cat) > len(S.time):
                         S.time = array(mtime_cat, dtype="float64")  # noqa: F403
@@ -559,26 +428,198 @@ def _process_one_run(spec, cfg):
         dt = time.time() - t0
         _log(f"Wrote {sname}")
         _log(f"Merge/save time: {dt:.2f}s")
+        return dict(
+            run_name=run_name,
+            run_dir=os.path.abspath(run),
+            output=sname,
+            status="written",
+            valid_stacks=int(len(valid_stacks)),
+            variables=sorted(set(extracted_vars)),
+        )
 
     if COMM is not None:
         COMM.Barrier()
+    return None
+
+
+def _parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Extract SCHISM station/transect products.")
+    p.add_argument("--config", help="Optional JSON config overrides.")
+    p.add_argument("--run", help="Override CONFIG['RUN'] and force single-run mode.")
+    p.add_argument("--sname", help="Override CONFIG['SNAME'] in single-run mode.")
+    p.add_argument("--manifest", help="Optional output JSON summary path.")
+    p.add_argument("--vars", nargs="+", help="Override CONFIG['SVARS'].")
+    p.add_argument(
+        "--stacks",
+        nargs="+",
+        type=int,
+        help="Override stack selection: pass 2 ints for [start end], or explicit stack list.",
+    )
+    p.add_argument(
+        "--stack-check-mode",
+        choices=["none", "light", "size", "light+size"],
+        help="Override CONFIG['STACK_CHECK_MODE'].",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Resolve runs/stacks/vars and exit.")
+    p.add_argument("--verbose", dest="verbose", action="store_true")
+    p.add_argument("--quiet", dest="verbose", action="store_false")
+    p.add_argument("--apply-param-start-time", dest="apply_param_start_time", action="store_true")
+    p.add_argument("--no-apply-param-start-time", dest="apply_param_start_time", action="store_false")
+    p.add_argument("--apply-utc-start", dest="apply_utc_start", action="store_true")
+    p.add_argument("--no-apply-utc-start", dest="apply_utc_start", action="store_false")
+    p.set_defaults(verbose=None, apply_param_start_time=None, apply_utc_start=None)
+    return p.parse_args(argv)
+
+
+def _load_json_config(config_path):
+    if config_path is None:
+        return {}
+    with open(str(config_path), "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError(f"--config must contain a JSON object: {config_path}")
+    return obj
+
+
+def _apply_cli(cfg, args):
+    out = deep_update_dict(cfg, _load_json_config(args.config), merge_list_of_dicts=False)
+    if args.run:
+        out["RUN"] = args.run
+        out["RUNS"] = None
+    if args.sname:
+        out["SNAME"] = args.sname
+    if args.vars:
+        out["SVARS"] = tuple(args.vars)
+    if args.stacks is not None:
+        vals = [int(v) for v in args.stacks]
+        out["STACKS"] = vals if len(vals) != 2 else [vals[0], vals[1]]
+    if args.stack_check_mode:
+        out["STACK_CHECK_MODE"] = str(args.stack_check_mode)
+    if args.dry_run:
+        out["DRY_RUN"] = True
+    if args.manifest:
+        out["MANIFEST"] = str(args.manifest)
+    if args.verbose is not None:
+        out["VERBOSE"] = bool(args.verbose)
+    if args.apply_param_start_time is not None:
+        out["APPLY_PARAM_START_TIME"] = bool(args.apply_param_start_time)
+    if args.apply_utc_start is not None:
+        out["APPLY_UTC_START"] = bool(args.apply_utc_start)
+    return out
+
+
+def _validate_config(cfg):
+    if cfg.get("RUNS") is None and cfg.get("RUN") is None:
+        raise ValueError("Either RUNS or RUN must be configured.")
+    svars = tuple(cfg.get("SVARS", ()))
+    if len(svars) == 0:
+        raise ValueError("SVARS must not be empty.")
+    if cfg.get("RVARS") is not None and len(tuple(cfg.get("RVARS"))) != len(svars):
+        raise ValueError("RVARS must have the same length as SVARS.")
+    mode = str(cfg.get("STACK_CHECK_MODE", "light")).lower()
+    if mode not in {"none", "light", "size", "light+size"}:
+        raise ValueError(f"Invalid STACK_CHECK_MODE: {mode}")
+
+
+def _dry_run_report(run_specs, cfg):
+    for spec in run_specs:
+        run = spec["RUN"]
+        svars = tuple(spec["SVARS"])
+        outputs_dir = os.path.join(run, "outputs")
+        if not os.path.isdir(outputs_dir):
+            _log(f"[DRY-RUN] {spec['NAME']}: missing outputs dir -> {outputs_dir}", rank0_only=True)
+            continue
+
+        try:
+            modules, outfmt, dstacks, dvars, dvars_2d = schout_info(outputs_dir, 1)  # noqa: F403
+            _ = modules
+            _ = dvars_2d
+        except Exception as exc:
+            _log(f"[DRY-RUN] {spec['NAME']}: schout_info failed: {exc}", rank0_only=True)
+            continue
+
+        cand = _as_stack_list(spec.get("STACKS"), dstacks)
+        valid, skipped = _screen_stacks(
+            outputs_dir=outputs_dir,
+            stacks=cand,
+            outfmt=outfmt,
+            mode=cfg.get("STACK_CHECK_MODE", "light"),
+            check_all_files=bool(cfg.get("STACK_CHECK_ALL_FILES", False)),
+            ratio_min=float(cfg.get("STACK_SIZE_RATIO_MIN", 0.70)),
+            abs_min_bytes=cfg.get("STACK_SIZE_MIN_BYTES"),
+            verbose=False,
+        )
+        present = [sv for sv in svars if len(schvar_info(sv, modules, fmt=outfmt)) > 0]  # noqa: F403
+        _log(
+            f"[DRY-RUN] {spec['NAME']}: run={run}, out={spec['SNAME']}, "
+            f"vars={svars}, vars_present={present}, candidates={len(cand)}, "
+            f"valid={len(valid)}, skipped={len(skipped)}",
+            rank0_only=True,
+        )
+
+
+def _write_manifest(cfg, run_specs, run_summaries):
+    mpath = cfg.get("MANIFEST")
+    if not mpath:
+        return
+    mpath = os.path.abspath(str(mpath))
+    mdir = os.path.dirname(mpath)
+    if mdir and (not os.path.isdir(mdir)):
+        os.makedirs(mdir, exist_ok=True)
+    payload = dict(
+        script=os.path.abspath(__file__),
+        dry_run=bool(cfg.get("DRY_RUN", False)),
+        run_count=int(len(run_specs)),
+        runs=run_summaries,
+    )
+    with open(mpath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    _log(f"Wrote manifest: {mpath}", rank0_only=True)
 
 
 def main():
-    run_specs = _normalize_run_specs(CONFIG)
+    args = _parse_args()
+    cfg = _apply_cli(CONFIG, args)
+    _validate_config(cfg)
+
+    run_specs = _normalize_run_specs(cfg)
     if len(run_specs) == 0:
         raise ValueError("No runs configured.")
 
     if RANK == 0:
         _log(f"Total runs to process: {len(run_specs)}")
 
+    if cfg.get("DRY_RUN", False):
+        _dry_run_report(run_specs, cfg)
+        if RANK == 0:
+            _write_manifest(
+                cfg,
+                run_specs,
+                [
+                    dict(
+                        run_name=str(spec.get("NAME", "")),
+                        run_dir=os.path.abspath(str(spec.get("RUN", ""))),
+                        output=str(spec.get("SNAME", "")),
+                        status="dry_run",
+                    )
+                    for spec in run_specs
+                ],
+            )
+        return
+
+    run_summaries = []
     for i, spec in enumerate(run_specs, start=1):
         if RANK == 0:
             _log(f"---- Run {i}/{len(run_specs)}: {spec['NAME']} ----")
-        _process_one_run(spec, CONFIG)
+        rs = _process_one_run(spec, cfg)
+        if RANK == 0 and isinstance(rs, dict):
+            run_summaries.append(rs)
 
     if COMM is not None:
         COMM.Barrier()
+
+    if RANK == 0:
+        _write_manifest(cfg, run_specs, run_summaries)
 
 
 if __name__ == "__main__":
