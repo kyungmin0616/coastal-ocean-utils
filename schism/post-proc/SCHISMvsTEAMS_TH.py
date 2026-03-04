@@ -19,36 +19,45 @@ from __future__ import annotations
 CONFIG = dict(
     model={
         "runs": [
-            "/scratch2/08924/kmpark/post-proc/npz/RUN01d_SB_d2.npz",
-            "/scratch2/08924/kmpark/post-proc/npz/RUN01e_SB_d2.npz",
-            "/scratch2/08924/kmpark/post-proc/npz/RUN02a_SB_d2.npz",
+            "./npz/RUN01g_SB_D2.npz",
+            "./npz/RUN03a_SB_D2.npz",
+            "./npz/RUN04a_SB_D2.npz",
+            "./npz/RUN04a_SB_D2.npz",
+
         ],
-        "labels": None,
+        "labels": ["RUN01g", "RUN03a", "RUN04a", "RUN05a"],
         "variables": ["temp", "sal"],
+        "npz_time_mode": "absolute",  # absolute | relative | auto
+        "apply_time_offset_to_npz": False,
         "time_units": "datenum",  # datenum | seconds
         "time_offset": "2017-01-02",  # datenum-compatible string or offset days
     },
     obs={
-        "path": "/scratch2/08924/kmpark/post-proc/npz/sendai_d2_timeseries.npz",
+        "path": "./npz/sendai_d2_timeseries.npz",
     },
     stations={
-        "bpfile": "station_sendai_d2.bp",
-        "list": None,
-        "depth": None,
-        "depth_tol": 0.5,
-        "depth_policy": "mean",  # mean | first
+        "bpfile": "station_sendai_d2.bp",  # station metadata file (order/names)
+        "list": None,  # optional station subset (ids/names); None=all
+        "depth": None,  # target TEAMS depth (m); None=use all depths
+        "depth_tol": 0.5,  # depth match tolerance (m) when depth is set
+        "depth_policy": "mean",  # mean|first handling for multiple records per time
     },
     time={
-        "start": "2017-01-02",
-        "end": "2017-12-31",
+        "start": "2012-02-01",
+        "end": "2014-12-31",
         "resample": {"obs": "H", "model": "H"},
     },
     map={
-        "grid": "../RUN01d/hgrid.gr3",
+        "grid": "../run/RUN04a/hgrid.gr3",
         "zoom_deg": 0.1,
+        "region": {
+            "shapefile": "./shp/SOB.shp",  # set to None to skip shapefile filtering
+            "use_shapefile": True,
+            "subset_bbox": None,  # (lon_min, lon_max, lat_min, lat_max)
+        },
     },
     output={
-        "dir": "./CompTEAMS_RUN01e02a_SB_d2",
+        "dir": "./CompObs/CompTEAMS_SBD2_01g03a04a05a",
         "save_plots": True,
         "write_task_metrics": True,
         "write_scatter_plots": True,
@@ -89,6 +98,7 @@ from pylib import (
     datenum,
     num2date,
     read,
+    read_shapefile_data,
     deep_update_dict,
     init_mpi_runtime,
     rank_log,
@@ -149,6 +159,7 @@ TH_MODEL_FIELDS = [
 # MPI setup
 # =============================================================================
 MPI, COMM, RANK, SIZE, USE_MPI = init_mpi_runtime(sys.argv)
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 # =============================================================================
 # Core helpers
@@ -191,6 +202,24 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--depth", type=float, help="Target depth for TEAMS series (m).")
     p.add_argument("--depth-tol", type=float, help="Depth tolerance (m) for TEAMS selection.")
     p.add_argument("--depth-policy", choices=["mean", "first"], help="How to handle multiple depths.")
+    p.add_argument(
+        "--npz-time-mode",
+        choices=["absolute", "relative", "auto"],
+        help="How to interpret SCHISM NPZ time arrays.",
+    )
+    p.add_argument(
+        "--apply-offset-to-npz",
+        dest="apply_offset_to_npz",
+        action="store_true",
+        help="Also apply model_time_offset to NPZ in absolute mode.",
+    )
+    p.add_argument(
+        "--no-apply-offset-to-npz",
+        dest="apply_offset_to_npz",
+        action="store_false",
+        help="Do not apply model_time_offset to NPZ in absolute mode.",
+    )
+    p.set_defaults(apply_offset_to_npz=None)
     p.add_argument("--model-time-units", choices=["datenum", "seconds"], help="SCHISM time units.")
     p.add_argument("--model-time-offset", type=float, help="Offset to add to SCHISM time (days).")
     p.add_argument("--station-list", nargs="+", help="Station IDs or names to include.")
@@ -227,6 +256,62 @@ def _as_datetime_index(times: Any, units: str, offset_days: float) -> pd.Datetim
     if isinstance(stamps, pd.DatetimeIndex):
         return stamps
     return pd.DatetimeIndex(stamps)
+
+
+def _npz_time_is_absolute(ds: Any, time_values: np.ndarray) -> bool:
+    if hasattr(ds, "time_is_absolute"):
+        try:
+            return bool(int(np.asarray(ds.time_is_absolute).ravel()[0]) == 1)
+        except Exception:
+            pass
+    if hasattr(ds, "time_units"):
+        try:
+            units = str(np.asarray(ds.time_units).ravel()[0]).lower()
+            if "datenum" in units or "absolute" in units:
+                return True
+        except Exception:
+            pass
+    finite = np.asarray(time_values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return False
+    return bool(np.nanmedian(finite) > 10000.0)
+
+
+def _npz_time_to_datetime_index(
+    ds: Any,
+    time_values: Any,
+    npz_time_mode: str,
+    offset_days: float,
+    apply_offset_to_npz: bool,
+    fallback_units: str,
+) -> pd.DatetimeIndex:
+    t_raw = np.asarray(time_values, dtype=float)
+    mode = str(npz_time_mode).strip().lower()
+    if mode not in {"absolute", "relative", "auto"}:
+        mode = "auto"
+
+    if mode == "auto":
+        is_absolute = _npz_time_is_absolute(ds, t_raw)
+    elif mode == "absolute":
+        is_absolute = True
+    else:
+        is_absolute = False
+
+    if is_absolute:
+        t_days = t_raw.astype(float)
+        if apply_offset_to_npz and float(offset_days) != 0.0:
+            t_days = t_days + float(offset_days)
+    else:
+        t_days = t_raw.astype(float) + float(offset_days)
+
+    # If values still look non-datenum, fall back to legacy unit handling.
+    finite = t_days[np.isfinite(t_days)]
+    if finite.size > 0 and np.nanmedian(finite) < 10000.0:
+        return _as_datetime_index(time_values, fallback_units, float(offset_days))
+
+    stamps = [num2date(float(t)).strftime("%Y-%m-%d %H:%M:%S") for t in t_days]
+    return pd.to_datetime(stamps, utc=True)
 
 
 def _resample_series(times: pd.DatetimeIndex, values: np.ndarray, freq: Optional[str]) -> pd.Series:
@@ -401,10 +486,13 @@ def _load_schism_models(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         ds = loadz(p)
         label = labels[i] if labels and i < len(labels) else Path(p).stem
         names = _get_schism_station_names(ds)
-        time_index = _as_datetime_index(
+        time_index = _npz_time_to_datetime_index(
+            ds,
             getattr(ds, "time"),
-            str(cfg["model_time_units"]),
-            float(cfg["model_time_offset"]),
+            str(cfg.get("npz_time_mode", "absolute")),
+            float(cfg.get("model_time_offset", 0.0)),
+            bool(cfg.get("apply_offset_to_npz", False)),
+            str(cfg.get("model_time_units", "datenum")),
         )
         models.append(
             {
@@ -435,6 +523,25 @@ def _teams_station_location(
     if lat.size == 0 or lon.size == 0:
         return None, None
     return float(np.nanmedian(lat)), float(np.nanmedian(lon))
+
+
+def _resolve_map_region(region_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    shapefile = region_cfg.get("shapefile")
+    use_shapefile = bool(region_cfg.get("use_shapefile", bool(shapefile)))
+    px = py = None
+    if use_shapefile and shapefile:
+        shp_path = Path(str(shapefile))
+        if not shp_path.is_absolute():
+            shp_path = (SCRIPT_DIR / shp_path).resolve()
+        if shp_path.exists():
+            try:
+                bp = read_shapefile_data(str(shp_path))
+                px, py = bp.xy.T
+            except Exception as exc:
+                rank_print(f"[WARN] Failed to read region shapefile {shp_path}: {exc}")
+        else:
+            rank_print(f"[WARN] Region shapefile not found: {shp_path}")
+    return {"px": px, "py": py}
 
 
 def _teams_station_depth_mean(
@@ -672,6 +779,12 @@ def _build_canonical_config(args: argparse.Namespace) -> Dict[str, Any]:
     if args.depth_policy:
         cfg.setdefault("stations", {})
         cfg["stations"]["depth_policy"] = args.depth_policy
+    if args.npz_time_mode:
+        cfg.setdefault("model", {})
+        cfg["model"]["npz_time_mode"] = str(args.npz_time_mode).strip().lower()
+    if args.apply_offset_to_npz is not None:
+        cfg.setdefault("model", {})
+        cfg["model"]["apply_time_offset_to_npz"] = bool(args.apply_offset_to_npz)
     if args.model_time_units:
         cfg.setdefault("model", {})
         cfg["model"]["time_units"] = args.model_time_units
@@ -723,6 +836,9 @@ def _canonical_to_runtime_config(canonical_cfg: Dict[str, Any]) -> Dict[str, Any
         model_time_offset = float(datenum(time_offset_raw))
     else:
         model_time_offset = float(time_offset_raw)
+    npz_time_mode = str(model_cfg.get("npz_time_mode", "absolute")).strip().lower()
+    if npz_time_mode not in {"absolute", "relative", "auto"}:
+        npz_time_mode = "absolute"
 
     cfg: Dict[str, Any] = {
         "teams_npz": obs_cfg.get("path"),
@@ -739,10 +855,13 @@ def _canonical_to_runtime_config(canonical_cfg: Dict[str, Any]) -> Dict[str, Any
         "depth_policy": station_cfg.get("depth_policy", "mean"),
         "model_time_units": model_cfg.get("time_units", "datenum"),
         "model_time_offset": model_time_offset,
+        "npz_time_mode": npz_time_mode,
+        "apply_offset_to_npz": bool(model_cfg.get("apply_time_offset_to_npz", False)),
         "station_list": station_cfg.get("list"),
         "debug_times": bool(debug_cfg.get("times", False)),
         "grid": map_cfg.get("grid"),
         "map_zoom": float(map_cfg.get("zoom_deg", 0.1)),
+        "map_region": dict(map_cfg.get("region", {})),
         "save_plots": bool(output_cfg.get("save_plots", True)),
         "write_task_metrics": bool(output_cfg.get("write_task_metrics", True)),
         "write_integrated_scatter": bool(output_cfg.get("write_scatter_plots", True)),
@@ -790,6 +909,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             gd = read(cfg["grid"])
         except Exception as exc:
             rank_print(f"[WARN] Failed to read grid {cfg['grid']}: {exc}")
+    region = _resolve_map_region(cfg.get("map_region", {}))
 
     bp_names = _station_names_from_bp(cfg["bpfile"])
     if cfg["station_list"]:
@@ -819,6 +939,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         sid_full = _extract_station_id(name)
         sid_short = _station_id_short(name)
         station_depth = _teams_station_depth_mean(teams, sid_short, station_index=teams_station_index)
+        lat0, lon0 = _teams_station_location(teams, sid_short, station_index=teams_station_index)
 
         station_has_obs = False
         for var in cfg["vars"]:
@@ -876,6 +997,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 continue
 
             var_had_overlap = False
+            metrics_by_label: Dict[str, Dict[str, float]] = {}
             for label, mod_series in model_series_list:
                 common = obs_series.index.intersection(mod_series.index)
                 if len(common) == 0:
@@ -887,6 +1009,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 obs_c = obs_series.loc[common].values.astype(float)
                 mod_c = mod_series.loc[common].values.astype(float)
                 mm = _compute_metrics(obs_c, mod_c)
+                metrics_by_label[label] = mm
 
                 station_rows_local.append(
                     {
@@ -951,36 +1074,50 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ax_ts.set_title(f"{name} - {_normalize_var_name(var)}")
             if len(obs_series.index) > 0:
                 ax_ts.set_xlim(obs_series.index.min(), obs_series.index.max())
-            ax_ts.text(
-                0.01,
-                0.98,
-                "See CSV for stats",
-                transform=ax_ts.transAxes,
-                ha="left",
-                va="top",
-                fontsize=9,
-                bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
-            )
+            text_lines = []
+            for label, _ in model_series_list:
+                mm = metrics_by_label.get(label)
+                if mm is None:
+                    continue
+                text_lines.append(
+                    f"{label}: R={mm['corr']:.2f}, RMSE={mm['rmse']:.3f}, "
+                    f"Bias={mm['bias']:.3f}, WSS={mm['wss']:.3f}"
+                )
+            if text_lines:
+                ax_ts.text(
+                    0.01,
+                    0.02,
+                    "\n".join(text_lines[:6]),
+                    transform=ax_ts.transAxes,
+                    ha="left",
+                    va="bottom",
+                    fontsize=8.5,
+                    bbox=dict(facecolor="white", alpha=0.7, edgecolor="none"),
+                )
             ax_ts.legend()
             ax_ts.grid(True, alpha=0.3)
 
-            if gd is not None:
-                lat0, lon0 = _teams_station_location(teams, sid_short, station_index=teams_station_index)
-                if lat0 is None or lon0 is None:
-                    ax_map.set_axis_off()
-                else:
+            if lat0 is None or lon0 is None:
+                ax_map.set_axis_off()
+            else:
+                has_region_bg = region.get("px") is not None and region.get("py") is not None
+                if has_region_bg:
+                    # If shapefile background exists, use it and skip grid boundary.
+                    ax_map.plot(region["px"], region["py"], "k-", lw=0.8, alpha=0.8)
+                elif gd is not None:
                     try:
                         gd.plot_bnd(ax=ax_map)
                     except Exception:
                         gd.plot_bnd()
-                    ax_map.plot(lon0, lat0, marker="o", color="red", markersize=5)
-                    dz = float(cfg.get("map_zoom", 0.1))
-                    ax_map.set_xlim(lon0 - dz, lon0 + dz)
-                    ax_map.set_ylim(lat0 - dz, lat0 + dz)
-                    ax_map.set_xlabel("Lon")
-                    ax_map.set_ylabel("Lat")
-            else:
-                ax_map.set_axis_off()
+                else:
+                    ax_map.set_axis_off()
+                    continue
+                ax_map.plot(lon0, lat0, marker="o", color="red", markersize=5)
+                dz = float(cfg.get("map_zoom", 0.1))
+                ax_map.set_xlim(lon0 - dz, lon0 + dz)
+                ax_map.set_ylim(lat0 - dz, lat0 + dz)
+                ax_map.set_xlabel("Lon")
+                ax_map.set_ylabel("Lat")
 
             fig.tight_layout()
             fname = f"{sid_full}_{name}_{_normalize_var_name(var)}.png".replace(" ", "_")

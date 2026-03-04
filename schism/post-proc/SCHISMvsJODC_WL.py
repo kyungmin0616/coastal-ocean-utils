@@ -16,16 +16,16 @@ from __future__ import annotations
 DEFAULT_CONFIG = {
     "model": {
         "runs": [
-            "/scratch2/08924/kmpark/SOB/post-proc/npz/RUN01g_JODC.npz",
-            "/scratch2/08924/kmpark/SOB/post-proc/npz/RUN03a_JODC.npz",
-            "/scratch2/08924/kmpark/SOB/post-proc/npz/RUN04a_JODC.npz",
-            "/scratch2/08924/kmpark/SOB/post-proc/npz/RUN05a_JODC.npz",
+            "./npz/RUN01g_JODC.npz",
+            "./npz/RUN03a_JODC.npz",
+            "./npz/RUN04a_JODC.npz",
+            "./npz/RUN05a_JODC.npz",
         ],
         "labels": ["RUN01g", "RUN03a", "RUN04a", "RUN05a"],
         "time_offset_days": [0.0],
         "npz_time_mode": "absolute",  # absolute | relative | auto
         "apply_time_offset_to_npz": False,
-        "demean": True,
+        "demean": True, #remove mean to compare anomaly/tidal variability (shape/phase) rather than absolute water-level datum.
         "filter": {
             "obs": False,
             "model": False,
@@ -34,27 +34,32 @@ DEFAULT_CONFIG = {
         },
     },
     "obs": {
-        "path": "/scratch2/08924/kmpark/SOB/post-proc/npz/jodc_tide_all.npz",
+        "path": "./npz/jodc_tide_all.npz",
         # Optional station-specific observation datum offsets (meters).
         # Positive offset means: obs_corrected = obs_raw + offset.
-        "station_offsets": {"MA11": -2.609, "0112": -1.89, "2003": -0.875},
+        "station_offsets": None,#{"MA11": -2.609, "0112": -1.89, "2003": -0.875},
     },
     "stations": {
-        "bpfile": "/scratch2/08924/kmpark/SOB/post-proc/station_jodc.bp",
-        "list": None,
+        "bpfile": "./stations/station_jodc.bp",
+        "list": None, # optional station subset (ids/names); None=all
     },
     "time": {
-        "start": "2012-03-1 00:00:00",
-        "end": "2012-03-14 00:00:00",
+        "start": "2013-03-1 00:00:00",
+        "end": "2013-03-14 00:00:00",
         "resample": {"obs": "h", "model": "h"},
         "progress_every": 1,
     },
     "map": {
-        "grid": "/scratch2/08924/kmpark/SOB/run/RUN01d/hgrid.gr3",
+        "grid": "../run/RUN04a/hgrid.gr3",
         "zoom_deg": 0.1,
+        "region": {
+            "shapefile": "./shp/SOB.shp",  # set to None to skip shapefile background
+            "use_shapefile": True,
+            "subset_bbox": None,  # reserved for future use
+        },
     },
     "output": {
-        "dir": "/scratch2/08924/kmpark/SOB/post-proc/CompJODC_01g03a04a05a",
+        "dir": "./CompObs/CompJODC_WL_01g03a04a05a",
         "save_plots": True,
         "log_station_skips": True,
     },
@@ -83,6 +88,7 @@ from pylib import (
     num2date,
     read,
     read_schism_bpfile,
+    read_shapefile_data,
     deep_update_dict,
     init_mpi_runtime,
     rank_log,
@@ -127,6 +133,25 @@ def _resolve_path(path_like: str) -> Path:
     if path.is_absolute():
         return path
     return (SCRIPT_DIR / path).resolve()
+
+
+def _resolve_map_region(region_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    shapefile = region_cfg.get("shapefile")
+    use_shapefile = bool(region_cfg.get("use_shapefile", bool(shapefile)))
+    px = py = None
+    if use_shapefile and shapefile:
+        shp_path = Path(str(shapefile))
+        if not shp_path.is_absolute():
+            shp_path = (SCRIPT_DIR / shp_path).resolve()
+        if shp_path.exists():
+            try:
+                bp = read_shapefile_data(str(shp_path))
+                px, py = bp.xy.T
+            except Exception as exc:
+                log(f"[WARN] Failed to read region shapefile {shp_path}: {exc}", rank0_only=True)
+        else:
+            log(f"[WARN] Region shapefile not found: {shp_path}", rank0_only=True)
+    return {"px": px, "py": py}
 
 
 def _parse_time_value(value: Any) -> float:
@@ -547,6 +572,7 @@ def _canonical_to_runtime_config(canonical_cfg: Dict[str, Any]) -> Dict[str, Any
         "progress_every": int(time_cfg.get("progress_every", 1)),
         "grid": map_cfg.get("grid"),
         "map_zoom": float(map_cfg.get("zoom_deg", 0.1)),
+        "map_region": dict(map_cfg.get("region", {})),
         "obs_station_offsets": obs_cfg.get("station_offsets", {}),
     }
 
@@ -742,6 +768,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             gd = read(str(grid_path))
         except Exception as exc:
             log(f"[WARN] Failed to read grid {grid_path}: {exc}", rank0_only=True)
+    region = _resolve_map_region(cfg.get("map_region", {}))
 
     model_runs: List[Dict[str, Any]] = []
     for run_path, tag, offset in zip(cfg["runs"], cfg["tags"], cfg["model_time_offset_days"]):
@@ -839,7 +866,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 )
 
                 # left panel: station location map
-                if gd is not None:
+                has_region_bg = region.get("px") is not None and region.get("py") is not None
+                if has_region_bg:
+                    # If shapefile background exists, use it and skip grid boundary.
+                    ax_map.plot(region["px"], region["py"], "k-", lw=0.8, alpha=0.8)
+                elif gd is not None:
                     try:
                         gd.plot_bnd(ax=ax_map)
                     except Exception as exc:
