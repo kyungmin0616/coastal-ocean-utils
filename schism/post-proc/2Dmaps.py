@@ -6,68 +6,67 @@ with temporal aggregation: --tmean {none,hourly,daily,monthly}
 """
 
 # =====================
-# Config
+# Configuration
 # =====================
 USER_CONFIG = {
     "enable": True,
-
-    # --- Experiment-driven paths ---
-    "exp": "RUN04a",                                # e.g., RUN01a/RUN01b/...
-    "base_run_dir": "/scratch2/08924/kmpark/SOB/run/", # parent dir for runs
-    "base_outdir": "./images/",                      # parent dir for images
-
-    # If any are None, they'll be derived from exp:
-    "hgrid": None,   # -> {base_run_dir}/{exp}/hgrid.gr3
-    "run": None,     # -> {base_run_dir}/{exp}/outputs
-    "outdir": None,  # -> {base_outdir}/{exp}
-
-    # Range & time
-    "start": None,             # None -> auto from discovered stacks
-    "end": None,               # None -> auto from discovered stacks
-    "refdate": "2017-01-02", # It is not used when "apply_param_start_time": True
-    "apply_param_start_time": True,
-    "apply_utc_start": False,
-    "param_nml": None,          # if None: auto-detect from run dir
-
-    # Layer & intra-file aggregation
-    "layer": -1,              # -1 = surface
-    "agg": "inst",            # file-mean or inst (inst -> all steps when tmean=none)
-
-    # Layout & variables
-    "layout": "ALL",          # EC, TS, ALL, SINGLE
-    "vars": None,
-
-    # Plot
-    "prefix": "",
-    "dpi": 500,
-    "skip_existing": False,    # True: skip if output PNG already exists
-    "cbars": "each",          # each, shared, none
-    "proj": "PlateCarree",
-    "extent": None,           # [xmin xmax ymin ymax]
-    "coastline": False,
-    "bnd": False,
-    "bnd_color": "k",
-    "bnd_lw": 0.6,
-
-    # MPI & temporal mean
-    "mpi": True,
-    "tmean": "none",          # none | hourly | daily | monthly
-    "mpi_show_assignment": True,
-    "mpi_log_every": 1,         # print rank progress every N local stacks
-    "mpi_rank_logs": False,     # write per-rank logs in outdir
-
-    # Reporting
-    "report_stack_info": False,
-    "stack_span_hours": None,
-
-    # Stack screening
-    "stack_check_mode": "light",        # none | light | size | light+size
-    "stack_check_all_files": False,     # False: check primary file only
-    "stack_size_ratio_min": 0.70,       # for size/light+size
-    "stack_size_min_bytes": None,       # optional absolute size floor
-
-    # Temporal-mean accumulator dtype
-    "accum_dtype": "float32", # float32 | float64
+    "model": {
+        "exp": "RUN04a",  # e.g., RUN01a/RUN01b/...
+        "base_run_dir": "/scratch2/08924/kmpark/SOB/run/",
+        # If None, derive from model.exp/model.base_run_dir.
+        "hgrid": None,
+        "run": None,
+        "refdate": "2017-01-02",  # ignored when apply_param_start_time is True
+        "apply_param_start_time": True,
+        "apply_utc_start": False,
+        "param_nml": None,
+        "layer": -1,  # -1 = surface
+        "agg": "inst",  # file-mean | inst
+    },
+    "time": {
+        # Canonical stack range names.
+        "stack_start": None,  # None -> auto from discovered stacks
+        "stack_end": None,  # None -> auto from discovered stacks
+        "tmean": "none",  # none | hourly | daily | monthly
+        "stack_span_hours": None,
+    },
+    "map": {
+        "proj": "PlateCarree",
+        "extent": None,  # [xmin xmax ymin ymax]
+    },
+    "output": {
+        "base_outdir": "./images/",
+        # If None, derive from output.base_outdir/model.exp.
+        "dir": None,
+        "prefix": "",
+        "dpi": 500,
+        "skip_existing": False,
+        "report_stack_info": False,
+    },
+    "plot": {
+        "layout": "ALL",  # EC, TS, ALL, SINGLE
+        "vars": None,
+        "cbars": "each",  # each, shared, none
+        "coastline": False,
+        "bnd": False,
+        "bnd_color": "k",
+        "bnd_lw": 0.6,
+    },
+    "mpi": {
+        "enabled": True,
+        "show_assignment": True,
+        "log_every": 1,  # print rank progress every N local stacks
+        "rank_logs": False,  # write per-rank logs in outdir
+    },
+    "checks": {
+        "stack_mode": "light",  # none | light | size | light+size
+        "check_all_files": False,  # False: check primary file only
+        "size_ratio_min": 0.70,  # for size/light+size
+        "size_min_bytes": None,  # optional absolute size floor
+    },
+    "runtime": {
+        "accum_dtype": "float32",  # float32 | float64
+    },
 }
 
 # ---- headless & cluster guards ----
@@ -79,6 +78,7 @@ if "frontera" in (os.environ.get("HOSTNAME", "").lower(), os.environ.get("TACC_S
 # ---- std libs ----
 import sys
 import argparse
+import copy as pycopy
 from pathlib import Path
 import re
 from glob import glob
@@ -174,8 +174,8 @@ def parse_args():
     p.add_argument("--hgrid")
     p.add_argument("--run")
     p.add_argument("--outdir")
-    p.add_argument("--start", type=int)
-    p.add_argument("--end",   type=int)
+    p.add_argument("--stack-start", type=int, dest="stack_start")
+    p.add_argument("--stack-end", type=int, dest="stack_end")
     p.add_argument("--refdate")
     p.add_argument("--param-nml")
     p.add_argument("--apply-param-start-time", dest="apply_param_start_time", action="store_true")
@@ -615,65 +615,163 @@ def _maybe_collect(counter, every=8):
 
 def _merge_config(args):
     ad = vars(args).copy()
-    use_cfg = USER_CONFIG.get("enable", False) and not ad.get("no_config", False)
-
+    use_cfg = bool(USER_CONFIG.get("enable", False)) and not bool(ad.get("no_config", False))
     if use_cfg:
-        for k, v in USER_CONFIG.items():
-            if k == "enable":
-                continue
-            if ad.get(k) is None and v is not None:
-                ad[k] = v
+        cfg = pycopy.deepcopy(USER_CONFIG)
+    else:
+        cfg = {
+            "model": {},
+            "time": {},
+            "map": {},
+            "output": {},
+            "plot": {},
+            "mpi": {},
+            "checks": {},
+            "runtime": {},
+        }
 
-    exp = ad.get("exp")
-    base_run_dir = ad.get("base_run_dir", USER_CONFIG.get("base_run_dir"))
-    base_outdir  = ad.get("base_outdir",  USER_CONFIG.get("base_outdir"))
+    model_cfg = cfg.setdefault("model", {})
+    time_cfg = cfg.setdefault("time", {})
+    map_cfg = cfg.setdefault("map", {})
+    output_cfg = cfg.setdefault("output", {})
+    plot_cfg = cfg.setdefault("plot", {})
+    mpi_cfg = cfg.setdefault("mpi", {})
+    checks_cfg = cfg.setdefault("checks", {})
+    runtime_cfg = cfg.setdefault("runtime", {})
 
+    if ad.get("exp") is not None:
+        model_cfg["exp"] = ad.get("exp")
+    if ad.get("base_run_dir") is not None:
+        model_cfg["base_run_dir"] = ad.get("base_run_dir")
+    if ad.get("base_outdir") is not None:
+        output_cfg["base_outdir"] = ad.get("base_outdir")
+    if ad.get("hgrid") is not None:
+        model_cfg["hgrid"] = ad.get("hgrid")
+    if ad.get("run") is not None:
+        model_cfg["run"] = ad.get("run")
+    if ad.get("outdir") is not None:
+        output_cfg["dir"] = ad.get("outdir")
+    if ad.get("stack_start") is not None:
+        time_cfg["stack_start"] = int(ad.get("stack_start"))
+    if ad.get("stack_end") is not None:
+        time_cfg["stack_end"] = int(ad.get("stack_end"))
+    if ad.get("refdate") is not None:
+        model_cfg["refdate"] = ad.get("refdate")
+    if ad.get("param_nml") is not None:
+        model_cfg["param_nml"] = ad.get("param_nml")
+    if ad.get("apply_param_start_time") is not None:
+        model_cfg["apply_param_start_time"] = bool(ad.get("apply_param_start_time"))
+    if ad.get("apply_utc_start") is not None:
+        model_cfg["apply_utc_start"] = bool(ad.get("apply_utc_start"))
+    if ad.get("layer") is not None:
+        model_cfg["layer"] = int(ad.get("layer"))
+    if ad.get("agg") is not None:
+        model_cfg["agg"] = str(ad.get("agg"))
+    if ad.get("layout") is not None:
+        plot_cfg["layout"] = str(ad.get("layout"))
+    if ad.get("vars") is not None:
+        plot_cfg["vars"] = list(ad.get("vars"))
+    if ad.get("prefix") is not None:
+        output_cfg["prefix"] = str(ad.get("prefix"))
+    if ad.get("dpi") is not None:
+        output_cfg["dpi"] = int(ad.get("dpi"))
+    if ad.get("skip_existing") is not None:
+        output_cfg["skip_existing"] = bool(ad.get("skip_existing"))
+    if ad.get("cbars") is not None:
+        plot_cfg["cbars"] = str(ad.get("cbars"))
+    if ad.get("proj") is not None:
+        map_cfg["proj"] = str(ad.get("proj"))
+    if ad.get("extent") is not None:
+        map_cfg["extent"] = list(ad.get("extent"))
+    if bool(ad.get("no_coastline")):
+        plot_cfg["coastline"] = False
+    if bool(ad.get("bnd")):
+        plot_cfg["bnd"] = True
+    if ad.get("bnd_color") is not None:
+        plot_cfg["bnd_color"] = str(ad.get("bnd_color"))
+    if ad.get("bnd_lw") is not None:
+        plot_cfg["bnd_lw"] = float(ad.get("bnd_lw"))
+    if ad.get("tmean") is not None:
+        time_cfg["tmean"] = str(ad.get("tmean"))
+    if ad.get("mpi_show_assignment") is not None:
+        mpi_cfg["show_assignment"] = bool(ad.get("mpi_show_assignment"))
+    if ad.get("mpi_log_every") is not None:
+        mpi_cfg["log_every"] = int(ad.get("mpi_log_every"))
+    if ad.get("mpi_rank_logs") is not None:
+        mpi_cfg["rank_logs"] = bool(ad.get("mpi_rank_logs"))
+    if bool(ad.get("report_stack_info")):
+        output_cfg["report_stack_info"] = True
+    if ad.get("stack_span_hours") is not None:
+        time_cfg["stack_span_hours"] = float(ad.get("stack_span_hours"))
+    if ad.get("stack_check_mode") is not None:
+        checks_cfg["stack_mode"] = str(ad.get("stack_check_mode"))
+    if ad.get("stack_check_all_files") is not None:
+        checks_cfg["check_all_files"] = bool(ad.get("stack_check_all_files"))
+    if ad.get("stack_size_ratio_min") is not None:
+        checks_cfg["size_ratio_min"] = float(ad.get("stack_size_ratio_min"))
+    if ad.get("stack_size_min_bytes") is not None:
+        checks_cfg["size_min_bytes"] = int(ad.get("stack_size_min_bytes"))
+    if ad.get("accum_dtype") is not None:
+        runtime_cfg["accum_dtype"] = str(ad.get("accum_dtype"))
+
+    exp = model_cfg.get("exp")
+    base_run_dir = model_cfg.get("base_run_dir")
+    base_outdir = output_cfg.get("base_outdir")
     if exp:
-        if ad.get("hgrid") is None and base_run_dir:
-            ad["hgrid"] = str(Path(base_run_dir) / exp / "hgrid.gr3")
-        if ad.get("run") is None and base_run_dir:
-            ad["run"] = str(Path(base_run_dir) / exp / "outputs")
-        if ad.get("outdir") is None and base_outdir:
-            ad["outdir"] = str(Path(base_outdir) / exp)
+        if model_cfg.get("hgrid") is None and base_run_dir:
+            model_cfg["hgrid"] = str(Path(base_run_dir) / exp / "hgrid.gr3")
+        if model_cfg.get("run") is None and base_run_dir:
+            model_cfg["run"] = str(Path(base_run_dir) / exp / "outputs")
+        if output_cfg.get("dir") is None and base_outdir:
+            output_cfg["dir"] = str(Path(base_outdir) / exp)
 
-    # defaults
-    ad.setdefault("refdate", "2022-01-02")
-    ad.setdefault("apply_param_start_time", USER_CONFIG.get("apply_param_start_time", True))
-    ad.setdefault("apply_utc_start", USER_CONFIG.get("apply_utc_start", False))
-    ad.setdefault("param_nml", USER_CONFIG.get("param_nml", None))
-    ad.setdefault("layer", -1)
-    ad.setdefault("agg", "inst")
-    ad.setdefault("layout", "EC")
-    ad.setdefault("dpi", 200)
-    ad.setdefault("skip_existing", USER_CONFIG.get("skip_existing", False))
-    ad.setdefault("cbars", "each")
-    ad.setdefault("proj", "PlateCarree")
-    if ad.get("no_coastline"):
-        ad["coastline"] = False
-    ad.setdefault("coastline", USER_CONFIG.get("coastline", True))
-    if ad.get("bnd"):
-        ad["bnd"] = True
-    ad.setdefault("bnd", USER_CONFIG.get("bnd", False))
-    ad.setdefault("bnd_color", USER_CONFIG.get("bnd_color", "k"))
-    ad.setdefault("bnd_lw", USER_CONFIG.get("bnd_lw", 0.6))
-    ad.setdefault("mpi", USER_CONFIG.get("mpi", True))
-    ad.setdefault("tmean", USER_CONFIG.get("tmean", "none"))
-    ad.setdefault("mpi_show_assignment", USER_CONFIG.get("mpi_show_assignment", True))
-    ad.setdefault("mpi_log_every", USER_CONFIG.get("mpi_log_every", 1))
-    ad.setdefault("mpi_rank_logs", USER_CONFIG.get("mpi_rank_logs", False))
-    ad.setdefault("report_stack_info", USER_CONFIG.get("report_stack_info", False))
-    ad.setdefault("stack_span_hours", USER_CONFIG.get("stack_span_hours", None))
-    ad.setdefault("stack_check_mode", USER_CONFIG.get("stack_check_mode", "light"))
-    ad.setdefault("stack_check_all_files", USER_CONFIG.get("stack_check_all_files", False))
-    ad.setdefault("stack_size_ratio_min", USER_CONFIG.get("stack_size_ratio_min", 0.70))
-    ad.setdefault("stack_size_min_bytes", USER_CONFIG.get("stack_size_min_bytes", None))
-    ad.setdefault("accum_dtype", USER_CONFIG.get("accum_dtype", "float32"))
+    merged = {
+        "exp": model_cfg.get("exp"),
+        "base_run_dir": model_cfg.get("base_run_dir"),
+        "base_outdir": output_cfg.get("base_outdir"),
+        "hgrid": model_cfg.get("hgrid"),
+        "run": model_cfg.get("run"),
+        "outdir": output_cfg.get("dir"),
+        "stack_start": time_cfg.get("stack_start"),
+        "stack_end": time_cfg.get("stack_end"),
+        "refdate": model_cfg.get("refdate", "2022-01-02"),
+        "apply_param_start_time": bool(model_cfg.get("apply_param_start_time", True)),
+        "apply_utc_start": bool(model_cfg.get("apply_utc_start", False)),
+        "param_nml": model_cfg.get("param_nml"),
+        "layer": int(model_cfg.get("layer", -1)),
+        "agg": str(model_cfg.get("agg", "inst")),
+        "layout": str(plot_cfg.get("layout", "EC")),
+        "vars": plot_cfg.get("vars"),
+        "prefix": str(output_cfg.get("prefix", "")),
+        "dpi": int(output_cfg.get("dpi", 200)),
+        "skip_existing": bool(output_cfg.get("skip_existing", False)),
+        "cbars": str(plot_cfg.get("cbars", "each")),
+        "proj": str(map_cfg.get("proj", "PlateCarree")),
+        "extent": map_cfg.get("extent"),
+        "coastline": bool(plot_cfg.get("coastline", True)),
+        "bnd": bool(plot_cfg.get("bnd", False)),
+        "bnd_color": str(plot_cfg.get("bnd_color", "k")),
+        "bnd_lw": float(plot_cfg.get("bnd_lw", 0.6)),
+        "mpi": bool(mpi_cfg.get("enabled", True)),
+        "tmean": str(time_cfg.get("tmean", "none")),
+        "mpi_show_assignment": bool(mpi_cfg.get("show_assignment", True)),
+        "mpi_log_every": int(mpi_cfg.get("log_every", 1)),
+        "mpi_rank_logs": bool(mpi_cfg.get("rank_logs", False)),
+        "report_stack_info": bool(output_cfg.get("report_stack_info", False)),
+        "stack_span_hours": time_cfg.get("stack_span_hours"),
+        "stack_check_mode": str(checks_cfg.get("stack_mode", "light")),
+        "stack_check_all_files": bool(checks_cfg.get("check_all_files", False)),
+        "stack_size_ratio_min": float(checks_cfg.get("size_ratio_min", 0.70)),
+        "stack_size_min_bytes": checks_cfg.get("size_min_bytes"),
+        "accum_dtype": str(runtime_cfg.get("accum_dtype", "float32")),
+        "no_mpi": bool(ad.get("no_mpi", False)),
+    }
 
-    missing = [k for k in ("hgrid", "run", "outdir") if ad.get(k) is None]
+    missing = [k for k in ("hgrid", "run", "outdir") if merged.get(k) is None]
     if missing:
         raise SystemExit(f"Missing required inputs: {missing}.")
 
-    return argparse.Namespace(**ad)
+    return argparse.Namespace(**merged)
 
 def _period_key(dt, mode):
     if mode == "hourly":
@@ -716,6 +814,7 @@ def main():
             f"[rank 0] run={args.run}\n"
             f"[rank 0] outdir={args.outdir}\n"
             f"[rank 0] skip_existing={skip_existing}\n"
+            f"[rank 0] stack_start={args.stack_start}, stack_end={args.stack_end}\n"
             f"[rank 0] time_origin_mode={'param.nml' if args.apply_param_start_time else 'refdate'}\n"
             f"[rank 0] tmean={args.tmean} (agg={args.agg})\n"
             f"[rank 0] accum_dtype={args.accum_dtype}",
@@ -762,11 +861,15 @@ def main():
             print("When --layout=SINGLE, pass exactly one variable via --vars", file=sys.stderr)
         sys.exit(2)
 
-    cands = _select_candidate_stacks(args.run, start=args.start, end=args.end)
+    cands = _select_candidate_stacks(args.run, start=args.stack_start, end=args.stack_end)
     if len(cands) == 0:
         if rank == 0:
-            print(f"[rank 0] No stack files found in {args.run} for range start={args.start}, end={args.end}.",
-                  file=sys.stderr, flush=True)
+            print(
+                f"[rank 0] No stack files found in {args.run} for range "
+                f"stack_start={args.stack_start}, stack_end={args.stack_end}.",
+                file=sys.stderr,
+                flush=True,
+            )
         sys.exit(2)
 
     stacks, skipped = _screen_stacks(

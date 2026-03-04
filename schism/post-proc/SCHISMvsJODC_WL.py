@@ -10,6 +10,60 @@ It keeps the original script untouched and focuses only on:
 
 from __future__ import annotations
 
+# =============================================================================
+# Configuration
+# =============================================================================
+DEFAULT_CONFIG = {
+    "model": {
+        "runs": [
+            "/scratch2/08924/kmpark/SOB/post-proc/npz/RUN01g_JODC.npz",
+            "/scratch2/08924/kmpark/SOB/post-proc/npz/RUN03a_JODC.npz",
+            "/scratch2/08924/kmpark/SOB/post-proc/npz/RUN04a_JODC.npz",
+            "/scratch2/08924/kmpark/SOB/post-proc/npz/RUN05a_JODC.npz",
+        ],
+        "labels": ["RUN01g", "RUN03a", "RUN04a", "RUN05a"],
+        "time_offset_days": [0.0],
+        "npz_time_mode": "absolute",  # absolute | relative | auto
+        "apply_time_offset_to_npz": False,
+        "demean": True,
+        "filter": {
+            "obs": False,
+            "model": False,
+            "cutoff_period_hours": 34.0,
+            "butterworth_order": 4,
+        },
+    },
+    "obs": {
+        "path": "/scratch2/08924/kmpark/SOB/post-proc/npz/jodc_tide_all.npz",
+        # Optional station-specific observation datum offsets (meters).
+        # Positive offset means: obs_corrected = obs_raw + offset.
+        "station_offsets": {"MA11": -2.609, "0112": -1.89, "2003": -0.875},
+    },
+    "stations": {
+        "bpfile": "/scratch2/08924/kmpark/SOB/post-proc/station_jodc.bp",
+        "list": None,
+    },
+    "time": {
+        "start": "2012-03-1 00:00:00",
+        "end": "2012-03-14 00:00:00",
+        "resample": {"obs": "h", "model": "h"},
+        "progress_every": 1,
+    },
+    "map": {
+        "grid": "/scratch2/08924/kmpark/SOB/run/RUN01d/hgrid.gr3",
+        "zoom_deg": 0.1,
+    },
+    "output": {
+        "dir": "/scratch2/08924/kmpark/SOB/post-proc/CompJODC_01g03a04a05a",
+        "save_plots": True,
+        "log_station_skips": True,
+    },
+    "plot": {
+        "ylim": [-1.5, 1.5],
+        "line_width": 1.8,
+    },
+}
+
 import argparse
 import json
 import os
@@ -29,6 +83,7 @@ from pylib import (
     num2date,
     read,
     read_schism_bpfile,
+    deep_update_dict,
     init_mpi_runtime,
     rank_log,
     report_work_assignment,
@@ -40,45 +95,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     signal = None
 
-# =============================================================================
-# Configuration
-# =============================================================================
 SCRIPT_DIR = Path(__file__).resolve().parent
-OBS_DEFAULT = SCRIPT_DIR / "npz" / "jodc_tide_all.npz"
-
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "runs": ["/scratch2/08924/kmpark/SOB/post-proc/npz/RUN01g_JODC.npz","/scratch2/08924/kmpark/SOB/post-proc/npz/RUN03a_JODC.npz","/scratch2/08924/kmpark/SOB/post-proc/npz/RUN04a_JODC.npz","/scratch2/08924/kmpark/SOB/post-proc/npz/RUN05a_JODC.npz"],
-    "tags": ["RUN01g", "RUN03a", "RUN04a", "RUN05a"],
-    "bpfile": "/scratch2/08924/kmpark/SOB/post-proc/station_jodc.bp",
-    "outdir": "/scratch2/08924/kmpark/SOB/post-proc/CompJODC_01g03a04a05a",
-    "obs_path": "/scratch2/08924/kmpark/SOB/post-proc/npz/jodc_tide_all.npz",
-    "start": "2012-03-1 00:00:00",
-    "end": "2012-03-14 00:00:00",
-    "model_start": None,
-    "model_time_offset_days": [0.0],
-    "npz_time_mode": "absolute",  # absolute | relative | auto
-    "apply_offset_to_npz": False,  # legacy fallback when npz_time_mode=absolute
-    "resample_obs": "h",
-    "resample_model": "h",
-    "demean": True,
-    "plot_ylim": [-1.5, 1.5],
-    "line_width": 1.8,
-    "save_plots": True,
-    "log_station_skips": True,
-    "filter_obs": False,
-    "filter_model": False,
-    "cutoff_period_hours": 34.0,
-    "butterworth_order": 4,
-    "station_list": None,
-    "progress_every": 1,
-    "grid": "/scratch2/08924/kmpark/SOB/run/RUN01d/hgrid.gr3",  # optional hgrid.gr3 for map boundary
-    "map_zoom": 0.1,  # half-width in degree around active station
-    # Optional station-specific observation datum offsets (meters).
-    # Positive offset means: obs_corrected = obs_raw + offset.
-    # Example:
-    # "obs_station_offsets": {"Abashiri": 0.12, "1234": -0.08}
-    "obs_station_offsets": {"MA11": -2.609, "0112": -1.89, "2003": -0.875},
-}
 
 # =============================================================================
 # MPI setup
@@ -385,92 +402,153 @@ def _build_station_info(bpfile: Path) -> Tuple[List[str], List[str], np.ndarray,
     return station_ids, station_vars, x, y
 
 
-def _load_config(args: argparse.Namespace) -> Dict[str, Any]:
-    cfg = dict(DEFAULT_CONFIG)
+def _build_canonical_config(args: argparse.Namespace) -> Dict[str, Any]:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if args.config:
         with open(args.config, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
-        cfg.update(user_cfg)
+        cfg = deep_update_dict(cfg, user_cfg, merge_list_of_dicts=False)
 
     if args.runs:
-        cfg["runs"] = list(args.runs)
+        cfg.setdefault("model", {})
+        cfg["model"]["runs"] = list(args.runs)
     if args.tags:
-        cfg["tags"] = list(args.tags)
+        cfg.setdefault("model", {})
+        cfg["model"]["labels"] = list(args.tags)
     if args.bpfile:
-        cfg["bpfile"] = args.bpfile
+        cfg.setdefault("stations", {})
+        cfg["stations"]["bpfile"] = args.bpfile
     if args.outdir:
-        cfg["outdir"] = args.outdir
+        cfg.setdefault("output", {})
+        cfg["output"]["dir"] = args.outdir
     if args.obs_path:
-        cfg["obs_path"] = args.obs_path
+        cfg.setdefault("obs", {})
+        cfg["obs"]["path"] = args.obs_path
     if args.start:
-        cfg["start"] = args.start
+        cfg.setdefault("time", {})
+        cfg["time"]["start"] = args.start
     if args.end:
-        cfg["end"] = args.end
+        cfg.setdefault("time", {})
+        cfg["time"]["end"] = args.end
     if args.resample_obs is not None:
-        cfg["resample_obs"] = args.resample_obs
+        cfg.setdefault("time", {})
+        cfg["time"].setdefault("resample", {})
+        cfg["time"]["resample"]["obs"] = args.resample_obs
     if args.resample_model is not None:
-        cfg["resample_model"] = args.resample_model
+        cfg.setdefault("time", {})
+        cfg["time"].setdefault("resample", {})
+        cfg["time"]["resample"]["model"] = args.resample_model
     if args.station_list:
-        cfg["station_list"] = list(args.station_list)
+        cfg.setdefault("stations", {})
+        cfg["stations"]["list"] = list(args.station_list)
     if args.demean is not None:
-        cfg["demean"] = bool(args.demean)
+        cfg.setdefault("model", {})
+        cfg["model"]["demean"] = bool(args.demean)
     if args.save_plots is not None:
-        cfg["save_plots"] = bool(args.save_plots)
+        cfg.setdefault("output", {})
+        cfg["output"]["save_plots"] = bool(args.save_plots)
     if args.log_station_skips is not None:
-        cfg["log_station_skips"] = bool(args.log_station_skips)
+        cfg.setdefault("output", {})
+        cfg["output"]["log_station_skips"] = bool(args.log_station_skips)
     if args.filter_obs is not None:
-        cfg["filter_obs"] = bool(args.filter_obs)
+        cfg.setdefault("model", {})
+        cfg["model"].setdefault("filter", {})
+        cfg["model"]["filter"]["obs"] = bool(args.filter_obs)
     if args.filter_model is not None:
-        cfg["filter_model"] = bool(args.filter_model)
+        cfg.setdefault("model", {})
+        cfg["model"].setdefault("filter", {})
+        cfg["model"]["filter"]["model"] = bool(args.filter_model)
     if args.cutoff_period_hours is not None:
-        cfg["cutoff_period_hours"] = float(args.cutoff_period_hours)
+        cfg.setdefault("model", {})
+        cfg["model"].setdefault("filter", {})
+        cfg["model"]["filter"]["cutoff_period_hours"] = float(args.cutoff_period_hours)
     if args.butterworth_order is not None:
-        cfg["butterworth_order"] = int(args.butterworth_order)
+        cfg.setdefault("model", {})
+        cfg["model"].setdefault("filter", {})
+        cfg["model"]["filter"]["butterworth_order"] = int(args.butterworth_order)
     if args.line_width is not None:
-        cfg["line_width"] = float(args.line_width)
+        cfg.setdefault("plot", {})
+        cfg["plot"]["line_width"] = float(args.line_width)
     if args.plot_ymin is not None or args.plot_ymax is not None:
-        ymin = args.plot_ymin if args.plot_ymin is not None else cfg.get("plot_ylim", [None, None])[0]
-        ymax = args.plot_ymax if args.plot_ymax is not None else cfg.get("plot_ylim", [None, None])[1]
-        cfg["plot_ylim"] = [ymin, ymax]
+        cfg.setdefault("plot", {})
+        ylim = list(cfg.get("plot", {}).get("ylim", [None, None]))
+        ymin = args.plot_ymin if args.plot_ymin is not None else ylim[0]
+        ymax = args.plot_ymax if args.plot_ymax is not None else ylim[1]
+        cfg["plot"]["ylim"] = [ymin, ymax]
     if args.progress_every is not None:
-        cfg["progress_every"] = int(args.progress_every)
+        cfg.setdefault("time", {})
+        cfg["time"]["progress_every"] = int(args.progress_every)
     if args.grid:
-        cfg["grid"] = args.grid
+        cfg.setdefault("map", {})
+        cfg["map"]["grid"] = args.grid
     if args.map_zoom is not None:
-        cfg["map_zoom"] = float(args.map_zoom)
+        cfg.setdefault("map", {})
+        cfg["map"]["zoom_deg"] = float(args.map_zoom)
     if args.model_time_offset_days:
-        cfg["model_time_offset_days"] = [float(v) for v in args.model_time_offset_days]
-    elif args.model_start:
-        cfg["model_time_offset_days"] = [float(datenum(args.model_start))]
+        cfg.setdefault("model", {})
+        cfg["model"]["time_offset_days"] = [float(v) for v in args.model_time_offset_days]
     if args.npz_time_mode:
-        cfg["npz_time_mode"] = str(args.npz_time_mode).strip().lower()
+        cfg.setdefault("model", {})
+        cfg["model"]["npz_time_mode"] = str(args.npz_time_mode).strip().lower()
     if args.apply_offset_to_npz is not None:
-        cfg["apply_offset_to_npz"] = bool(args.apply_offset_to_npz)
+        cfg.setdefault("model", {})
+        cfg["model"]["apply_time_offset_to_npz"] = bool(args.apply_offset_to_npz)
+    return cfg
 
-    runs = list(cfg.get("runs", []))
-    tags = list(cfg.get("tags", []))
+
+def _canonical_to_runtime_config(canonical_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    model_cfg = dict(canonical_cfg.get("model", {}))
+    obs_cfg = dict(canonical_cfg.get("obs", {}))
+    stations_cfg = dict(canonical_cfg.get("stations", {}))
+    time_cfg = dict(canonical_cfg.get("time", {}))
+    time_resample = dict(time_cfg.get("resample", {}))
+    map_cfg = dict(canonical_cfg.get("map", {}))
+    output_cfg = dict(canonical_cfg.get("output", {}))
+    plot_cfg = dict(canonical_cfg.get("plot", {}))
+    filter_cfg = dict(model_cfg.get("filter", {}))
+
+    runs = list(model_cfg.get("runs", []))
+    tags = list(model_cfg.get("labels", []))
     if len(runs) == 0:
         raise ValueError("No runs configured.")
     if len(tags) == 1 and len(runs) > 1:
         tags = tags * len(runs)
     if len(tags) != len(runs):
-        raise ValueError(f"tags length ({len(tags)}) must match runs length ({len(runs)}).")
-    if "model_time_offset_days" not in cfg and cfg.get("model_start"):
-        cfg["model_time_offset_days"] = [float(datenum(cfg["model_start"]))]
-    elif cfg.get("model_start") and "model_time_offset_days" in cfg:
-        # Respect explicit offsets when provided; otherwise keep model_start as metadata.
-        pass
+        raise ValueError(f"labels length ({len(tags)}) must match runs length ({len(runs)}).")
 
-    offsets = _expand_scalar_or_list(cfg.get("model_time_offset_days", [0.0]), len(runs))
-    mode = str(cfg.get("npz_time_mode", "absolute")).strip().lower()
+    offsets = _expand_scalar_or_list(model_cfg.get("time_offset_days", [0.0]), len(runs))
+    mode = str(model_cfg.get("npz_time_mode", "absolute")).strip().lower()
     if mode not in {"absolute", "relative", "auto"}:
-        raise ValueError(f"Invalid npz_time_mode={mode}; expected absolute|relative|auto")
-    cfg["runs"] = runs
-    cfg["tags"] = tags
-    cfg["model_time_offset_days"] = [float(x) for x in offsets]
-    cfg["npz_time_mode"] = mode
-    cfg["apply_offset_to_npz"] = bool(cfg.get("apply_offset_to_npz", False))
-    return cfg
+        raise ValueError(f"Invalid model.npz_time_mode={mode}; expected absolute|relative|auto")
+
+    return {
+        "runs": runs,
+        "tags": tags,
+        "bpfile": stations_cfg.get("bpfile"),
+        "outdir": output_cfg.get("dir"),
+        "obs_path": obs_cfg.get("path"),
+        "start": time_cfg.get("start"),
+        "end": time_cfg.get("end"),
+        "model_time_offset_days": [float(x) for x in offsets],
+        "npz_time_mode": mode,
+        "apply_offset_to_npz": bool(model_cfg.get("apply_time_offset_to_npz", False)),
+        "resample_obs": time_resample.get("obs", "h"),
+        "resample_model": time_resample.get("model", "h"),
+        "station_list": stations_cfg.get("list"),
+        "demean": bool(model_cfg.get("demean", True)),
+        "plot_ylim": list(plot_cfg.get("ylim", [-1.5, 1.5])),
+        "line_width": float(plot_cfg.get("line_width", 1.8)),
+        "save_plots": bool(output_cfg.get("save_plots", True)),
+        "log_station_skips": bool(output_cfg.get("log_station_skips", True)),
+        "filter_obs": bool(filter_cfg.get("obs", False)),
+        "filter_model": bool(filter_cfg.get("model", False)),
+        "cutoff_period_hours": float(filter_cfg.get("cutoff_period_hours", 34.0)),
+        "butterworth_order": int(filter_cfg.get("butterworth_order", 4)),
+        "progress_every": int(time_cfg.get("progress_every", 1)),
+        "grid": map_cfg.get("grid"),
+        "map_zoom": float(map_cfg.get("zoom_deg", 0.1)),
+        "obs_station_offsets": obs_cfg.get("station_offsets", {}),
+    }
 
 
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -483,7 +561,6 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--obs-path", help="Path to jodc_tide_all.npz.")
     p.add_argument("--start", help="Start time (string or datenum).")
     p.add_argument("--end", help="End time (string or datenum).")
-    p.add_argument("--model-start", help="Model start datetime used as offset for model time.")
     p.add_argument(
         "--model-time-offset-days",
         nargs="+",
@@ -554,7 +631,8 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = _parse_args(argv)
-    cfg = _load_config(args)
+    canonical_cfg = _build_canonical_config(args)
+    cfg = _canonical_to_runtime_config(canonical_cfg)
 
     outdir = _resolve_path(str(cfg["outdir"]))
     if RANK == 0:
@@ -565,7 +643,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     cfg_snapshot = outdir / "wl_config_used.json"
     if RANK == 0:
         with open(cfg_snapshot, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
+            json.dump(canonical_cfg, f, indent=2)
     if MPI:
         COMM.Barrier()
 
@@ -595,7 +673,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     t0 = time.time()
     obs_map = _load_observations(obs_path)
     obs_lookup = _build_station_lookup(obs_map)
-    raw_offsets = cfg.get("obs_station_offsets", cfg.get("obs_datum_offsets", {}))
+    raw_offsets = cfg.get("obs_station_offsets", {})
     obs_station_offsets = _build_station_offset_map(raw_offsets)
     log(f"Loaded observations for {len(obs_map)} stations", rank0_only=True)
     if obs_station_offsets:

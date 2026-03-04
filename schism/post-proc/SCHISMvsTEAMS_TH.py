@@ -13,6 +13,62 @@ This refactored task script supports:
 
 from __future__ import annotations
 
+# =============================================================================
+# Configuration
+# =============================================================================
+CONFIG = dict(
+    model={
+        "runs": [
+            "/scratch2/08924/kmpark/post-proc/npz/RUN01d_SB_d2.npz",
+            "/scratch2/08924/kmpark/post-proc/npz/RUN01e_SB_d2.npz",
+            "/scratch2/08924/kmpark/post-proc/npz/RUN02a_SB_d2.npz",
+        ],
+        "labels": None,
+        "variables": ["temp", "sal"],
+        "time_units": "datenum",  # datenum | seconds
+        "time_offset": "2017-01-02",  # datenum-compatible string or offset days
+    },
+    obs={
+        "path": "/scratch2/08924/kmpark/post-proc/npz/sendai_d2_timeseries.npz",
+    },
+    stations={
+        "bpfile": "station_sendai_d2.bp",
+        "list": None,
+        "depth": None,
+        "depth_tol": 0.5,
+        "depth_policy": "mean",  # mean | first
+    },
+    time={
+        "start": "2017-01-02",
+        "end": "2017-12-31",
+        "resample": {"obs": "H", "model": "H"},
+    },
+    map={
+        "grid": "../RUN01d/hgrid.gr3",
+        "zoom_deg": 0.1,
+    },
+    output={
+        "dir": "./CompTEAMS_RUN01e02a_SB_d2",
+        "save_plots": True,
+        "write_task_metrics": True,
+        "write_scatter_plots": True,
+        "task_name": "th",
+        "experiment_id": None,
+        "metrics_raw_name": "TH_metrics_raw.csv",
+        "metrics_station_name": "SCHISMvsTEAMS_stats.csv",
+        "metrics_model_name": "TH_stats_by_model.csv",
+        "manifest_name": "TH_manifest.json",
+    },
+    plot={
+        "scatter_alpha": 0.65,
+        "scatter_size": 9,
+        "scatter_cmap": "viridis",
+    },
+    debug={
+        "times": True,
+    },
+)
+
 import argparse
 import copy
 import json
@@ -40,46 +96,6 @@ from pylib import (
     compute_skill_metrics,
     write_csv_rows,
     read_csv_rows,
-)
-
-# =============================================================================
-# Configuration
-# =============================================================================
-CONFIG: Dict[str, Any] = dict(
-    teams_npz="/scratch2/08924/kmpark/post-proc/npz/sendai_d2_timeseries.npz",
-    schism_npzs=[
-        "/scratch2/08924/kmpark/post-proc/npz/RUN01d_SB_d2.npz",
-        "/scratch2/08924/kmpark/post-proc/npz/RUN01e_SB_d2.npz",
-        "/scratch2/08924/kmpark/post-proc/npz/RUN02a_SB_d2.npz",
-    ],
-    bpfile="station_sendai_d2.bp",
-    outdir="./CompTEAMS_RUN01e02a_SB_d2",
-    schism_labels=None,
-    vars=["temp", "sal"],
-    resample="H",
-    start="2017-01-02",
-    end="2017-12-31",
-    depth=None,
-    depth_tol=0.5,
-    depth_policy="mean",  # mean | first
-    model_time_units="datenum",  # datenum | seconds
-    model_time_offset=datenum(2017, 1, 2),  # days
-    station_list=None,
-    debug_times=True,
-    grid="../RUN01d/hgrid.gr3",
-    map_zoom=0.1,
-    save_plots=True,
-    write_task_metrics=True,
-    write_integrated_scatter=True,
-    task_name="th",
-    experiment_id=None,
-    metrics_raw_name="TH_metrics_raw.csv",
-    metrics_station_name="SCHISMvsTEAMS_stats.csv",
-    metrics_model_name="TH_stats_by_model.csv",
-    manifest_name="TH_manifest.json",
-    scatter_alpha=0.65,
-    scatter_size=9,
-    scatter_cmap="viridis",
 )
 
 TH_STATION_FIELDS = [
@@ -379,8 +395,6 @@ def _time_first(arr: np.ndarray, nt: int) -> np.ndarray:
 
 def _load_schism_models(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     paths = list(cfg.get("schism_npzs") or [])
-    if not paths and cfg.get("schism_npz"):
-        paths = [cfg.get("schism_npz")]
     labels = cfg.get("schism_labels")
     models: List[Dict[str, Any]] = []
     for i, p in enumerate(paths):
@@ -613,7 +627,7 @@ def _write_integrated_scatter(raw_rows: List[Dict[str, Any]], cfg: Dict[str, Any
     return files
 
 
-def _build_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
+def _build_canonical_config(args: argparse.Namespace) -> Dict[str, Any]:
     cfg = copy.deepcopy(CONFIG)
     if args.config:
         with open(args.config, "r", encoding="utf-8") as f:
@@ -621,57 +635,135 @@ def _build_runtime_config(args: argparse.Namespace) -> Dict[str, Any]:
         cfg = _deep_update(cfg, user_cfg)
 
     if args.teams:
-        cfg["teams_npz"] = args.teams
+        cfg.setdefault("obs", {})
+        cfg["obs"]["path"] = args.teams
     if args.schism:
-        cfg["schism_npzs"] = list(args.schism)
+        cfg.setdefault("model", {})
+        cfg["model"]["runs"] = list(args.schism)
     if args.schism_labels:
-        cfg["schism_labels"] = list(args.schism_labels)
+        cfg.setdefault("model", {})
+        cfg["model"]["labels"] = list(args.schism_labels)
     if args.bp:
-        cfg["bpfile"] = args.bp
+        cfg.setdefault("stations", {})
+        cfg["stations"]["bpfile"] = args.bp
     if args.outdir:
-        cfg["outdir"] = args.outdir
+        cfg.setdefault("output", {})
+        cfg["output"]["dir"] = args.outdir
     if args.vars:
-        cfg["vars"] = list(args.vars)
+        cfg.setdefault("model", {})
+        cfg["model"]["variables"] = list(args.vars)
     if args.resample:
-        cfg["resample"] = args.resample
+        cfg.setdefault("time", {})
+        cfg["time"].setdefault("resample", {})
+        cfg["time"]["resample"]["obs"] = args.resample
+        cfg["time"]["resample"]["model"] = args.resample
     if args.start:
-        cfg["start"] = args.start
+        cfg.setdefault("time", {})
+        cfg["time"]["start"] = args.start
     if args.end:
-        cfg["end"] = args.end
+        cfg.setdefault("time", {})
+        cfg["time"]["end"] = args.end
     if args.depth is not None:
-        cfg["depth"] = float(args.depth)
+        cfg.setdefault("stations", {})
+        cfg["stations"]["depth"] = float(args.depth)
     if args.depth_tol is not None:
-        cfg["depth_tol"] = float(args.depth_tol)
+        cfg.setdefault("stations", {})
+        cfg["stations"]["depth_tol"] = float(args.depth_tol)
     if args.depth_policy:
-        cfg["depth_policy"] = args.depth_policy
+        cfg.setdefault("stations", {})
+        cfg["stations"]["depth_policy"] = args.depth_policy
     if args.model_time_units:
-        cfg["model_time_units"] = args.model_time_units
+        cfg.setdefault("model", {})
+        cfg["model"]["time_units"] = args.model_time_units
     if args.model_time_offset is not None:
-        cfg["model_time_offset"] = float(args.model_time_offset)
+        cfg.setdefault("model", {})
+        cfg["model"]["time_offset"] = float(args.model_time_offset)
     if args.station_list:
-        cfg["station_list"] = list(args.station_list)
+        cfg.setdefault("stations", {})
+        cfg["stations"]["list"] = list(args.station_list)
     if args.debug_times:
-        cfg["debug_times"] = True
+        cfg.setdefault("debug", {})
+        cfg["debug"]["times"] = True
     if args.grid:
-        cfg["grid"] = args.grid
+        cfg.setdefault("map", {})
+        cfg["map"]["grid"] = args.grid
     if args.map_zoom is not None:
-        cfg["map_zoom"] = float(args.map_zoom)
+        cfg.setdefault("map", {})
+        cfg["map"]["zoom_deg"] = float(args.map_zoom)
     if args.experiment_id:
-        cfg["experiment_id"] = args.experiment_id
+        cfg.setdefault("output", {})
+        cfg["output"]["experiment_id"] = args.experiment_id
     if args.disable_plots:
-        cfg["save_plots"] = False
+        cfg.setdefault("output", {})
+        cfg["output"]["save_plots"] = False
     if args.disable_scatter:
-        cfg["write_integrated_scatter"] = False
+        cfg.setdefault("output", {})
+        cfg["output"]["write_scatter_plots"] = False
     if args.disable_metrics:
-        cfg["write_task_metrics"] = False
+        cfg.setdefault("output", {})
+        cfg["output"]["write_task_metrics"] = False
+    return cfg
 
+
+def _canonical_to_runtime_config(canonical_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    model_cfg = dict(canonical_cfg.get("model", {}))
+    obs_cfg = dict(canonical_cfg.get("obs", {}))
+    station_cfg = dict(canonical_cfg.get("stations", {}))
+    time_cfg = dict(canonical_cfg.get("time", {}))
+    map_cfg = dict(canonical_cfg.get("map", {}))
+    output_cfg = dict(canonical_cfg.get("output", {}))
+    plot_cfg = dict(canonical_cfg.get("plot", {}))
+    debug_cfg = dict(canonical_cfg.get("debug", {}))
+    resample_cfg = dict(time_cfg.get("resample", {}))
+
+    time_offset_raw = model_cfg.get("time_offset", 0.0)
+    if time_offset_raw is None:
+        model_time_offset = 0.0
+    elif isinstance(time_offset_raw, str):
+        model_time_offset = float(datenum(time_offset_raw))
+    else:
+        model_time_offset = float(time_offset_raw)
+
+    cfg: Dict[str, Any] = {
+        "teams_npz": obs_cfg.get("path"),
+        "schism_npzs": list(model_cfg.get("runs") or []),
+        "schism_labels": model_cfg.get("labels"),
+        "bpfile": station_cfg.get("bpfile"),
+        "outdir": output_cfg.get("dir"),
+        "vars": list(model_cfg.get("variables") or []),
+        "resample": resample_cfg.get("obs", "H"),
+        "start": time_cfg.get("start"),
+        "end": time_cfg.get("end"),
+        "depth": station_cfg.get("depth"),
+        "depth_tol": float(station_cfg.get("depth_tol", 0.5)),
+        "depth_policy": station_cfg.get("depth_policy", "mean"),
+        "model_time_units": model_cfg.get("time_units", "datenum"),
+        "model_time_offset": model_time_offset,
+        "station_list": station_cfg.get("list"),
+        "debug_times": bool(debug_cfg.get("times", False)),
+        "grid": map_cfg.get("grid"),
+        "map_zoom": float(map_cfg.get("zoom_deg", 0.1)),
+        "save_plots": bool(output_cfg.get("save_plots", True)),
+        "write_task_metrics": bool(output_cfg.get("write_task_metrics", True)),
+        "write_integrated_scatter": bool(output_cfg.get("write_scatter_plots", True)),
+        "task_name": output_cfg.get("task_name", "th"),
+        "experiment_id": output_cfg.get("experiment_id"),
+        "metrics_raw_name": output_cfg.get("metrics_raw_name", "TH_metrics_raw.csv"),
+        "metrics_station_name": output_cfg.get("metrics_station_name", "SCHISMvsTEAMS_stats.csv"),
+        "metrics_model_name": output_cfg.get("metrics_model_name", "TH_stats_by_model.csv"),
+        "manifest_name": output_cfg.get("manifest_name", "TH_manifest.json"),
+        "scatter_alpha": float(plot_cfg.get("scatter_alpha", 0.65)),
+        "scatter_size": float(plot_cfg.get("scatter_size", 9)),
+        "scatter_cmap": str(plot_cfg.get("scatter_cmap", "viridis")),
+    }
     cfg["vars"] = [_normalize_var_name(v) for v in cfg.get("vars", [])]
     return cfg
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = _parse_args(argv)
-    cfg = _build_runtime_config(args)
+    canonical_cfg = _build_canonical_config(args)
+    cfg = _canonical_to_runtime_config(canonical_cfg)
 
     outdir = Path(cfg["outdir"]).expanduser().resolve()
     if RANK == 0:
@@ -681,7 +773,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     if RANK == 0:
         with open(outdir / "th_config_used.json", "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
+            json.dump(canonical_cfg, f, indent=2)
     if MPI:
         COMM.Barrier()
 

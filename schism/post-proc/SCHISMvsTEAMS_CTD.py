@@ -3,136 +3,74 @@
 Compare SCHISM profiles against TEAMS CTD observations stored in NPZ.
 """
 
-import argparse
-import builtins
-import copy as pycopy
-import json
-import os
-import sys
-import time
-from matplotlib import rc
-from matplotlib.pyplot import (
-    clf,
-    close,
-    figure,
-    gca,
-    gcf,
-    legend,
-    plot,
-    savefig,
-    setp,
-    subplot,
-    subplots,
-    title,
-    xlabel,
-    xlim,
-    ylabel,
-    ylim,
-)
-from numpy import arange, argsort, array, c_, concatenate, isnan, ma, nanmax, nanmin, unravel_index
-from scipy import interpolate
-from pylib import (
-    ReadNC,
-    datenum,
-    deep_update_dict,
-    get_stat,
-    init_mpi_runtime,
-    inside_polygon,
-    loadz,
-    num2date,
-    rank_log,
-    read_schism_output,
-    read_shapefile_data,
-    report_work_assignment,
-    compute_skill_metrics,
-    write_csv_rows,
-    read_csv_rows,
-    write_rank_csv_chunk,
-    collect_rank_csv_chunks,
-    cleanup_rank_csv_chunks,
-)
-import numpy as np
-
-NaN = np.nan
-
 # =============================================================================
 # Configuration
 # =============================================================================
-CONFIG = {
-    "coordinates": {
-        "canonical": "180",  # use "180" for [-180, 180], "360" for [0, 360)
+DEFAULT_CONFIG = {
+    "model": {
+        "coordinates": {
+            "canonical": "180",  # use "180" for [-180, 180], "360" for [0, 360)
+        },
+        "source_mode": "npz",  # raw | npz
+        "source_npz_paths": ["./npz/RUN01g_OB_D1.npz", "./npz/RUN03a_OB_D1.npz","./npz/RUN04a_OB_D1.npz", "./npz/RUN05a_OB_D1.npz"],
+        "plot_depth_mode": "native",  # native | interp
+        "schism": [
+            {"enabled": True, "label": "RUN01g", "color": "k"},
+            {"enabled": True, "label": "RUN03a", "color": "c"},
+            {"enabled": True, "label": "RUN04a", "color": "b"},
+            {"enabled": True, "label": "RUN05a", "color": "g"},
+        ],
+        "global": {
+            "enabled": False,  # set True to compare against a global model
+            "label": "CMEMS",
+            "color": "k",
+            "data_dir": "/scratch2/08924/kmpark/CMEMS/Japan",
+            "file_suffix": ".nc",
+            "variables": {
+                "lon": "longitude",
+                "lat": "latitude",
+                "depth": "depth",
+                "temp": "thetao",
+                "salt": "so",
+            },
+            "fill_value": -3e4,
+            "lon_mode": "auto",  # "auto", "180", or "360"
+            "search_radius": 1,  # grid cells to search for nearest wet point if target is all-NaN
+        },
     },
-    "date_range": {
+    "obs": {
+        "path": "./npz/onagawa_d1_ctd.npz",
+        "fields": {
+            "lon": "lon",
+            "lat": "lat",
+            "time": "time",
+            "depth": "depth",
+            "temp": "temp",
+            "salt": "sal",
+            "station_id": "station_id",
+            "station_name": "station_name",
+        },
+    },
+    "stations": {
+        "ids": None,  # list of station_id strings to include, or None for all
+        "names": None,  # list of station_name strings to include, or None for all
+    },
+    "time": {
         "start": (2012, 2, 1),
         "end": (2014, 12, 31),
-    },
-    "compare": {
         "location_only": None,  # True: ignore observation time and use a fixed SCHISM time
         "location_only_time": None,  # datenum or None to use first SCHISM time
-        "station_ids": None, # ["4", "5","6", "7","8"],  # list of station_id strings to include, or None for all
-        "station_names": None,  # list of station_name strings to include, or None for all
         "match_month_day": None,  # True: ignore year, match month/day across model times
     },
-    "source": {
-        "mode": "npz",  # raw | npz
-        "npz_path": "./npz/RUN01g_OB_D1.npz",  # required when mode=npz
-        "npz_paths": ["./npz/RUN01g_OB_D1.npz","./npz/RUN04a_OB_D1.npz","./npz/RUN05a_OB_D1.npz"], #["./npz/RUN01g_OB_D1.npz","./npz/RUN01i_OB_D1.npz"],
-        "plot_depth_mode": "native",  # native | interp
-    },
-    "region": {
-        "shapefile": "./SO_bnd.shp",  # set to None to skip shapefile filtering
-        "use_shapefile": True,
-        "subset_bbox": None, #(141.48767,141.56841,38.41906,38.43688),  # (lon_min, lon_max, lat_min, lat_max)
-    },
-    "teams": {
-        "npz_path": "/scratch2/08924/kmpark/post-proc/npz/onagawa_d1_ctd.npz",
-        "lon_name": "lon",
-        "lat_name": "lat",
-        "time_name": "time",
-        "depth_name": "depth",
-        "temp_name": "temp",
-        "salt_name": "sal",
-        "station_id_name": "station_id",
-        "station_name_name": "station_name",
-    },
-
-    "schism": [
-        {
-        "enabled": True,
-        "label": "RUN01g",
-        "color": "k",
+    "map": {
+        "region": {
+            "shapefile": "./SO_bnd.shp",  # set to None to skip shapefile filtering
+            "use_shapefile": True,
+            "subset_bbox": None,  # (lon_min, lon_max, lat_min, lat_max)
         },
-        {
-        "enabled": True,
-        "label": "RUN04a",
-        "color": "b",
-        },
-        {
-        "enabled": True,
-        "label": "RUN05a",
-        "color": "g",
-        },
-    ],
-
-    "global_model": {
-        "enabled": True,  # set True to compare against a global model
-        "label": "CMEMS",
-        "color": "k",
-        "data_dir": "/scratch2/08924/kmpark/CMEMS/Japan",
-        "file_suffix": ".nc",
-        "variables": {
-            "lon": "longitude",
-            "lat": "latitude",
-            "depth": "depth",
-            "temp": "thetao",
-            "salt": "so",
-        },
-        "fill_value": -3e4,
-        "lon_mode": "auto",  # "auto", "180", or "360"
-        "search_radius": 1,  # grid cells to search for nearest wet point if target is all-NaN
     },
     "output": {
-        "dir": "./ESIMAGES/CompTEAMS_2012_01g04a05a",
+        "dir": "./CompObs/CompTEAMS_OBD1_01g03a04a05a",
         "task_name": "ctd",
         "experiment_id": None,
         "write_task_metrics": True,
@@ -160,14 +98,51 @@ CONFIG = {
         "linewidth": 1.5,
         "font_size": 7,
         "obs_color": "r",
-        "map_auto_zoom": False,  # True: auto-center map on observation point
+        "map_auto_zoom": True,  # True: auto-center map on observation point
         "map_zoom_degree": 0.03,  # half-width in degrees around obs point (lon/lat)
         "map_zoom_degree_lon": None,  # optional lon half-width override
         "map_zoom_degree_lat": None,  # optional lat half-width override
-        "map_xlim": (141.4127, 141.6027),  # e.g. (141.2, 141.8)
-        "map_ylim": (38.3298, 38.4992),  # e.g. (38.2, 38.6)
+        "map_xlim": (141.4127, 141.6027),  # e.g. (141.2, 141.8), it is not used when "map_auto_zoom": True
+        "map_ylim": (38.3298, 38.4992),  # e.g. (38.2, 38.6), it is is not used when "map_auto_zoom": True
     },
 }
+
+# =============================================================================
+# Imports
+# =============================================================================
+import argparse
+import builtins
+import copy as pycopy
+import json
+import os
+import sys
+import time
+from matplotlib import rc
+import matplotlib.pyplot as plt
+from scipy import interpolate
+from pylib import (
+    ReadNC,
+    datenum,
+    deep_update_dict,
+    get_stat,
+    init_mpi_runtime,
+    inside_polygon,
+    loadz,
+    num2date,
+    rank_log,
+    read_schism_output,
+    read_shapefile_data,
+    report_work_assignment,
+    compute_skill_metrics,
+    write_csv_rows,
+    read_csv_rows,
+    write_rank_csv_chunk,
+    collect_rank_csv_chunks,
+    cleanup_rank_csv_chunks,
+)
+import numpy as np
+
+NaN = np.nan
 
 
 SMALL_SIZE = 8
@@ -181,7 +156,9 @@ rc("legend", fontsize=SMALL_SIZE)
 rc("axes", labelsize=MEDIUM_SIZE)
 rc("figure", titlesize=BIGGER_SIZE)
 
-CANONICAL_LON_MODE = CONFIG["coordinates"].get("canonical", "180")
+CONFIG = {}
+CANONICAL_CONFIG = pycopy.deepcopy(DEFAULT_CONFIG)
+CANONICAL_LON_MODE = DEFAULT_CONFIG.get("model", {}).get("coordinates", {}).get("canonical", "180")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # =============================================================================
@@ -206,11 +183,11 @@ def _parse_args(argv=None):
     p.add_argument("--disable-scatter", action="store_true", help="Skip integrated scatter plots.")
     p.add_argument("--disable-metrics", action="store_true", help="Skip writing standardized task metrics.")
     p.add_argument("--plot-mode", choices=["full", "quick", "off"], help="Profile plotting mode.")
-    p.add_argument("--start-date", help="Override date_range.start as YYYY-MM-DD.")
-    p.add_argument("--end-date", help="Override date_range.end as YYYY-MM-DD.")
-    p.add_argument("--source-mode", choices=["raw", "npz"], help="Data source mode.")
-    p.add_argument("--source-npz", nargs="+", help="One or more NPZs from pextract_schism_ctd.py when source-mode=npz.")
-    p.add_argument("--plot-depth-mode", choices=["native", "interp"], help="Profile plot depth mode for source-mode=npz.")
+    p.add_argument("--start-date", help="Override time.start as YYYY-MM-DD.")
+    p.add_argument("--end-date", help="Override time.end as YYYY-MM-DD.")
+    p.add_argument("--source-mode", choices=["raw", "npz"], help="Override model.source_mode.")
+    p.add_argument("--source-npz", nargs="+", help="Override model.source_npz_paths when source-mode=npz.")
+    p.add_argument("--plot-depth-mode", choices=["native", "interp"], help="Override model.plot_depth_mode.")
     return p.parse_args(argv)
 
 
@@ -219,10 +196,61 @@ def _parse_ymd(text):
     return [y, m, d]
 
 
-def _apply_runtime_overrides(args):
-    global CONFIG, CANONICAL_LON_MODE
+def _canonical_to_runtime_config(canonical_cfg):
+    model_cfg = pycopy.deepcopy(canonical_cfg.get("model", {}))
+    obs_cfg = pycopy.deepcopy(canonical_cfg.get("obs", {}))
+    fields_cfg = pycopy.deepcopy(obs_cfg.get("fields", {}))
+    stations_cfg = pycopy.deepcopy(canonical_cfg.get("stations", {}))
+    time_cfg = pycopy.deepcopy(canonical_cfg.get("time", {}))
+    map_cfg = pycopy.deepcopy(canonical_cfg.get("map", {}))
+    output_cfg = pycopy.deepcopy(canonical_cfg.get("output", {}))
+    plot_cfg = pycopy.deepcopy(canonical_cfg.get("plot", {}))
 
-    cfg = pycopy.deepcopy(CONFIG)
+    start_raw = time_cfg.get("start", [2012, 2, 1])
+    end_raw = time_cfg.get("end", [2014, 12, 31])
+    start_val = list(start_raw) if start_raw is not None else [2012, 2, 1]
+    end_val = list(end_raw) if end_raw is not None else [2014, 12, 31]
+
+    runtime_cfg = {
+        "coordinates": pycopy.deepcopy(model_cfg.get("coordinates", {"canonical": "180"})),
+        "date_range": {
+            "start": start_val,
+            "end": end_val,
+        },
+        "compare": {
+            "station_ids": stations_cfg.get("ids"),
+            "station_names": stations_cfg.get("names"),
+            "location_only": time_cfg.get("location_only"),
+            "location_only_time": time_cfg.get("location_only_time"),
+            "match_month_day": time_cfg.get("match_month_day"),
+        },
+        "region": pycopy.deepcopy(map_cfg.get("region", {})),
+        "source": {
+            "mode": model_cfg.get("source_mode", "raw"),
+            "npz_paths": pycopy.deepcopy(model_cfg.get("source_npz_paths")),
+            "plot_depth_mode": model_cfg.get("plot_depth_mode", "native"),
+        },
+        "teams": {
+            "npz_path": obs_cfg.get("path"),
+            "lon_name": fields_cfg.get("lon", "lon"),
+            "lat_name": fields_cfg.get("lat", "lat"),
+            "time_name": fields_cfg.get("time", "time"),
+            "depth_name": fields_cfg.get("depth", "depth"),
+            "temp_name": fields_cfg.get("temp", "temp"),
+            "salt_name": fields_cfg.get("salt", "sal"),
+            "station_id_name": fields_cfg.get("station_id", "station_id"),
+            "station_name_name": fields_cfg.get("station_name", "station_name"),
+        },
+        "schism": pycopy.deepcopy(model_cfg.get("schism", [])),
+        "global_model": pycopy.deepcopy(model_cfg.get("global", {})),
+        "output": output_cfg,
+        "plot": plot_cfg,
+    }
+    return runtime_cfg
+
+
+def _build_canonical_config(args):
+    cfg = pycopy.deepcopy(DEFAULT_CONFIG)
     if args.config:
         with open(args.config, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
@@ -235,8 +263,8 @@ def _apply_runtime_overrides(args):
         cfg.setdefault("output", {})
         cfg["output"]["experiment_id"] = args.experiment_id
     if args.teams_npz:
-        cfg.setdefault("teams", {})
-        cfg["teams"]["npz_path"] = args.teams_npz
+        cfg.setdefault("obs", {})
+        cfg["obs"]["path"] = args.teams_npz
     if args.disable_profile_plots:
         cfg.setdefault("output", {})
         cfg["output"]["save_profile_plots"] = False
@@ -252,28 +280,34 @@ def _apply_runtime_overrides(args):
         if str(args.plot_mode).lower() == "off":
             cfg["output"]["save_profile_plots"] = False
     if args.start_date:
-        cfg.setdefault("date_range", {})
-        cfg["date_range"]["start"] = _parse_ymd(args.start_date)
+        cfg.setdefault("time", {})
+        cfg["time"]["start"] = _parse_ymd(args.start_date)
     if args.end_date:
-        cfg.setdefault("date_range", {})
-        cfg["date_range"]["end"] = _parse_ymd(args.end_date)
+        cfg.setdefault("time", {})
+        cfg["time"]["end"] = _parse_ymd(args.end_date)
     if args.source_mode:
-        cfg.setdefault("source", {})
-        cfg["source"]["mode"] = str(args.source_mode)
+        cfg.setdefault("model", {})
+        cfg["model"]["source_mode"] = str(args.source_mode)
     if args.source_npz:
-        cfg.setdefault("source", {})
-        npz_list = [str(x) for x in args.source_npz]
-        if len(npz_list) == 1:
-            cfg["source"]["npz_path"] = npz_list[0]
-            cfg["source"]["npz_paths"] = None
-        else:
-            cfg["source"]["npz_path"] = npz_list[0]
-            cfg["source"]["npz_paths"] = npz_list
+        cfg.setdefault("model", {})
+        cfg["model"]["source_npz_paths"] = [str(x) for x in args.source_npz if str(x).strip()]
     if args.plot_depth_mode:
-        cfg.setdefault("source", {})
-        cfg["source"]["plot_depth_mode"] = str(args.plot_depth_mode)
+        cfg.setdefault("model", {})
+        cfg["model"]["plot_depth_mode"] = str(args.plot_depth_mode)
+    return cfg
 
-    CONFIG = cfg
+
+def _apply_runtime_overrides(args):
+    global CONFIG, CANONICAL_CONFIG, CANONICAL_LON_MODE
+
+    canonical_cfg = _build_canonical_config(args)
+    CONFIG = _canonical_to_runtime_config(canonical_cfg)
+    CANONICAL_CONFIG = canonical_cfg
+    CANONICAL_LON_MODE = CONFIG["coordinates"].get("canonical", "180")
+
+
+if not CONFIG:
+    CONFIG = _canonical_to_runtime_config(CANONICAL_CONFIG)
     CANONICAL_LON_MODE = CONFIG["coordinates"].get("canonical", "180")
 
 
@@ -365,7 +399,7 @@ def setup_region(region_cfg):
 def point_in_region(region, lon, lat):
     lon = normalize_longitudes(lon, CANONICAL_LON_MODE)
     if region["px"] is not None and region["py"] is not None:
-        inside = inside_polygon(array([[lon, lat]]), region["px"], region["py"]).ravel()[0]
+        inside = inside_polygon(np.array([[lon, lat]]), region["px"], region["py"]).ravel()[0]
         if not bool(inside):
             return False
     bbox = region["bbox"]
@@ -381,27 +415,27 @@ def point_in_region(region, lon, lat):
 
 
 def drop_nan_pairs(depth, values):
-    valid = (~isnan(depth)) & (~isnan(values))
+    valid = (~np.isnan(depth)) & (~np.isnan(values))
     if valid.sum() == 0:
-        return array([]), array([])
+        return np.array([]), np.array([])
     return depth[valid], values[valid]
 
 
 def select_obs_within_model_range(obs_depth, obs_temp, obs_salt, model_depth):
-    valid = (~isnan(obs_depth)) & (~isnan(obs_temp)) & (~isnan(obs_salt))
+    valid = (~np.isnan(obs_depth)) & (~np.isnan(obs_temp)) & (~np.isnan(obs_salt))
     obs_depth = obs_depth[valid]
     obs_temp = obs_temp[valid]
     obs_salt = obs_salt[valid]
     if len(obs_depth) == 0:
         return None
 
-    model_depth = array(model_depth, dtype=float)
-    model_depth = model_depth[~isnan(model_depth)]
+    model_depth = np.array(model_depth, dtype=float)
+    model_depth = model_depth[~np.isnan(model_depth)]
     if len(model_depth) == 0:
         return None
 
-    depth_min = nanmin(model_depth)
-    depth_max = nanmax(model_depth)
+    depth_min = np.nanmin(model_depth)
+    depth_max = np.nanmax(model_depth)
     within = (obs_depth >= depth_min) & (obs_depth <= depth_max)
     obs_depth = obs_depth[within]
     obs_temp = obs_temp[within]
@@ -448,16 +482,16 @@ def interpolate_model_to_obs(model_depth, model_values, obs_depth, obs_values):
 def prepare_global_model(cfg, start, end):
     if not cfg.get("enabled", False):
         return None
-    files = array([f for f in os.listdir(cfg["data_dir"]) if f.endswith(cfg.get("file_suffix", ".nc"))])
+    files = np.array([f for f in os.listdir(cfg["data_dir"]) if f.endswith(cfg.get("file_suffix", ".nc"))])
     if len(files) == 0:
         return None
-    mti = array([datenum(*array(f.replace(".", "_").split("_")[1:5]).astype("int")) for f in files])
+    mti = np.array([datenum(*np.array(f.replace(".", "_").split("_")[1:5]).astype("int")) for f in files])
     fpt = (mti >= (start - 1)) * (mti < (end + 1))
     files = files[fpt]
     mti = mti[fpt]
     if len(files) == 0:
         return None
-    sind = argsort(mti)
+    sind = np.argsort(mti)
     cfg = cfg.copy()
     cfg.update({
         "files": files[sind],
@@ -543,7 +577,7 @@ def extract_global_profile(cfg, stime, lon, lat):
             lon_grid, _ = np.broadcast_arrays(lon_norm, lat_data)
         lat_grid = meta["lat_grid"]
         dist = (lat_grid - lat) ** 2 + (lon_grid - target_lon) ** 2
-        llidx = unravel_index(dist.argmin(), dist.shape)
+        llidx = np.unravel_index(dist.argmin(), dist.shape)
         lat_idx, lon_idx = int(llidx[0]), int(llidx[1])
         lon_pick = lon_data[lat_idx, lon_idx]
         lat_pick = lat_data[lat_idx, lon_idx]
@@ -573,7 +607,7 @@ def extract_global_profile(cfg, stime, lon, lat):
             slices[lon_axis] = lon_idx_clipped
 
         data = var[tuple(slices)]
-        if ma.isMaskedArray(data):
+        if np.ma.isMaskedArray(data):
             data = data.filled(np.nan)
         data = np.asarray(data, dtype=float)
         data = np.squeeze(data)
@@ -668,7 +702,7 @@ def prepare_schism(cfg):
     cfg = cfg.copy()
     stack_start, stack_end = cfg["stack_range"]
     stack_step = cfg.get("stack_step", 1)
-    stacks = arange(stack_start, stack_end + stack_step, stack_step)
+    stacks = np.arange(stack_start, stack_end + stack_step, stack_step)
     cfg["stacks"] = stacks
     cfg["mti"] = stacks - 1 + cfg["refdate"]
     cfg["month_day"] = _month_day_array(cfg["mti"])
@@ -688,7 +722,7 @@ def extract_schism_profile(cfg, stime, lon, lat):
         lon_query = normalize_longitudes(lon, "180")
     else:
         lon_query = lon
-    C = read_schism_output(cfg["run_dir"], cvars, c_[lon_query, lat], istack, fmt=1)
+    C = read_schism_output(cfg["run_dir"], cvars, np.c_[lon_query, lat], istack, fmt=1)
     sch_time = C.time + cfg["refdate"]
     tidx_prof = abs(sch_time - stime).argmin()
     depth = -C.zcor[tidx_prof, :]
@@ -824,35 +858,35 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir, plot_run
     if len(depth_temp_obs) == 0 or len(depth_salt_obs) == 0:
         return
 
-    figure(figsize=[fig_w, 3.5])
-    clf()
-    subplot(1, 2, 1)
-    plot(alon, alat, f"{obs_color}+", markersize=10, label="Obs")
-    plot(lon, lat, "b*", markersize=10, label="SCHISM")
+    plt.figure(figsize=[fig_w, 3.5])
+    plt.clf()
+    plt.subplot(1, 2, 1)
+    plt.plot(alon, alat, f"{obs_color}+", markersize=10, label="Obs")
+    plt.plot(lon, lat, "b*", markersize=10, label="SCHISM")
     if gm_lon is not None and gm_lat is not None:
-        plot(gm_lon, gm_lat, "k^", markersize=8, label="Global")
+        plt.plot(gm_lon, gm_lat, "k^", markersize=8, label="Global")
     if region["px"] is not None and region["py"] is not None:
-        plot(region["px"], region["py"], "k")
+        plt.plot(region["px"], region["py"], "k")
     if map_xlim is not None:
-        xlim(map_xlim)
+        plt.xlim(map_xlim)
     if map_ylim is not None:
-        ylim(map_ylim)
-    xlabel("Longitude")
-    ylabel("Latitude")
-    legend()
+        plt.ylim(map_ylim)
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.legend()
 
-    subplot(1, 2, 2)
+    plt.subplot(1, 2, 2)
     temp_depth_sets = []
     temp_value_sets = []
     for model in models:
         m_depth, m_temp = drop_nan_pairs(model["depth"], model["temp"])
         if len(m_depth) == 0:
             continue
-        plot(m_temp, m_depth, model["color"], lw=linewidth, label=model["name"])
-        plot(m_temp, m_depth, marker="o", linestyle="None", markersize=3, color=model["color"])
+        plt.plot(m_temp, m_depth, model["color"], lw=linewidth, label=model["name"])
+        plt.plot(m_temp, m_depth, marker="o", linestyle="None", markersize=3, color=model["color"])
         temp_depth_sets.append(m_depth)
         temp_value_sets.append(m_temp)
-    plot(
+    plt.plot(
         temp_obs,
         depth_temp_obs,
         color=obs_color,
@@ -864,23 +898,23 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir, plot_run
     )
     temp_depth_sets.append(depth_temp_obs)
     temp_value_sets.append(temp_obs)
-    title(profile_title, fontsize=font_size, fontweight="bold")
-    temp_values_concat = concatenate(temp_value_sets)
-    temp_depth_concat = concatenate(temp_depth_sets)
-    xm = [nanmin(temp_values_concat) - 1, nanmax(temp_values_concat) + 1]
-    ym = [nanmin(temp_depth_concat), nanmax(temp_depth_concat)]
-    setp(gca(), ylim=ym, xlim=xm)
-    gca().invert_yaxis()
-    annotate_stats(gca(), models, "temp", font_size)
-    legend(loc="center left", bbox_to_anchor=(1.02, 0.5), borderaxespad=0.0)
-    xlabel("Temperature ($^\\circ$C)")
-    ylabel("Depth (m)")
-    gca().xaxis.grid("on")
-    gca().yaxis.grid("on")
+    plt.title(profile_title, fontsize=font_size, fontweight="bold")
+    temp_values_concat = np.concatenate(temp_value_sets)
+    temp_depth_concat = np.concatenate(temp_depth_sets)
+    xm = [np.nanmin(temp_values_concat) - 1, np.nanmax(temp_values_concat) + 1]
+    ym = [np.nanmin(temp_depth_concat), np.nanmax(temp_depth_concat)]
+    plt.setp(plt.gca(), ylim=ym, xlim=xm)
+    plt.gca().invert_yaxis()
+    annotate_stats(plt.gca(), models, "temp", font_size)
+    plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), borderaxespad=0.0)
+    plt.xlabel("Temperature ($^\\circ$C)")
+    plt.ylabel("Depth (m)")
+    plt.gca().xaxis.grid("on")
+    plt.gca().yaxis.grid("on")
     if bool(plot_runtime.get("tight_layout", True)):
-        gcf().tight_layout(rect=[0.0, 0.0, 0.86, 1.0])
+        plt.gcf().tight_layout(rect=[0.0, 0.0, 0.86, 1.0])
 
-    savefig(
+    plt.savefig(
         os.path.join(
             output_dir,
             f"{meta['profile_id']}_temp_{num2date(stime).strftime('%Y%m%d%H%M%S')}.png",
@@ -888,37 +922,37 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir, plot_run
         dpi=int(plot_runtime.get("dpi", 400)),
         bbox_inches=plot_runtime.get("bbox_inches", "tight"),
     )
-    close()
+    plt.close()
 
-    figure(figsize=[fig_w, 3.5])
-    clf()
-    subplot(1, 2, 1)
-    plot(alon, alat, f"{obs_color}+", markersize=10, label="Obs")
-    plot(lon, lat, "b*", markersize=10, label="SCHISM")
+    plt.figure(figsize=[fig_w, 3.5])
+    plt.clf()
+    plt.subplot(1, 2, 1)
+    plt.plot(alon, alat, f"{obs_color}+", markersize=10, label="Obs")
+    plt.plot(lon, lat, "b*", markersize=10, label="SCHISM")
     if gm_lon is not None and gm_lat is not None:
-        plot(gm_lon, gm_lat, "k^", markersize=8, label="Global")
+        plt.plot(gm_lon, gm_lat, "k^", markersize=8, label="Global")
     if region["px"] is not None and region["py"] is not None:
-        plot(region["px"], region["py"], "k")
+        plt.plot(region["px"], region["py"], "k")
     if map_xlim is not None:
-        xlim(map_xlim)
+        plt.xlim(map_xlim)
     if map_ylim is not None:
-        ylim(map_ylim)
-    xlabel("Longitude")
-    ylabel("Latitude")
-    legend()
+        plt.ylim(map_ylim)
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.legend()
 
-    subplot(1, 2, 2)
+    plt.subplot(1, 2, 2)
     salt_depth_sets = []
     salt_value_sets = []
     for model in models:
         m_depth, m_salt = drop_nan_pairs(model["depth"], model["salt"])
         if len(m_depth) == 0:
             continue
-        plot(m_salt, m_depth, model["color"], lw=linewidth, label=model["name"])
-        plot(m_salt, m_depth, marker="o", linestyle="None", markersize=3, color=model["color"])
+        plt.plot(m_salt, m_depth, model["color"], lw=linewidth, label=model["name"])
+        plt.plot(m_salt, m_depth, marker="o", linestyle="None", markersize=3, color=model["color"])
         salt_depth_sets.append(m_depth)
         salt_value_sets.append(m_salt)
-    plot(
+    plt.plot(
         salt_obs,
         depth_salt_obs,
         color=obs_color,
@@ -930,23 +964,23 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir, plot_run
     )
     salt_depth_sets.append(depth_salt_obs)
     salt_value_sets.append(salt_obs)
-    title(profile_title, fontsize=font_size, fontweight="bold")
-    salt_values_concat = concatenate(salt_value_sets)
-    salt_depth_concat = concatenate(salt_depth_sets)
-    xm = [nanmin(salt_values_concat) - 1, nanmax(salt_values_concat) + 1]
-    ym = [nanmin(salt_depth_concat), nanmax(salt_depth_concat)]
-    setp(gca(), ylim=ym, xlim=xm)
-    gca().invert_yaxis()
-    annotate_stats(gca(), models, "salt", font_size)
-    legend(loc="center left", bbox_to_anchor=(1.02, 0.5), borderaxespad=0.0)
-    xlabel("Salinity (PSU)")
-    ylabel("Depth (m)")
-    gca().xaxis.grid("on")
-    gca().yaxis.grid("on")
+    plt.title(profile_title, fontsize=font_size, fontweight="bold")
+    salt_values_concat = np.concatenate(salt_value_sets)
+    salt_depth_concat = np.concatenate(salt_depth_sets)
+    xm = [np.nanmin(salt_values_concat) - 1, np.nanmax(salt_values_concat) + 1]
+    ym = [np.nanmin(salt_depth_concat), np.nanmax(salt_depth_concat)]
+    plt.setp(plt.gca(), ylim=ym, xlim=xm)
+    plt.gca().invert_yaxis()
+    annotate_stats(plt.gca(), models, "salt", font_size)
+    plt.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), borderaxespad=0.0)
+    plt.xlabel("Salinity (PSU)")
+    plt.ylabel("Depth (m)")
+    plt.gca().xaxis.grid("on")
+    plt.gca().yaxis.grid("on")
     if bool(plot_runtime.get("tight_layout", True)):
-        gcf().tight_layout(rect=[0.0, 0.0, 0.86, 1.0])
+        plt.gcf().tight_layout(rect=[0.0, 0.0, 0.86, 1.0])
 
-    savefig(
+    plt.savefig(
         os.path.join(
             output_dir,
             f"{meta['profile_id']}_salt_{num2date(stime).strftime('%Y%m%d%H%M%S')}.png",
@@ -954,7 +988,7 @@ def plot_profiles(meta, region, obs_plot, models, plot_cfg, output_dir, plot_run
         dpi=int(plot_runtime.get("dpi", 400)),
         bbox_inches=plot_runtime.get("bbox_inches", "tight"),
     )
-    close()
+    plt.close()
 
 
 def build_profile_groups(station_ids, times):
@@ -1127,7 +1161,7 @@ def _write_depth_scatter(pair_rows, output_cfg):
             depth_max = float(np.nanmax(model_depth))
         depth_max = max(depth_max, 1e-6)
 
-        fig, axs = subplots(1, 2, figsize=(10.5, 4.5))
+        fig, axs = plt.subplots(1, 2, figsize=(10.5, 4.5))
         vars_info = [
             ("temp", "Temperature", r"$^\circ$C"),
             ("salt", "Salinity", "PSU"),
@@ -1200,8 +1234,8 @@ def _write_depth_scatter(pair_rows, output_cfg):
         fig.suptitle(f"{model_name}: observation vs model", fontsize=11)
         fig.subplots_adjust(left=0.07, right=0.98, bottom=0.24, top=0.88, wspace=0.22)
         fp = os.path.join(outdir, f"{_sanitize_name(model_name)}_scatter_depth.png")
-        savefig(fp, dpi=350)
-        close(fig)
+        plt.savefig(fp, dpi=350)
+        plt.close(fig)
         written.append(fp)
     return written
 
@@ -1333,11 +1367,7 @@ def _cmp_from_interp_on_obs_grid(obs_depth, obs_values, model_interp_values):
 
 
 def _resolve_source_npz_paths(source_cfg):
-    raw_paths = None
-    if source_cfg.get("npz_paths") is not None:
-        raw_paths = source_cfg.get("npz_paths")
-    elif source_cfg.get("npz_path") is not None:
-        raw_paths = source_cfg.get("npz_path")
+    raw_paths = source_cfg.get("npz_paths")
     if raw_paths is None:
         return []
     if isinstance(raw_paths, (list, tuple, np.ndarray)):
@@ -1611,7 +1641,7 @@ def _run_npz_source(start_t, end_t, region, output_cfg):
     source_cfg = CONFIG.get("source", {})
     npz_paths = _resolve_source_npz_paths(source_cfg)
     if len(npz_paths) == 0:
-        raise ValueError("CONFIG['source']['npz_path'] or CONFIG['source']['npz_paths'] is required when source.mode='npz'.")
+        raise ValueError("CONFIG['source']['npz_paths'] is required when source.mode='npz'.")
     source = _load_and_merge_source_npz(npz_paths)
 
     profile_id_all = np.asarray(source["profile_id"]).astype("U")
@@ -2049,6 +2079,8 @@ def main():
 
     if RANK == 0:
         ensure_output_dir(output_cfg["dir"])
+        with open(os.path.join(output_cfg["dir"], "ctd_config_used.json"), "w", encoding="utf-8") as f:
+            json.dump(CANONICAL_CONFIG, f, indent=2)
     if MPI:
         COMM.Barrier()
 
