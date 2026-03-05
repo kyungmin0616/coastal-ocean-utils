@@ -103,6 +103,7 @@ try:
     from postproc_common import (
         deep_update_dict,
         get_model_start_datenum as common_get_model_start_datenum,
+        init_mpi_runtime,
         normalize_stack_list as common_normalize_stack_list,
         normalize_run_specs as common_normalize_run_specs,
         read_stack_times_abs as common_read_stack_times_abs,
@@ -113,12 +114,20 @@ except Exception as exc:
         "Shared helpers not found. Set PYLIBS_SRC to pylibs/src or install postproc_common."
     ) from exc
 
+MPI, COMM, RANK, SIZE, USE_MPI = init_mpi_runtime(sys.argv)
+
 
 # =============================================================================
 # Core Helpers
 # =============================================================================
-def _log(msg: str, verbose: bool = True) -> None:
-    if bool(verbose):
+def _log(msg: str, verbose: bool = True, rank0_only: bool = True) -> None:
+    if not bool(verbose):
+        return
+    if rank0_only and int(RANK) != 0:
+        return
+    if int(SIZE) > 1:
+        print(f"[rank {RANK}/{SIZE}] {msg}", flush=True)
+    else:
         print(str(msg), flush=True)
 
 
@@ -721,7 +730,7 @@ def _interp_at_obs_depth(z_prof: np.ndarray, val_prof: np.ndarray, obs_depth: fl
 def _write_csv(path: Path, fieldnames: Sequence[str], rows: Sequence[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(fieldnames))
+        w = csv.DictWriter(f, fieldnames=list(fieldnames), extrasaction="ignore")
         w.writeheader()
         for r in rows:
             w.writerow(r)
@@ -1361,6 +1370,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = _parse_args(argv)
     cfg = _apply_cli(CONFIG, args)
     _validate_config(cfg)
+
+    # Current OC extractor is serial. Under mpirun, execute on rank 0 only.
+    if bool(USE_MPI) and int(RANK) != 0:
+        return
 
     verbose = bool(cfg.get("VERBOSE", True))
     run_specs = _normalize_run_specs(cfg)
