@@ -335,7 +335,9 @@ def _load_pair_table(path: Path, label: str) -> pd.DataFrame:
 
     if "reject_reason" not in df.columns:
         df["reject_reason"] = ""
-    df["reject_reason"] = df["reject_reason"].fillna("").astype(str)
+    df["reject_reason"] = df["reject_reason"].fillna("").astype(str).str.strip()
+    df["obs_source"] = df["obs_source"].fillna("").astype(str).str.strip()
+    df["obs_data_type"] = df["obs_data_type"].fillna("").astype(str).str.strip().str.upper()
 
     t = _coerce_datetime(df)
     df["time_utc"] = t
@@ -385,64 +387,93 @@ def _load_models(cfg: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
-def _apply_filters(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
+def _apply_filters(df: pd.DataFrame, cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     out = df.copy()
+    diag: Dict[str, Any] = {}
+    diag["n_loaded"] = int(len(out))
 
     for c in ["obs_u", "obs_v", "mod_u", "mod_v", "obs_speed", "mod_speed", "obs_depth"]:
         out[c] = pd.to_numeric(out.get(c), errors="coerce")
 
     m = pd.Series(True, index=out.index)
     m &= out["time_utc"].notna()
+    diag["after_time_notna"] = int(m.sum())
     m &= np.isfinite(out["obs_u"]) & np.isfinite(out["obs_v"])
+    diag["after_obs_uv_finite"] = int(m.sum())
     m &= np.isfinite(out["mod_u"]) & np.isfinite(out["mod_v"])
+    diag["after_mod_uv_finite"] = int(m.sum())
 
     dtypes = cfg.get("data_types")
     if dtypes:
         keep = {str(x).strip().upper() for x in dtypes if str(x).strip() != ""}
         if keep:
-            m &= out["obs_data_type"].astype(str).str.upper().isin(keep)
+            m &= out["obs_data_type"].astype(str).str.strip().str.upper().isin(keep)
+            diag["after_data_type"] = int(m.sum())
 
     sources = cfg.get("sources")
     if sources:
         sk = {str(x).strip() for x in sources if str(x).strip() != ""}
         if sk:
-            m &= out["obs_source"].astype(str).isin(sk)
+            m &= out["obs_source"].astype(str).str.strip().isin(sk)
+            diag["after_sources"] = int(m.sum())
 
     ts0 = _parse_time_bound(cfg.get("start"), is_end=False)
     ts1 = _parse_time_bound(cfg.get("end"), is_end=True)
     if ts0 is not None:
         m &= out["time_utc"] >= ts0
+        diag["after_start"] = int(m.sum())
     if ts1 is not None:
         m &= out["time_utc"] <= ts1
+        diag["after_end"] = int(m.sum())
 
     z0 = cfg.get("min_depth")
     z1 = cfg.get("max_depth")
     if z0 is not None:
         m &= out["obs_depth"] >= float(z0)
+        diag["after_min_depth"] = int(m.sum())
     if z1 is not None:
         m &= out["obs_depth"] <= float(z1)
+        diag["after_max_depth"] = int(m.sum())
 
     if bool(cfg.get("require_matched", True)) and "matched" in out.columns:
-        m &= pd.to_numeric(out["matched"], errors="coerce").fillna(0).astype(int) == 1
+        matched = pd.to_numeric(out["matched"], errors="coerce")
+        if int(np.count_nonzero(np.isfinite(matched))) == 0:
+            diag["warn_matched_non_numeric"] = True
+            m &= np.isfinite(out["mod_u"]) & np.isfinite(out["mod_v"])
+        else:
+            m &= matched.fillna(0).astype(int) == 1
+        diag["after_require_matched"] = int(m.sum())
 
     if bool(cfg.get("require_inside_domain", True)) and "inside_domain" in out.columns:
-        m &= pd.to_numeric(out["inside_domain"], errors="coerce").fillna(0).astype(int) == 1
+        inside = pd.to_numeric(out["inside_domain"], errors="coerce")
+        if int(np.count_nonzero(np.isfinite(inside))) == 0:
+            diag["warn_inside_non_numeric"] = True
+        else:
+            m &= inside.fillna(0).astype(int) == 1
+        diag["after_require_inside"] = int(m.sum())
 
     max_abs_dt = cfg.get("max_abs_dt_hours")
     if max_abs_dt is not None and "mod_dt_hours" in out.columns:
         dt = pd.to_numeric(out["mod_dt_hours"], errors="coerce")
-        m &= np.isfinite(dt) & (np.abs(dt) <= float(max_abs_dt))
+        finite = np.isfinite(dt)
+        if int(np.count_nonzero(finite)) == 0:
+            diag["warn_mod_dt_all_nan"] = True
+        else:
+            m &= finite & (np.abs(dt) <= float(max_abs_dt))
+        diag["after_max_abs_dt"] = int(m.sum())
 
     rr = cfg.get("exclude_reject_reasons")
     if rr:
         bad = {str(x).strip() for x in rr if str(x).strip() != ""}
         if bad:
-            m &= ~out["reject_reason"].astype(str).isin(bad)
+            m &= ~out["reject_reason"].astype(str).str.strip().isin(bad)
+            diag["after_reject_reason"] = int(m.sum())
 
     out = out.loc[m].copy()
+    diag["n_used"] = int(len(out))
     out.sort_values(["model", "obs_source", "segment_key", "time_utc"], inplace=True)
     out.reset_index(drop=True, inplace=True)
-    return out
+    return out, diag
 
 
 def _compute_oc_metrics(obs_u: np.ndarray, obs_v: np.ndarray, mod_u: np.ndarray, mod_v: np.ndarray) -> Dict[str, float]:
@@ -784,6 +815,10 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--min-depth", type=float)
     p.add_argument("--max-depth", type=float)
     p.add_argument("--max-lag-hours", type=float)
+    p.add_argument("--require-matched", dest="require_matched", action="store_true", help="Keep only matched==1 rows.")
+    p.add_argument("--allow-unmatched", dest="require_matched", action="store_false", help="Do not enforce matched==1.")
+    p.add_argument("--require-inside", dest="require_inside", action="store_true", help="Keep only inside_domain==1 rows.")
+    p.add_argument("--allow-outside", dest="require_inside", action="store_false", help="Do not enforce inside_domain==1.")
     p.add_argument("--resample", help="Resample frequency for plots (e.g., H, D).")
     p.add_argument("--top-segments", type=int, help="Top segments per source for plots.")
     p.add_argument("--experiment-id", help="Experiment ID for metrics rows.")
@@ -791,6 +826,7 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--disable-scatter", action="store_true", help="Skip integrated scatter plots.")
     p.add_argument("--disable-metrics", action="store_true", help="Skip metrics CSV writing.")
     p.add_argument("--debug-times", action="store_true", help="Enable extra time-window logs.")
+    p.set_defaults(require_matched=None, require_inside=None)
     return p.parse_args(argv)
 
 
@@ -833,6 +869,12 @@ def _build_canonical_config(args: argparse.Namespace) -> Dict[str, Any]:
     if args.max_lag_hours is not None:
         cfg.setdefault("filter", {})
         cfg["filter"]["max_abs_dt_hours"] = float(args.max_lag_hours)
+    if args.require_matched is not None:
+        cfg.setdefault("filter", {})
+        cfg["filter"]["require_matched"] = bool(args.require_matched)
+    if args.require_inside is not None:
+        cfg.setdefault("filter", {})
+        cfg["filter"]["require_inside_domain"] = bool(args.require_inside)
 
     if args.resample is not None:
         cfg.setdefault("time", {})
@@ -934,12 +976,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             rank0_only=True,
         )
 
-    df = _apply_filters(df_all, cfg)
+    df, filt_diag = _apply_filters(df_all, cfg)
     n_used = int(len(df))
     if n_used == 0:
-        raise RuntimeError("No rows remain after OC filters.")
+        rank_print(f"[ERROR] No rows remain after OC filters. filter_diag={filt_diag}", rank0_only=True)
+        if "obs_data_type" in df_all.columns:
+            vc = df_all["obs_data_type"].astype(str).str.strip().str.upper().value_counts(dropna=False)
+            rank_print(f"[ERROR] obs_data_type counts:\n{vc.head(10).to_string()}", rank0_only=True)
+        if "matched" in df_all.columns:
+            vc = pd.to_numeric(df_all["matched"], errors="coerce").value_counts(dropna=False)
+            rank_print(f"[ERROR] matched counts:\n{vc.head(10).to_string()}", rank0_only=True)
+        if "inside_domain" in df_all.columns:
+            vc = pd.to_numeric(df_all["inside_domain"], errors="coerce").value_counts(dropna=False)
+            rank_print(f"[ERROR] inside_domain counts:\n{vc.head(10).to_string()}", rank0_only=True)
+        if "reject_reason" in df_all.columns:
+            vc = df_all["reject_reason"].astype(str).str.strip().replace("", "<blank>").value_counts(dropna=False)
+            rank_print(f"[ERROR] reject_reason counts:\n{vc.head(10).to_string()}", rank0_only=True)
+        raise RuntimeError(
+            "No rows remain after OC filters. "
+            "Check diagnostics above and relax filters (e.g., --max-lag-hours, --data-types, or matched/inside settings in config)."
+        )
 
-    rank_print(f"OC rows: loaded={n_loaded:,}, used={n_used:,}", rank0_only=True)
+    rank_print(f"OC rows: loaded={n_loaded:,}, used={n_used:,}, filter_diag={filt_diag}", rank0_only=True)
 
     raw_rows = _build_raw_rows(df, cfg)
     segment_rows = _build_segment_rows(df)
