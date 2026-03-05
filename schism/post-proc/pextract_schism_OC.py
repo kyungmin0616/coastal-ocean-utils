@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Collocate SCHISM current (u,v) with JODC trajectory observations.
+Extract SCHISM current (u, v) collocated at JODC trajectory observations.
 
-Phase-1 design goals:
-1) CA-first (ADCP) workflow.
-2) Nearest-time match with lag threshold.
-3) FEM horizontal interpolation + exact observation depth interpolation.
+Features:
+1) Multi-run extraction (RUNS list).
+2) Optional model-start UTC offset from run/param.nml.
+3) Nearest-time, FEM horizontal, depth interpolation collocation.
 4) Extraction-only outputs (paired CSV/NPZ + rejects + manifest).
 """
 
@@ -15,46 +15,51 @@ from __future__ import annotations
 # Configuration
 # =============================================================================
 CONFIG = dict(
-    PATHS=dict(
-        RUN_DIR=None,
-        RUN_NAME=None,
-        OBS_CSV=None,
-        OBS_NPZ=None,
-        OUTDIR="./npz",
-        OUT_PREFIX="jodc_ca_schism_pairs",
-        MANIFEST=None,  # default: <OUTDIR>/<OUT_PREFIX>_manifest.json
-    ),
-    OBS_FILTER=dict(
-        OBS_DATA_TYPES=("CA",),
-        OBS_SOURCES=None,  # e.g. ["JMA", "JODC"]
-        START=None,  # UTC: YYYY-MM-DD[ HH:MM[:SS]]
-        END=None,  # UTC: YYYY-MM-DD[ HH:MM[:SS]]
-        MIN_DEPTH=None,
-        MAX_DEPTH=None,
-        REQUIRE_OBS_QC_CODES=(0,),
-        REQUIRE_INSIDE=True,  # applies when obs "inside" field exists
-    ),
-    MATCHING=dict(
-        TIME_MATCH="nearest",  # fixed in phase-1
-        MAX_TIME_LAG_HOURS=6.0,
-        SPACE_MATCH="fem",  # fixed in phase-1
-        DEPTH_MATCH="interp",  # fixed in phase-1
-        OUTSIDE_DOMAIN="drop",  # drop | nan
-    ),
-    STACK_POLICY=dict(
-        STACKS=None,  # None -> all discovered stacks after screening
-        STACK_CHECK_MODE="light",  # none | light | size | light+size
-    ),
-    TIME_POLICY=dict(
-        APPLY_UTC_START=False,  # shift by utc_start from param.nml
-    ),
-    OUTPUT=dict(
-        WRITE_CSV=True,
-        WRITE_NPZ=True,
-        WRITE_REJECTS_CSV=True,
-        VERBOSE=True,
-        DRY_RUN=False,
-    ),
+    # Multi-run mode
+    RUNS=[
+        {"NAME": "RUN01d", "RUN": "../run/RUN01d"},
+    ],
+    SNAME_TEMPLATE="./npz/{run_name}_jodc_ca_schism_pairs",
+
+    # Observation input (exactly one is required)
+    OBS_CSV=None,
+    OBS_NPZ="../../dataset/JODC/npz/trusted_collocation_obs.npz",
+
+    # Observation filters
+    OBS_DATA_TYPES=("CA",),
+    OBS_SOURCES=None,
+    START=None,  # UTC: YYYY-MM-DD[ HH:MM[:SS]]
+    END=None,  # UTC: YYYY-MM-DD[ HH:MM[:SS]]
+    MIN_DEPTH=None,
+    MAX_DEPTH=None,
+    REQUIRE_OBS_QC_CODES=(0,),
+    REQUIRE_INSIDE=True,
+
+    # Matching controls
+    TIME_MATCH="nearest",  # fixed in phase-1
+    MAX_TIME_LAG_HOURS=6.0,
+    SPACE_MATCH="fem",  # fixed in phase-1
+    DEPTH_MATCH="interp",  # fixed in phase-1
+    OUTSIDE_DOMAIN="drop",  # drop | nan
+
+    # Stack controls
+    STACKS=None,  # None -> all discovered stacks after screening
+    STACK_CHECK_MODE="light",  # none | light | size | light+size
+    STACK_CHECK_ALL_FILES=False,
+    STACK_SIZE_RATIO_MIN=0.70,
+    STACK_SIZE_MIN_BYTES=None,
+
+    # Time offset controls
+    APPLY_UTC_START=False,
+
+    # Output controls
+    WRITE_CSV=True,
+    WRITE_NPZ=True,
+    WRITE_REJECTS_CSV=True,
+
+    VERBOSE=True,
+    DRY_RUN=False,
+    MANIFEST=None,  # optional JSON summary path
 )
 
 # =============================================================================
@@ -98,7 +103,8 @@ try:
     from postproc_common import (
         deep_update_dict,
         get_model_start_datenum as common_get_model_start_datenum,
-        normalize_stack_list,
+        normalize_stack_list as common_normalize_stack_list,
+        normalize_run_specs as common_normalize_run_specs,
         read_stack_times_abs as common_read_stack_times_abs,
         screen_stacks as common_screen_stacks,
     )
@@ -111,11 +117,23 @@ except Exception as exc:
 # =============================================================================
 # Core Helpers
 # =============================================================================
+def _log(msg: str, verbose: bool = True) -> None:
+    if bool(verbose):
+        print(str(msg), flush=True)
+
+
 def _resolve_path(path_like: str) -> Path:
     p = Path(os.path.expanduser(str(path_like)))
     if p.is_absolute():
         return p
     return (Path.cwd() / p).resolve()
+
+
+def _resolve_output_stem(path_like: str) -> Path:
+    p = _resolve_path(path_like)
+    if p.suffix.lower() in {".csv", ".npz", ".json"}:
+        p = p.with_suffix("")
+    return p
 
 
 def _parse_bound(value: Optional[str], is_end: bool) -> Optional[datetime]:
@@ -193,113 +211,57 @@ def _parse_int_set(values: Any, default: Sequence[int]) -> List[int]:
 def _load_json_config(config_path: Optional[str]) -> Dict[str, Any]:
     if config_path is None:
         return {}
-    path = _resolve_path(config_path)
-    with path.open("r", encoding="utf-8") as f:
+    with open(str(config_path), "r", encoding="utf-8") as f:
         obj = json.load(f)
     if not isinstance(obj, dict):
-        raise ValueError(f"--config must contain a JSON object: {path}")
+        raise ValueError(f"--config must contain a JSON object: {config_path}")
     return obj
 
 
-def _flatten_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    flat: Dict[str, Any] = {}
-    for section in ("PATHS", "OBS_FILTER", "MATCHING", "STACK_POLICY", "TIME_POLICY", "OUTPUT"):
-        flat.update(cfg.get(section, {}))
-    return flat
+def _normalize_run_specs(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return common_normalize_run_specs(
+        cfg,
+        run_keys=("RUN", "run", "run_dir"),
+        name_keys=("NAME", "name", "RUN_NAME", "run_name"),
+        output_keys=("SNAME", "sname", "out_prefix"),
+        output_template_key="SNAME_TEMPLATE",
+        default_output_template="./npz/{run_name}_jodc_ca_schism_pairs",
+        include_keys=("STACKS",),
+    )
 
 
-def _apply_cli(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
-    out = deep_update_dict(copy.deepcopy(cfg), _load_json_config(args.config), merge_list_of_dicts=True)
-
-    if args.run_dir is not None:
-        out["PATHS"]["RUN_DIR"] = str(args.run_dir)
-    if args.run_name is not None:
-        out["PATHS"]["RUN_NAME"] = str(args.run_name)
-    if args.obs_csv is not None:
-        out["PATHS"]["OBS_CSV"] = str(args.obs_csv)
-    if args.obs_npz is not None:
-        out["PATHS"]["OBS_NPZ"] = str(args.obs_npz)
-    if args.outdir is not None:
-        out["PATHS"]["OUTDIR"] = str(args.outdir)
-    if args.out_prefix is not None:
-        out["PATHS"]["OUT_PREFIX"] = str(args.out_prefix)
-    if args.manifest is not None:
-        out["PATHS"]["MANIFEST"] = str(args.manifest)
-
-    if args.obs_data_types is not None:
-        out["OBS_FILTER"]["OBS_DATA_TYPES"] = tuple(str(x).strip().upper() for x in args.obs_data_types if str(x).strip() != "")
-    if args.obs_sources is not None:
-        out["OBS_FILTER"]["OBS_SOURCES"] = [str(x).strip() for x in args.obs_sources if str(x).strip() != ""]
-    if args.start is not None:
-        out["OBS_FILTER"]["START"] = str(args.start)
-    if args.end is not None:
-        out["OBS_FILTER"]["END"] = str(args.end)
-    if args.min_depth is not None:
-        out["OBS_FILTER"]["MIN_DEPTH"] = float(args.min_depth)
-    if args.max_depth is not None:
-        out["OBS_FILTER"]["MAX_DEPTH"] = float(args.max_depth)
-    if args.require_obs_qc_codes is not None:
-        out["OBS_FILTER"]["REQUIRE_OBS_QC_CODES"] = _parse_int_set(args.require_obs_qc_codes, default=[0])
-    if args.require_inside is not None:
-        out["OBS_FILTER"]["REQUIRE_INSIDE"] = bool(args.require_inside)
-
-    if args.time_match is not None:
-        out["MATCHING"]["TIME_MATCH"] = str(args.time_match).lower()
-    if args.max_time_lag_hours is not None:
-        out["MATCHING"]["MAX_TIME_LAG_HOURS"] = float(args.max_time_lag_hours)
-    if args.space_match is not None:
-        out["MATCHING"]["SPACE_MATCH"] = str(args.space_match).lower()
-    if args.depth_match is not None:
-        out["MATCHING"]["DEPTH_MATCH"] = str(args.depth_match).lower()
-    if args.outside_domain is not None:
-        out["MATCHING"]["OUTSIDE_DOMAIN"] = str(args.outside_domain).lower()
-
-    if args.stacks is not None:
-        vals = [int(v) for v in args.stacks]
-        out["STACK_POLICY"]["STACKS"] = vals if len(vals) != 2 else [vals[0], vals[1]]
-    if args.stack_check_mode is not None:
-        out["STACK_POLICY"]["STACK_CHECK_MODE"] = str(args.stack_check_mode).lower()
-
-    if args.apply_utc_start is not None:
-        out["TIME_POLICY"]["APPLY_UTC_START"] = bool(args.apply_utc_start)
-
-    if args.write_csv is not None:
-        out["OUTPUT"]["WRITE_CSV"] = bool(args.write_csv)
-    if args.write_npz is not None:
-        out["OUTPUT"]["WRITE_NPZ"] = bool(args.write_npz)
-    if args.write_rejects_csv is not None:
-        out["OUTPUT"]["WRITE_REJECTS_CSV"] = bool(args.write_rejects_csv)
-    if args.verbose is not None:
-        out["OUTPUT"]["VERBOSE"] = bool(args.verbose)
-    if args.dry_run:
-        out["OUTPUT"]["DRY_RUN"] = True
-    return out
+def _as_stack_list(stacks: Any, dstacks: Any) -> np.ndarray:
+    return np.asarray(common_normalize_stack_list(stacks, dstacks), dtype=int)
 
 
-def _validate_config(flat_cfg: Dict[str, Any]) -> None:
-    if flat_cfg.get("RUN_DIR") in (None, ""):
-        raise ValueError("Configure PATHS.RUN_DIR or pass --run-dir.")
-    if flat_cfg.get("OUTDIR") in (None, ""):
-        raise ValueError("Configure PATHS.OUTDIR or pass --outdir.")
-    if flat_cfg.get("OBS_CSV") in (None, "") and flat_cfg.get("OBS_NPZ") in (None, ""):
-        raise ValueError("Configure PATHS.OBS_CSV or PATHS.OBS_NPZ (or pass --obs-csv/--obs-npz).")
-    if str(flat_cfg.get("TIME_MATCH", "nearest")).lower() != "nearest":
-        raise ValueError("Only TIME_MATCH='nearest' is supported in phase-1.")
-    if str(flat_cfg.get("SPACE_MATCH", "fem")).lower() != "fem":
-        raise ValueError("Only SPACE_MATCH='fem' is supported in phase-1.")
-    if str(flat_cfg.get("DEPTH_MATCH", "interp")).lower() != "interp":
-        raise ValueError("Only DEPTH_MATCH='interp' is supported in phase-1.")
-    mode = str(flat_cfg.get("STACK_CHECK_MODE", "light")).lower()
-    if mode not in {"none", "light", "size", "light+size"}:
-        raise ValueError(f"Invalid STACK_CHECK_MODE: {mode}")
-    od = str(flat_cfg.get("OUTSIDE_DOMAIN", "drop")).lower()
-    if od not in {"drop", "nan"}:
-        raise ValueError(f"Invalid OUTSIDE_DOMAIN: {od}")
+def _screen_stacks(
+    outputs_dir: str,
+    stacks: np.ndarray,
+    outfmt: int,
+    cfg: Dict[str, Any],
+) -> Tuple[np.ndarray, np.ndarray]:
+    return common_screen_stacks(
+        outputs_dir=outputs_dir,
+        stacks=np.asarray(stacks, dtype=int),
+        outfmt=int(outfmt),
+        mode=str(cfg.get("STACK_CHECK_MODE", "light")),
+        check_all_files=bool(cfg.get("STACK_CHECK_ALL_FILES", False)),
+        ratio_min=float(cfg.get("STACK_SIZE_RATIO_MIN", 0.70)),
+        abs_min_bytes=cfg.get("STACK_SIZE_MIN_BYTES"),
+        readnc=lambda p: ReadNC(str(p), 1),
+        logger=None,
+        log_limit=20,
+    )
 
 
-def _log(msg: str, verbose: bool) -> None:
-    if bool(verbose):
-        print(str(msg), flush=True)
+def _time_to_days(tvar: Any) -> np.ndarray:
+    arr = np.asarray(tvar[:], dtype=float).ravel()
+    units = str(getattr(tvar, "units", "")).strip().lower()
+    if "second" in units:
+        return arr / 86400.0
+    if "day" in units:
+        return arr
+    return arr / 86400.0
 
 
 # =============================================================================
@@ -423,7 +385,6 @@ def _read_obs_csv(path: Path) -> Dict[str, np.ndarray]:
     if c_time is not None:
         time_num = np.asarray([_safe_float(r.get(c_time), np.nan) for r in rows], dtype=float)
     else:
-        # Parse timestamp_utc if numeric time not provided.
         parsed = np.full(n, np.nan, dtype=float)
         for i, r in enumerate(rows):
             txt = str(r.get(c_tutc, "")).strip()
@@ -508,7 +469,6 @@ def _filter_obs(
     if max_depth is not None:
         mask &= obs["depth"] <= float(max_depth)
 
-    # QC strict both, by design in this phase.
     keep = np.asarray(list(qc_keep_codes), dtype=int)
     mask &= np.isin(obs["qc_u"], keep) & np.isin(obs["qc_v"], keep)
 
@@ -526,44 +486,71 @@ def _filter_obs(
     return out, idx
 
 
-def _time_to_days(tvar: Any) -> np.ndarray:
-    arr = np.asarray(tvar[:], dtype=float).ravel()
-    units = str(getattr(tvar, "units", "")).strip().lower()
-    if "second" in units:
-        return arr / 86400.0
-    if "day" in units:
-        return arr
-    # Default SCHISM behavior: time variable is in seconds.
-    return arr / 86400.0
+def _load_and_filter_observations(cfg: Dict[str, Any]) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    obs_csv = cfg.get("OBS_CSV")
+    obs_npz = cfg.get("OBS_NPZ")
+    if (obs_csv in (None, "")) and (obs_npz in (None, "")):
+        raise ValueError("Configure OBS_CSV or OBS_NPZ.")
+    if (obs_csv not in (None, "")) and (obs_npz not in (None, "")):
+        raise ValueError("Provide only one observation input: OBS_CSV or OBS_NPZ.")
+
+    start_dt = _parse_bound(cfg.get("START"), is_end=False)
+    end_dt = _parse_bound(cfg.get("END"), is_end=True)
+    if start_dt is not None and end_dt is not None and end_dt < start_dt:
+        raise ValueError("END must be >= START.")
+    start_num = float(date2num([start_dt])[0]) if start_dt is not None else None
+    end_num = float(date2num([end_dt])[0]) if end_dt is not None else None
+
+    qc_keep = _parse_int_set(cfg.get("REQUIRE_OBS_QC_CODES"), default=[0])
+    obs_types = [str(x).strip().upper() for x in (cfg.get("OBS_DATA_TYPES") or []) if str(x).strip() != ""]
+    obs_sources = [str(x).strip() for x in (cfg.get("OBS_SOURCES") or []) if str(x).strip() != ""]
+    if len(obs_sources) == 0:
+        obs_sources = None
+
+    if obs_csv not in (None, ""):
+        obs_path = _resolve_path(str(obs_csv))
+        if not obs_path.is_file():
+            raise FileNotFoundError(f"obs_csv not found: {obs_path}")
+        obs_raw = _read_obs_csv(obs_path)
+    else:
+        obs_path = _resolve_path(str(obs_npz))
+        if not obs_path.is_file():
+            raise FileNotFoundError(f"obs_npz not found: {obs_path}")
+        obs_raw = _read_obs_npz(obs_path)
+
+    n_loaded = int(len(obs_raw["time_num"]))
+    obs, idx = _filter_obs(
+        obs=obs_raw,
+        obs_data_types=obs_types,
+        obs_sources=obs_sources,
+        start_num=start_num,
+        end_num=end_num,
+        min_depth=cfg.get("MIN_DEPTH"),
+        max_depth=cfg.get("MAX_DEPTH"),
+        qc_keep_codes=qc_keep,
+        require_inside=bool(cfg.get("REQUIRE_INSIDE", True)),
+    )
+    n_filtered = int(len(obs["time_num"]))
+    if n_filtered == 0:
+        raise RuntimeError("No observations remain after filters.")
+
+    meta = {
+        "obs_source_file": str(obs_path),
+        "obs_loaded": n_loaded,
+        "obs_filtered": n_filtered,
+        "obs_types": obs_types,
+        "obs_sources": obs_sources,
+        "qc_keep": [int(x) for x in qc_keep],
+        "start_num": start_num,
+        "end_num": end_num,
+        "selected_obs_index": idx.astype(int),
+    }
+    return obs, meta
 
 
 # =============================================================================
 # SCHISM Matching / Interpolation Helpers
 # =============================================================================
-def _screen_stacks(outputs_dir: Path, stacks: np.ndarray, outfmt: int, mode: str) -> np.ndarray:
-    valid, _ = common_screen_stacks(
-        outputs_dir=outputs_dir,
-        stacks=stacks,
-        outfmt=outfmt,
-        mode=mode,
-        check_all_files=False,
-        ratio_min=0.70,
-        abs_min_bytes=None,
-        readnc=lambda p: ReadNC(str(p), 1),
-        logger=None,
-        log_limit=20,
-    )
-    return np.asarray(valid, dtype=int)
-
-
-def _parse_stack_request(stacks: Optional[Sequence[int]], discovered: np.ndarray) -> np.ndarray:
-    if stacks is None or len(stacks) == 0:
-        return np.asarray(discovered, dtype=int)
-    vals = [int(v) for v in stacks]
-    req = np.arange(vals[0], vals[1] + 1, dtype=int) if len(vals) == 2 else np.asarray(vals, dtype=int)
-    return np.asarray(normalize_stack_list(req, discovered), dtype=int)
-
-
 def _build_model_time_table(
     outputs_dir: Path,
     stacks: np.ndarray,
@@ -642,8 +629,7 @@ def _open_required_stack_files(outputs_dir: Path, stack: int) -> Tuple[Any, Any,
     fy = outputs_dir / f"horizontalVelY_{int(stack)}.nc"
     if not fx.exists() or not fy.exists():
         raise FileNotFoundError(
-            f"Missing model current files for stack {stack}: "
-            f"horizontalVelX/horizontalVelY required."
+            f"Missing model current files for stack {stack}: horizontalVelX/horizontalVelY required."
         )
 
     cx = ReadNC(str(fx), 1)
@@ -652,14 +638,12 @@ def _open_required_stack_files(outputs_dir: Path, stack: int) -> Tuple[Any, Any,
     fz = outputs_dir / f"zCoordinates_{int(stack)}.nc"
     cz = ReadNC(str(fz), 1) if fz.exists() else None
 
-    # Needed only when zCoordinates are unavailable.
     co = None
     if cz is None:
         fo = outputs_dir / f"out2d_{int(stack)}.nc"
         if not fo.exists():
             raise FileNotFoundError(
-                f"Missing zCoordinates and out2d files for stack {stack}; "
-                "cannot compute vertical coordinates."
+                f"Missing zCoordinates and out2d files for stack {stack}; cannot compute vertical coordinates."
             )
         co = ReadNC(str(fo), 1)
 
@@ -667,7 +651,6 @@ def _open_required_stack_files(outputs_dir: Path, stack: int) -> Tuple[Any, Any,
 
 
 def _read_var_slice_t_node_layer(v: Any, t_idx: int, node_ids: np.ndarray, np_nodes: int) -> np.ndarray:
-    # Try common SCHISM new-output layout: [time, node, layer].
     try:
         arr = np.asarray(v[t_idx, node_ids, :], dtype=float)
         if arr.ndim == 2 and arr.shape[0] == len(node_ids):
@@ -675,7 +658,6 @@ def _read_var_slice_t_node_layer(v: Any, t_idx: int, node_ids: np.ndarray, np_no
     except Exception:
         pass
 
-    # Alternate layout: [time, layer, node].
     try:
         arr = np.asarray(v[t_idx, :, node_ids], dtype=float)
         if arr.ndim == 2:
@@ -686,7 +668,6 @@ def _read_var_slice_t_node_layer(v: Any, t_idx: int, node_ids: np.ndarray, np_no
     except Exception:
         pass
 
-    # Fallback: read full 2D slice and infer orientation.
     arr2 = np.asarray(v[t_idx], dtype=float)
     if arr2.ndim != 2:
         raise ValueError(f"Unexpected variable slice ndim={arr2.ndim}, need 2D.")
@@ -698,7 +679,6 @@ def _read_var_slice_t_node_layer(v: Any, t_idx: int, node_ids: np.ndarray, np_no
 
 
 def _read_var_slice_t_node(v: Any, t_idx: int, node_ids: np.ndarray, np_nodes: int) -> np.ndarray:
-    # Standard [time, node]
     try:
         arr = np.asarray(v[t_idx, node_ids], dtype=float).reshape(-1)
         if len(arr) == len(node_ids):
@@ -706,7 +686,6 @@ def _read_var_slice_t_node(v: Any, t_idx: int, node_ids: np.ndarray, np_nodes: i
     except Exception:
         pass
 
-    # Fallback: read full 1D slice then subset.
     arr2 = np.asarray(v[t_idx], dtype=float).reshape(-1)
     if len(arr2) == np_nodes:
         return arr2[node_ids]
@@ -714,7 +693,6 @@ def _read_var_slice_t_node(v: Any, t_idx: int, node_ids: np.ndarray, np_nodes: i
 
 
 def _interp_at_obs_depth(z_prof: np.ndarray, val_prof: np.ndarray, obs_depth: float) -> Tuple[float, bool]:
-    # Observation depth is positive down; target z is negative below surface.
     target = -float(obs_depth)
     z = np.asarray(z_prof, dtype=float).reshape(-1)
     v = np.asarray(val_prof, dtype=float).reshape(-1)
@@ -749,196 +727,85 @@ def _write_csv(path: Path, fieldnames: Sequence[str], rows: Sequence[Dict[str, A
             w.writerow(r)
 
 
-# =============================================================================
-# CLI / Main
-# =============================================================================
-def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Extract SCHISM currents collocated at JODC trajectory observations.")
-    p.add_argument("--config", help="Optional JSON config overrides.")
+def _process_one_run(spec: Dict[str, Any], cfg: Dict[str, Any], obs: Dict[str, np.ndarray], obs_meta: Dict[str, Any]) -> Dict[str, Any]:
+    run = str(spec["RUN"])
+    run_name = str(spec.get("NAME", os.path.basename(os.path.abspath(run))))
+    sname = str(spec.get("SNAME"))
+    verbose = bool(cfg.get("VERBOSE", True))
 
-    # Model/run
-    p.add_argument("--run-dir", default=None, help="Override PATHS.RUN_DIR.")
-    p.add_argument("--run-name", default=None, help="Override PATHS.RUN_NAME.")
-    p.add_argument(
-        "--stacks",
-        nargs="+",
-        type=int,
-        default=None,
-        help="Optional stack list. If exactly 2 values are given, treated as [start end] inclusive.",
-    )
-
-    # Observation input
-    p.add_argument("--obs-csv", default=None, help="Override PATHS.OBS_CSV.")
-    p.add_argument("--obs-npz", default=None, help="Override PATHS.OBS_NPZ.")
-    p.add_argument("--obs-data-types", nargs="+", default=None)
-    p.add_argument("--obs-sources", nargs="+", default=None)
-    p.add_argument("--start", default=None, help="UTC start time (YYYY-MM-DD[ HH:MM[:SS]]).")
-    p.add_argument("--end", default=None, help="UTC end time (YYYY-MM-DD[ HH:MM[:SS]]).")
-    p.add_argument("--min-depth", type=float, default=None)
-    p.add_argument("--max-depth", type=float, default=None)
-
-    # Match controls
-    p.add_argument("--time-match", choices=["nearest"], default=None)
-    p.add_argument("--max-time-lag-hours", type=float, default=None)
-    p.add_argument("--space-match", choices=["fem"], default=None)
-    p.add_argument("--depth-match", choices=["interp"], default=None)
-    p.add_argument("--outside-domain", choices=["drop", "nan"], default=None)
-
-    # Quality/filter
-    p.add_argument("--require-obs-qc-codes", nargs="+", default=None)
-    p.add_argument("--require-inside", dest="require_inside", action="store_true")
-    p.add_argument("--no-require-inside", dest="require_inside", action="store_false")
-    p.set_defaults(require_inside=None)
-
-    # Runtime helpers
-    p.add_argument("--stack-check-mode", choices=["none", "light", "size", "light+size"], default=None)
-    p.add_argument("--apply-utc-start", dest="apply_utc_start", action="store_true")
-    p.add_argument("--no-apply-utc-start", dest="apply_utc_start", action="store_false")
-    p.set_defaults(apply_utc_start=None)
-
-    # Output
-    p.add_argument("--outdir", default=None, help="Override PATHS.OUTDIR.")
-    p.add_argument("--out-prefix", default=None, help="Override PATHS.OUT_PREFIX.")
-    p.add_argument("--write-csv", dest="write_csv", action="store_true")
-    p.add_argument("--no-write-csv", dest="write_csv", action="store_false")
-    p.set_defaults(write_csv=None)
-    p.add_argument("--write-npz", dest="write_npz", action="store_true")
-    p.add_argument("--no-write-npz", dest="write_npz", action="store_false")
-    p.set_defaults(write_npz=None)
-    p.add_argument("--write-rejects-csv", dest="write_rejects_csv", action="store_true")
-    p.add_argument("--no-write-rejects-csv", dest="write_rejects_csv", action="store_false")
-    p.set_defaults(write_rejects_csv=None)
-    p.add_argument("--manifest", default=None, help="Override PATHS.MANIFEST.")
-    p.add_argument("--dry-run", action="store_true", help="Resolve config and counts, then exit.")
-    p.add_argument("--verbose", dest="verbose", action="store_true")
-    p.add_argument("--quiet", dest="verbose", action="store_false")
-    p.set_defaults(verbose=None)
-    return p.parse_args(argv)
-
-
-def main(argv: Optional[Sequence[str]] = None) -> None:
-    args = _parse_args(argv)
-    cfg = _apply_cli(CONFIG, args)
-    C = _flatten_cfg(cfg)
-    _validate_config(C)
-
-    verbose = bool(C.get("VERBOSE", True))
-
-    run_dir = _resolve_path(str(C["RUN_DIR"]))
-    outdir = _resolve_path(str(C["OUTDIR"]))
-    outdir.mkdir(parents=True, exist_ok=True)
-
+    run_dir = _resolve_path(run)
     outputs_dir = run_dir / "outputs"
-    if not run_dir.is_dir():
-        raise FileNotFoundError(f"run_dir not found: {run_dir}")
-    if not outputs_dir.is_dir():
-        raise FileNotFoundError(f"outputs directory not found: {outputs_dir}")
+    if not run_dir.is_dir() or not outputs_dir.is_dir():
+        return {
+            "run_name": run_name,
+            "run_dir": str(run_dir),
+            "output_stem": str(_resolve_output_stem(sname)),
+            "status": "skipped_missing_run_or_outputs",
+        }
 
-    obs_path_csv = _resolve_path(str(C["OBS_CSV"])) if C.get("OBS_CSV") not in (None, "") else None
-    obs_path_npz = _resolve_path(str(C["OBS_NPZ"])) if C.get("OBS_NPZ") not in (None, "") else None
-    if obs_path_csv is not None and obs_path_npz is not None:
-        raise ValueError("Provide only one observation input: OBS_CSV or OBS_NPZ.")
-    if obs_path_csv is not None and not obs_path_csv.is_file():
-        raise FileNotFoundError(f"obs_csv not found: {obs_path_csv}")
-    if obs_path_npz is not None and not obs_path_npz.is_file():
-        raise FileNotFoundError(f"obs_npz not found: {obs_path_npz}")
+    out_stem = _resolve_output_stem(sname)
+    out_stem.parent.mkdir(parents=True, exist_ok=True)
+    paired_csv = Path(str(out_stem) + ".csv")
+    paired_npz = Path(str(out_stem) + ".npz")
+    reject_csv = Path(str(out_stem) + "_rejects.csv")
 
-    start_dt = _parse_bound(C.get("START"), is_end=False)
-    end_dt = _parse_bound(C.get("END"), is_end=True)
-    if start_dt is not None and end_dt is not None and end_dt < start_dt:
-        raise ValueError("end must be >= start")
-    start_num = float(date2num([start_dt])[0]) if start_dt is not None else None
-    end_num = float(date2num([end_dt])[0]) if end_dt is not None else None
-
-    qc_keep = _parse_int_set(C.get("REQUIRE_OBS_QC_CODES"), default=[0])
-    obs_types = [str(x).strip().upper() for x in (C.get("OBS_DATA_TYPES") or []) if str(x).strip() != ""]
-    obs_sources = [str(x).strip() for x in (C.get("OBS_SOURCES") or []) if str(x).strip() != ""]
-    if len(obs_sources) == 0:
-        obs_sources = None
-
-    # ------------------------------------------------------------------
-    # Load observations
-    # ------------------------------------------------------------------
-    if obs_path_csv is not None:
-        obs_raw = _read_obs_csv(obs_path_csv)
-        obs_source_file = str(obs_path_csv)
-    else:
-        obs_raw = _read_obs_npz(obs_path_npz)
-        obs_source_file = str(obs_path_npz)
-
-    n_obs_loaded = int(len(obs_raw["time_num"]))
-    obs, _ = _filter_obs(
-        obs=obs_raw,
-        obs_data_types=obs_types,
-        obs_sources=obs_sources,
-        start_num=start_num,
-        end_num=end_num,
-        min_depth=C.get("MIN_DEPTH"),
-        max_depth=C.get("MAX_DEPTH"),
-        qc_keep_codes=qc_keep,
-        require_inside=bool(C.get("REQUIRE_INSIDE", True)),
-    )
-    n_obs_filtered = int(len(obs["time_num"]))
-    if n_obs_filtered == 0:
-        raise RuntimeError("No observations remain after filters.")
-
-    _log(
-        f"[INFO] observations: loaded={n_obs_loaded:,}, filtered={n_obs_filtered:,}, "
-        f"types={obs_types if len(obs_types)>0 else 'ALL'}, qc={qc_keep}",
-        verbose=verbose,
-    )
-
-    # ------------------------------------------------------------------
-    # Discover model outputs and stack times
-    # ------------------------------------------------------------------
     modules, outfmt, dstacks, dvars, dvars_2d = schout_info(str(outputs_dir), 1)
     _ = modules
     _ = dvars
     _ = dvars_2d
     if int(outfmt) != 0:
-        raise RuntimeError(
-            f"Unsupported SCHISM output format outfmt={outfmt}. "
-            "Phase-1 only supports new-format per-variable NetCDF outputs."
-        )
+        return {
+            "run_name": run_name,
+            "run_dir": str(run_dir),
+            "output_stem": str(out_stem),
+            "status": f"skipped_outfmt_{int(outfmt)}",
+        }
 
-    stack_req = _parse_stack_request(C.get("STACKS"), np.asarray(dstacks, dtype=int))
-    valid_stacks = _screen_stacks(outputs_dir, stack_req, outfmt=int(outfmt), mode=str(C.get("STACK_CHECK_MODE", "light")))
+    stack_candidates = _as_stack_list(spec.get("STACKS"), dstacks)
+    valid_stacks, skipped_stacks = _screen_stacks(str(outputs_dir), stack_candidates, int(outfmt), cfg)
     if len(valid_stacks) == 0:
-        raise RuntimeError("No valid stacks available after screening.")
+        return {
+            "run_name": run_name,
+            "run_dir": str(run_dir),
+            "output_stem": str(out_stem),
+            "status": "skipped_no_valid_stacks",
+            "stacks_requested": int(len(stack_candidates)),
+            "stacks_valid": 0,
+            "stacks_skipped": int(len(skipped_stacks)),
+        }
 
     start_dnum, start_info = common_get_model_start_datenum(
         str(run_dir),
-        apply_utc_start=bool(C.get("APPLY_UTC_START", False)),
+        apply_utc_start=bool(cfg.get("APPLY_UTC_START", False)),
     )
     if start_dnum is None:
-        raise RuntimeError(f"Cannot parse model start time from param.nml: {start_info}")
+        return {
+            "run_name": run_name,
+            "run_dir": str(run_dir),
+            "output_stem": str(out_stem),
+            "status": "skipped_missing_param_start",
+            "reason": str(start_info),
+        }
 
     model_time, model_stack, model_tidx = _build_model_time_table(
         outputs_dir=outputs_dir,
-        stacks=valid_stacks,
+        stacks=np.asarray(valid_stacks, dtype=int),
         start_dnum=float(start_dnum),
     )
     if len(model_time) == 0:
-        raise RuntimeError("No model times discovered for selected stacks.")
+        return {
+            "run_name": run_name,
+            "run_dir": str(run_dir),
+            "output_stem": str(out_stem),
+            "status": "skipped_no_model_times",
+        }
 
-    _log(
-        f"[INFO] model stacks: requested={len(stack_req):,}, valid={len(valid_stacks):,}, "
-        f"time_records={len(model_time):,}, start={start_info}",
-        verbose=verbose,
-    )
-
-    if bool(C.get("DRY_RUN", False)):
-        _log("[INFO] dry-run requested; exiting before extraction.", verbose=verbose)
-        return
-
-    # ------------------------------------------------------------------
-    # Time matching (nearest)
-    # ------------------------------------------------------------------
-    mod_stack = np.full(n_obs_filtered, -1, dtype=int)
-    mod_tidx = np.full(n_obs_filtered, -1, dtype=int)
-    mod_time = np.full(n_obs_filtered, np.nan, dtype=float)
-    mod_dt_hours = np.full(n_obs_filtered, np.nan, dtype=float)
-    reject_reason = np.asarray([""] * n_obs_filtered, dtype="U64")
+    n_obs = int(len(obs["time_num"]))
+    mod_stack = np.full(n_obs, -1, dtype=int)
+    mod_tidx = np.full(n_obs, -1, dtype=int)
+    mod_time = np.full(n_obs, np.nan, dtype=float)
+    mod_dt_hours = np.full(n_obs, np.nan, dtype=float)
+    reject_reason = np.asarray([""] * n_obs, dtype="U64")
 
     ms, mtidx, mt, mdt = _nearest_model_time(
         obs_time=obs["time_num"],
@@ -954,13 +821,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     no_time = mod_stack < 0
     reject_reason[no_time] = "time_no_bracket_or_no_nearest"
     lag_bad = (mod_stack >= 0) & (
-        ~np.isfinite(mod_dt_hours) | (np.abs(mod_dt_hours) > float(C.get("MAX_TIME_LAG_HOURS", 6.0)))
+        ~np.isfinite(mod_dt_hours) | (np.abs(mod_dt_hours) > float(cfg.get("MAX_TIME_LAG_HOURS", 6.0)))
     )
     reject_reason[lag_bad] = "time_lag_exceeds_threshold"
 
-    # ------------------------------------------------------------------
-    # Prepare spatial coefficients once for all filtered observations
-    # ------------------------------------------------------------------
     gd, vd = grd(str(run_dir), fmt=2)
     pts = np.c_[obs["lon"], obs["lat"]]
     pie, pip, pacor = gd.compute_acor(pts)
@@ -976,23 +840,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if pip.shape[0] != 3:
         raise RuntimeError(f"Unexpected pip shape after normalize: {pip.shape}")
 
-    inside_domain = np.zeros(n_obs_filtered, dtype=int)
+    inside_domain = np.zeros(n_obs, dtype=int)
     inside_domain[(pie >= 0) & np.all(pip >= 0, axis=0)] = 1
 
-    # Matched outputs (filled only for successful interpolation)
-    mod_u = np.full(n_obs_filtered, np.nan, dtype=float)
-    mod_v = np.full(n_obs_filtered, np.nan, dtype=float)
-    mod_speed = np.full(n_obs_filtered, np.nan, dtype=float)
-    mod_dir = np.full(n_obs_filtered, np.nan, dtype=float)
-    matched = np.zeros(n_obs_filtered, dtype=int)
-    depth_interp_ok = np.zeros(n_obs_filtered, dtype=int)
+    mod_u = np.full(n_obs, np.nan, dtype=float)
+    mod_v = np.full(n_obs, np.nan, dtype=float)
+    mod_speed = np.full(n_obs, np.nan, dtype=float)
+    mod_dir = np.full(n_obs, np.nan, dtype=float)
+    matched = np.zeros(n_obs, dtype=int)
+    depth_interp_ok = np.zeros(n_obs, dtype=int)
     elem_id = pie.copy()
 
-    # Outside-domain handling after time matching.
     outside = (inside_domain == 0) & (mod_stack >= 0)
     reject_reason[outside] = "outside_domain"
 
-    # Group by stack/time for extraction.
     need = np.where((mod_stack >= 0) & (inside_domain == 1))[0]
     groups: Dict[Tuple[int, int], List[int]] = defaultdict(list)
     for i in need.tolist():
@@ -1003,14 +864,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         fx = outputs_dir / f"horizontalVelX_{int(stk)}.nc"
         fy = outputs_dir / f"horizontalVelY_{int(stk)}.nc"
         if not fx.exists() or not fy.exists():
-            raise RuntimeError(
-                f"Missing required 3D current files for needed stack {stk}: "
-                f"{fx.name} and/or {fy.name}"
-            )
+            return {
+                "run_name": run_name,
+                "run_dir": str(run_dir),
+                "output_stem": str(out_stem),
+                "status": "failed_missing_model_var",
+                "stack": int(stk),
+                "reason": f"Missing {fx.name} and/or {fy.name}",
+            }
 
-    # ------------------------------------------------------------------
-    # Spatial + vertical interpolation by stack/time chunk
-    # ------------------------------------------------------------------
     for stk in needed_stacks:
         cx, cy, cz, co = _open_required_stack_files(outputs_dir, stack=int(stk))
         try:
@@ -1040,8 +902,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 v_nodes = _read_var_slice_t_node_layer(yvar, int(tidx), unique_nodes, np_nodes=int(gd.np))
                 if u_nodes.shape != v_nodes.shape:
                     raise RuntimeError(
-                        f"Stack {stk}, t={tidx}: horizontalVelX/Y shape mismatch "
-                        f"{u_nodes.shape} vs {v_nodes.shape}"
+                        f"Stack {stk}, t={tidx}: horizontalVelX/Y shape mismatch {u_nodes.shape} vs {v_nodes.shape}"
                     )
 
                 if zvar is not None:
@@ -1089,7 +950,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         reject_reason[oi] = "bad_zcor_or_depth_interp"
                         continue
 
-                    # Convert to free-surface-referenced z for observation depth matching.
                     z_surf = z_prof[-1]
                     if not np.isfinite(z_surf):
                         reject_reason[oi] = "bad_zcor_or_depth_interp"
@@ -1116,25 +976,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     except Exception:
                         pass
 
-    # Any non-time-rejected row still unmatched becomes nan_model_value unless reason already set.
-    unmatched = (matched == 0)
+    unmatched = matched == 0
     empty_reason = reject_reason == ""
     reject_reason[unmatched & empty_reason] = "nan_model_value"
 
-    # ------------------------------------------------------------------
-    # Write paired outputs
-    # ------------------------------------------------------------------
-    out_prefix = str(C.get("OUT_PREFIX", "")).strip()
-    if out_prefix == "":
-        out_prefix = "jodc_ca_schism_pairs"
-    paired_csv = outdir / f"{out_prefix}.csv"
-    paired_npz = outdir / f"{out_prefix}.npz"
-    reject_csv = outdir / f"{out_prefix}_rejects.csv"
-    manifest_cfg = C.get("MANIFEST")
-    manifest_json = _resolve_path(str(manifest_cfg)) if manifest_cfg not in (None, "") else (outdir / f"{out_prefix}_manifest.json")
-
     rows_all: List[Dict[str, Any]] = []
-    for i in range(n_obs_filtered):
+    for i in range(n_obs):
         rows_all.append(
             {
                 "obs_time_num": float(obs["time_num"][i]),
@@ -1171,7 +1018,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
 
     rows = rows_all
-    if str(C.get("OUTSIDE_DOMAIN", "drop")).lower() == "drop":
+    if str(cfg.get("OUTSIDE_DOMAIN", "drop")).lower() == "drop":
         rows = [r for r in rows_all if str(r["reject_reason"]) != "outside_domain"]
 
     fieldnames = [
@@ -1207,26 +1054,34 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "depth_interp_ok",
     ]
 
-    if bool(C.get("WRITE_CSV", True)):
+    if bool(cfg.get("WRITE_CSV", True)):
         _write_csv(paired_csv, fieldnames, rows)
-        _log(f"[OK] wrote: {paired_csv}", verbose=verbose)
-
-    if bool(C.get("WRITE_NPZ", True)):
+    if bool(cfg.get("WRITE_NPZ", True)):
         P = zdata()
         for fn in fieldnames:
             vals = [r[fn] for r in rows]
             if fn.endswith("_utc") or fn in ("obs_source", "obs_data_type", "obs_track_file", "reject_reason"):
                 arr = np.asarray(vals, dtype="U128")
-            elif fn in ("mod_stack", "mod_time_index", "matched", "obs_qc_u", "obs_qc_v", "obs_track_id", "obs_segment_id", "elem_id", "inside_domain", "depth_interp_ok"):
+            elif fn in (
+                "mod_stack",
+                "mod_time_index",
+                "matched",
+                "obs_qc_u",
+                "obs_qc_v",
+                "obs_track_id",
+                "obs_segment_id",
+                "elem_id",
+                "inside_domain",
+                "depth_interp_ok",
+            ):
                 arr = np.asarray(vals, dtype=int)
             else:
                 arr = np.asarray(vals, dtype=float)
             setattr(P, fn, arr)
         savez(str(paired_npz), P)
-        _log(f"[OK] wrote: {paired_npz}", verbose=verbose)
 
     reject_rows = [r for r in rows_all if int(r["matched"]) == 0]
-    if bool(C.get("WRITE_REJECTS_CSV", True)):
+    if bool(cfg.get("WRITE_REJECTS_CSV", True)):
         rej_fields = [
             "obs_time_num",
             "obs_time_utc",
@@ -1248,46 +1103,27 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "reject_reason",
         ]
         _write_csv(reject_csv, rej_fields, reject_rows)
-        _log(f"[OK] wrote: {reject_csv}", verbose=verbose)
 
     reject_counts = Counter([str(r["reject_reason"]) for r in reject_rows])
     matched_rows = [r for r in rows if int(r["matched"]) == 1]
-    manifest = {
-        "config": {
-            "run_dir": str(run_dir),
-            "run_name": str(C.get("RUN_NAME")) if C.get("RUN_NAME") not in (None, "") else run_dir.name,
-            "obs_source_file": obs_source_file,
-            "obs_data_types": obs_types,
-            "obs_sources": obs_sources,
-            "start": _fmt_time(float(start_num)) if start_num is not None else None,
-            "end": _fmt_time(float(end_num)) if end_num is not None else None,
-            "min_depth": C.get("MIN_DEPTH"),
-            "max_depth": C.get("MAX_DEPTH"),
-            "time_match": str(C.get("TIME_MATCH")),
-            "max_time_lag_hours": float(C.get("MAX_TIME_LAG_HOURS", np.nan)),
-            "space_match": str(C.get("SPACE_MATCH")),
-            "depth_match": str(C.get("DEPTH_MATCH")),
-            "outside_domain": str(C.get("OUTSIDE_DOMAIN")),
-            "require_obs_qc_codes": [int(x) for x in qc_keep],
-            "require_inside": bool(C.get("REQUIRE_INSIDE", True)),
-            "stack_check_mode": str(C.get("STACK_CHECK_MODE")),
-            "apply_utc_start": bool(C.get("APPLY_UTC_START", False)),
-            "model_start_info": str(start_info),
-            "stacks_requested": stack_req.astype(int).tolist(),
-            "stacks_valid": valid_stacks.astype(int).tolist(),
-        },
-        "effective_config": cfg,
-        "counts": {
-            "obs_loaded": n_obs_loaded,
-            "obs_filtered": n_obs_filtered,
-            "matched": int(np.count_nonzero(matched == 1)),
-            "rejected": int(np.count_nonzero(matched == 0)),
-            "paired_rows_written": int(len(rows)),
-            "outside_domain_rows_dropped": int(len(rows_all) - len(rows)),
-            "reject_reason_counts": dict(reject_counts),
-            "inside_domain_count": int(np.count_nonzero(inside_domain == 1)),
-            "outside_domain_count": int(np.count_nonzero(inside_domain == 0)),
-        },
+
+    summary = {
+        "run_name": run_name,
+        "run_dir": str(run_dir),
+        "output_stem": str(out_stem),
+        "status": "written",
+        "obs_source_file": str(obs_meta["obs_source_file"]),
+        "obs_filtered": int(len(obs["time_num"])),
+        "matched": int(np.count_nonzero(matched == 1)),
+        "rejected": int(np.count_nonzero(matched == 0)),
+        "paired_rows_written": int(len(rows)),
+        "outside_domain_rows_dropped": int(len(rows_all) - len(rows)),
+        "reject_reason_counts": dict(reject_counts),
+        "inside_domain_count": int(np.count_nonzero(inside_domain == 1)),
+        "outside_domain_count": int(np.count_nonzero(inside_domain == 0)),
+        "model_start_info": str(start_info),
+        "stacks_requested": [int(x) for x in np.asarray(stack_candidates, dtype=int).tolist()],
+        "stacks_valid": [int(x) for x in np.asarray(valid_stacks, dtype=int).tolist()],
         "time_range": {
             "obs_min": _fmt_time(float(np.nanmin(obs["time_num"]))) if len(obs["time_num"]) > 0 else "",
             "obs_max": _fmt_time(float(np.nanmax(obs["time_num"]))) if len(obs["time_num"]) > 0 else "",
@@ -1295,26 +1131,262 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "mod_max_matched": _fmt_time(float(np.nanmax([r["mod_time_num"] for r in matched_rows]))) if len(matched_rows) > 0 else "",
         },
         "outputs": {
-            "paired_csv": str(paired_csv) if bool(C.get("WRITE_CSV", True)) else None,
-            "paired_npz": str(paired_npz) if bool(C.get("WRITE_NPZ", True)) else None,
-            "reject_csv": str(reject_csv) if bool(C.get("WRITE_REJECTS_CSV", True)) else None,
+            "paired_csv": str(paired_csv) if bool(cfg.get("WRITE_CSV", True)) else None,
+            "paired_npz": str(paired_npz) if bool(cfg.get("WRITE_NPZ", True)) else None,
+            "reject_csv": str(reject_csv) if bool(cfg.get("WRITE_REJECTS_CSV", True)) else None,
         },
     }
 
-    manifest_json.parent.mkdir(parents=True, exist_ok=True)
-    with manifest_json.open("w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=True)
-    _log(f"[OK] wrote: {manifest_json}", verbose=verbose)
-
     _log(
-        "[INFO] done:"
-        f" obs_loaded={n_obs_loaded:,},"
-        f" obs_filtered={n_obs_filtered:,},"
-        f" matched={int(np.count_nonzero(matched == 1)):,},"
-        f" rejected={int(np.count_nonzero(matched == 0)):,},"
-        f" paired_rows_written={len(rows):,}",
+        f"[OK] {run_name}: filtered={summary['obs_filtered']:,}, matched={summary['matched']:,}, "
+        f"rejected={summary['rejected']:,}, rows={summary['paired_rows_written']:,}",
         verbose=verbose,
     )
+    return summary
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Extract SCHISM currents collocated at JODC trajectory observations.")
+    p.add_argument("--config", help="Optional JSON config overrides.")
+    p.add_argument("--manifest", help="Optional output JSON summary path.")
+
+    # Observation input/filter overrides
+    p.add_argument("--obs-csv", help="Override CONFIG['OBS_CSV'].")
+    p.add_argument("--obs-npz", help="Override CONFIG['OBS_NPZ'].")
+    p.add_argument("--obs-data-types", nargs="+", help="Override CONFIG['OBS_DATA_TYPES'].")
+    p.add_argument("--obs-sources", nargs="+", help="Override CONFIG['OBS_SOURCES'].")
+    p.add_argument("--start", help="UTC start time (YYYY-MM-DD[ HH:MM[:SS]]).")
+    p.add_argument("--end", help="UTC end time (YYYY-MM-DD[ HH:MM[:SS]]).")
+    p.add_argument("--min-depth", type=float)
+    p.add_argument("--max-depth", type=float)
+    p.add_argument("--require-obs-qc-codes", nargs="+")
+    p.add_argument("--require-inside", dest="require_inside", action="store_true")
+    p.add_argument("--no-require-inside", dest="require_inside", action="store_false")
+
+    # Matching/runtime overrides
+    p.add_argument("--stacks", nargs="+", type=int, help="Global stack override: [start end] or explicit list.")
+    p.add_argument("--stack-check-mode", choices=["none", "light", "size", "light+size"])
+    p.add_argument("--max-time-lag-hours", type=float)
+    p.add_argument("--outside-domain", choices=["drop", "nan"])
+    p.add_argument("--apply-utc-start", dest="apply_utc_start", action="store_true")
+    p.add_argument("--no-apply-utc-start", dest="apply_utc_start", action="store_false")
+
+    # Output overrides
+    p.add_argument("--write-csv", dest="write_csv", action="store_true")
+    p.add_argument("--no-write-csv", dest="write_csv", action="store_false")
+    p.add_argument("--write-npz", dest="write_npz", action="store_true")
+    p.add_argument("--no-write-npz", dest="write_npz", action="store_false")
+    p.add_argument("--write-rejects-csv", dest="write_rejects_csv", action="store_true")
+    p.add_argument("--no-write-rejects-csv", dest="write_rejects_csv", action="store_false")
+
+    p.add_argument("--dry-run", action="store_true", help="Resolve runs/stacks and observation counts, then exit.")
+    p.add_argument("--verbose", dest="verbose", action="store_true")
+    p.add_argument("--quiet", dest="verbose", action="store_false")
+
+    p.set_defaults(
+        require_inside=None,
+        apply_utc_start=None,
+        write_csv=None,
+        write_npz=None,
+        write_rejects_csv=None,
+        verbose=None,
+    )
+    return p.parse_args(argv)
+
+
+def _apply_cli(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    out = deep_update_dict(copy.deepcopy(cfg), _load_json_config(args.config), merge_list_of_dicts=False)
+
+    if args.manifest is not None:
+        out["MANIFEST"] = str(args.manifest)
+
+    if args.obs_csv is not None:
+        out["OBS_CSV"] = str(args.obs_csv)
+        out["OBS_NPZ"] = None
+    if args.obs_npz is not None:
+        out["OBS_NPZ"] = str(args.obs_npz)
+        out["OBS_CSV"] = None
+    if args.obs_data_types is not None:
+        out["OBS_DATA_TYPES"] = tuple(str(x).strip().upper() for x in args.obs_data_types if str(x).strip() != "")
+    if args.obs_sources is not None:
+        out["OBS_SOURCES"] = [str(x).strip() for x in args.obs_sources if str(x).strip() != ""]
+    if args.start is not None:
+        out["START"] = str(args.start)
+    if args.end is not None:
+        out["END"] = str(args.end)
+    if args.min_depth is not None:
+        out["MIN_DEPTH"] = float(args.min_depth)
+    if args.max_depth is not None:
+        out["MAX_DEPTH"] = float(args.max_depth)
+    if args.require_obs_qc_codes is not None:
+        out["REQUIRE_OBS_QC_CODES"] = _parse_int_set(args.require_obs_qc_codes, default=[0])
+    if args.require_inside is not None:
+        out["REQUIRE_INSIDE"] = bool(args.require_inside)
+
+    if args.stacks is not None:
+        vals = [int(v) for v in args.stacks]
+        out["STACKS"] = vals if len(vals) != 2 else [vals[0], vals[1]]
+    if args.stack_check_mode is not None:
+        out["STACK_CHECK_MODE"] = str(args.stack_check_mode).lower()
+    if args.max_time_lag_hours is not None:
+        out["MAX_TIME_LAG_HOURS"] = float(args.max_time_lag_hours)
+    if args.outside_domain is not None:
+        out["OUTSIDE_DOMAIN"] = str(args.outside_domain).lower()
+    if args.apply_utc_start is not None:
+        out["APPLY_UTC_START"] = bool(args.apply_utc_start)
+
+    if args.write_csv is not None:
+        out["WRITE_CSV"] = bool(args.write_csv)
+    if args.write_npz is not None:
+        out["WRITE_NPZ"] = bool(args.write_npz)
+    if args.write_rejects_csv is not None:
+        out["WRITE_REJECTS_CSV"] = bool(args.write_rejects_csv)
+
+    if args.dry_run:
+        out["DRY_RUN"] = True
+    if args.verbose is not None:
+        out["VERBOSE"] = bool(args.verbose)
+    return out
+
+
+def _validate_config(cfg: Dict[str, Any]) -> None:
+    runs = cfg.get("RUNS")
+    if not isinstance(runs, (list, tuple)) or len(runs) == 0:
+        raise ValueError("RUNS must be a non-empty list of run specs.")
+
+    if cfg.get("OBS_CSV") in (None, "") and cfg.get("OBS_NPZ") in (None, ""):
+        raise ValueError("Configure OBS_CSV or OBS_NPZ.")
+
+    if str(cfg.get("TIME_MATCH", "nearest")).lower() != "nearest":
+        raise ValueError("Only TIME_MATCH='nearest' is supported in phase-1.")
+    if str(cfg.get("SPACE_MATCH", "fem")).lower() != "fem":
+        raise ValueError("Only SPACE_MATCH='fem' is supported in phase-1.")
+    if str(cfg.get("DEPTH_MATCH", "interp")).lower() != "interp":
+        raise ValueError("Only DEPTH_MATCH='interp' is supported in phase-1.")
+
+    mode = str(cfg.get("STACK_CHECK_MODE", "light")).lower()
+    if mode not in {"none", "light", "size", "light+size"}:
+        raise ValueError(f"Invalid STACK_CHECK_MODE: {mode}")
+
+    od = str(cfg.get("OUTSIDE_DOMAIN", "drop")).lower()
+    if od not in {"drop", "nan"}:
+        raise ValueError(f"Invalid OUTSIDE_DOMAIN: {od}")
+
+    qcodes = _parse_int_set(cfg.get("REQUIRE_OBS_QC_CODES"), default=[0])
+    if len(qcodes) == 0:
+        raise ValueError("REQUIRE_OBS_QC_CODES must not be empty.")
+
+
+def _dry_run_report(run_specs: List[Dict[str, Any]], cfg: Dict[str, Any], obs_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    summaries: List[Dict[str, Any]] = []
+    verbose = bool(cfg.get("VERBOSE", True))
+    for spec in run_specs:
+        run = str(spec["RUN"])
+        run_name = str(spec.get("NAME", os.path.basename(os.path.abspath(run))))
+        out_stem = str(_resolve_output_stem(str(spec.get("SNAME"))))
+        outputs_dir = _resolve_path(run) / "outputs"
+
+        if not outputs_dir.is_dir():
+            _log(f"[DRY-RUN] {run_name}: missing outputs dir -> {outputs_dir}", verbose=verbose)
+            summaries.append(
+                {
+                    "run_name": run_name,
+                    "run_dir": str(_resolve_path(run)),
+                    "output_stem": out_stem,
+                    "status": "missing_outputs_dir",
+                }
+            )
+            continue
+
+        try:
+            modules, outfmt, dstacks, dvars, dvars_2d = schout_info(str(outputs_dir), 1)
+            _ = modules
+            _ = dvars
+            _ = dvars_2d
+        except Exception as exc:
+            _log(f"[DRY-RUN] {run_name}: schout_info failed: {exc}", verbose=verbose)
+            summaries.append(
+                {
+                    "run_name": run_name,
+                    "run_dir": str(_resolve_path(run)),
+                    "output_stem": out_stem,
+                    "status": "schout_info_failed",
+                    "reason": str(exc),
+                }
+            )
+            continue
+
+        cand = _as_stack_list(spec.get("STACKS"), dstacks)
+        valid, skipped = _screen_stacks(str(outputs_dir), cand, int(outfmt), cfg)
+        _log(
+            f"[DRY-RUN] {run_name}: run={_resolve_path(run)}, out={out_stem}, "
+            f"obs_filtered={obs_meta['obs_filtered']:,}, candidates={len(cand)}, valid={len(valid)}, skipped={len(skipped)}",
+            verbose=verbose,
+        )
+        summaries.append(
+            {
+                "run_name": run_name,
+                "run_dir": str(_resolve_path(run)),
+                "output_stem": out_stem,
+                "status": "dry_run",
+                "obs_filtered": int(obs_meta["obs_filtered"]),
+                "stacks_requested": int(len(cand)),
+                "stacks_valid": int(len(valid)),
+                "stacks_skipped": int(len(skipped)),
+            }
+        )
+    return summaries
+
+
+def _write_manifest(cfg: Dict[str, Any], run_specs: List[Dict[str, Any]], run_summaries: List[Dict[str, Any]]) -> None:
+    mpath = cfg.get("MANIFEST")
+    if not mpath:
+        return
+    out = _resolve_path(str(mpath))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "script": str(_resolve_path(__file__)),
+        "dry_run": bool(cfg.get("DRY_RUN", False)),
+        "run_count": int(len(run_specs)),
+        "runs": run_summaries,
+    }
+    with out.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=True)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = _parse_args(argv)
+    cfg = _apply_cli(CONFIG, args)
+    _validate_config(cfg)
+
+    verbose = bool(cfg.get("VERBOSE", True))
+    run_specs = _normalize_run_specs(cfg)
+    if len(run_specs) == 0:
+        raise ValueError("No runs configured.")
+
+    obs, obs_meta = _load_and_filter_observations(cfg)
+    _log(
+        f"[INFO] observations: loaded={obs_meta['obs_loaded']:,}, filtered={obs_meta['obs_filtered']:,}, "
+        f"types={obs_meta['obs_types'] if len(obs_meta['obs_types']) > 0 else 'ALL'}, qc={obs_meta['qc_keep']}",
+        verbose=verbose,
+    )
+    _log(f"[INFO] runs to process: {len(run_specs)}", verbose=verbose)
+
+    if bool(cfg.get("DRY_RUN", False)):
+        run_summaries = _dry_run_report(run_specs, cfg, obs_meta)
+        _write_manifest(cfg, run_specs, run_summaries)
+        return
+
+    run_summaries: List[Dict[str, Any]] = []
+    for i, spec in enumerate(run_specs, start=1):
+        _log(f"---- Run {i}/{len(run_specs)}: {spec['NAME']} ----", verbose=verbose)
+        rs = _process_one_run(spec, cfg, obs, obs_meta)
+        run_summaries.append(rs)
+
+    _write_manifest(cfg, run_specs, run_summaries)
 
 
 if __name__ == "__main__":
