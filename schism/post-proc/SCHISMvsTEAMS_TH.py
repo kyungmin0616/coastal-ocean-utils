@@ -22,7 +22,7 @@ CONFIG = dict(
             "./npz/RUN01g_SB_D2.npz",
             "./npz/RUN03a_SB_D2.npz",
             "./npz/RUN04a_SB_D2.npz",
-            "./npz/RUN04a_SB_D2.npz",
+            "./npz/RUN05a_SB_D2.npz",
 
         ],
         "labels": ["RUN01g", "RUN03a", "RUN04a", "RUN05a"],
@@ -36,7 +36,7 @@ CONFIG = dict(
         "path": "./npz/sendai_d2_timeseries.npz",
     },
     stations={
-        "bpfile": "station_sendai_d2.bp",  # station metadata file (order/names)
+        "bpfile": "./stations/station_sendai_d2.bp",  # station metadata file (order/names)
         "list": None,  # optional station subset (ids/names); None=all
         "depth": None,  # target TEAMS depth (m); None=use all depths
         "depth_tol": 0.5,  # depth match tolerance (m) when depth is set

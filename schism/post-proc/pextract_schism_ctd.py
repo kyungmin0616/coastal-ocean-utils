@@ -10,26 +10,9 @@ Workflow:
 5) Save one NPZ with obs + model-ready matched arrays.
 """
 
-import argparse
-import os
-import re
-import time
-from glob import glob
-
-import numpy as np
-from pylib import *  # noqa: F403
-
-try:
-    from mpi4py import MPI  # type: ignore
-
-    COMM = MPI.COMM_WORLD
-    RANK = COMM.Get_rank()
-    SIZE = COMM.Get_size()
-except Exception:
-    COMM = None
-    RANK = 0
-    SIZE = 1
-
+# =============================================================================
+# Configuration
+# =============================================================================
 CONFIG = dict(
     # Observation NPZ (TEAMS CTD)
     OBS_NPZ="/scratch2/08924/kmpark/post-proc/npz/onagawa_d2_ctd.npz",
@@ -75,47 +58,132 @@ CONFIG = dict(
     VERBOSE=True,
     LOG_SKIP_STACK_DETAILS=10,  # print first N skipped stack reasons
     LOG_EVERY_STACK=1,  # stack progress interval per rank
+    MPI_DISTRIBUTION="auto",  # auto | run | stack
+    DRY_RUN=False,
+    MANIFEST=None,  # optional JSON summary path
+)
+
+# =============================================================================
+# Imports
+# =============================================================================
+import argparse
+import os
+import sys
+import time
+import json
+from pathlib import Path
+
+import numpy as np
+from pylib import *  # noqa: F403
+
+# =============================================================================
+# Shared Utilities / MPI Runtime
+# =============================================================================
+_COMMON_CANDIDATE_DIRS = []
+_env_pylibs_src = os.environ.get("PYLIBS_SRC")
+if _env_pylibs_src:
+    _COMMON_CANDIDATE_DIRS.append(Path(_env_pylibs_src).expanduser())
+try:
+    _COMMON_CANDIDATE_DIRS.append(Path(__file__).resolve().parents[3] / "pylibs" / "src")
+except Exception:
+    pass
+_COMMON_CANDIDATE_DIRS.append(Path.home() / "Documents" / "Codes" / "pylibs" / "src")
+for _common_dir in _COMMON_CANDIDATE_DIRS:
+    if _common_dir.is_dir():
+        _common_dir_str = str(_common_dir)
+        if _common_dir_str not in sys.path:
+            sys.path.insert(0, _common_dir_str)
+
+try:
+    from postproc_common import (
+        init_mpi_runtime,
+        rank_log,
+        normalize_stack_list,
+        primary_stack_file,
+        screen_stacks as common_screen_stacks,
+        get_model_start_datenum as common_get_model_start_datenum,
+        read_stack_times_abs as common_read_stack_times_abs,
+        normalize_run_specs as common_normalize_run_specs,
+        deep_update_dict,
     )
+except Exception as exc:
+    missing = [
+        name
+        for name in (
+            "init_mpi_runtime",
+            "rank_log",
+            "normalize_stack_list",
+            "primary_stack_file",
+            "common_screen_stacks",
+            "common_get_model_start_datenum",
+            "common_read_stack_times_abs",
+            "common_normalize_run_specs",
+            "deep_update_dict",
+        )
+        if name not in globals()
+    ]
+    if missing:
+        raise ImportError(
+            "Shared helpers not found. Set PYLIBS_SRC to pylibs/src or install "
+            f"postproc_common. Missing: {', '.join(missing)}"
+        ) from exc
 
+MPI, COMM, RANK, SIZE, USE_MPI = init_mpi_runtime(sys.argv)
 
+# =============================================================================
+# Core Helpers
+# =============================================================================
 def _log(msg, all_ranks=False):
-    if (not all_ranks) and (RANK != 0):
-        return
-    prefix = f"[rank {RANK}/{SIZE}] " if SIZE > 1 else ""
-    print(prefix + str(msg), flush=True)
-
-
-def _to_scalar(v, default=None):
-    if v is None:
-        return default
-    if isinstance(v, (list, tuple, np.ndarray)):
-        if len(v) == 0:
-            return default
-        return v[0]
-    return v
+    rank_log(str(msg), rank=RANK, size=SIZE, rank0_only=(not bool(all_ranks)))
 
 
 def _as_stack_list(stacks, dstacks):
-    if stacks is None:
-        return np.array(sorted(set([int(i) for i in np.array(dstacks).ravel()])), dtype=int)
-    if isinstance(stacks, (list, tuple)) and len(stacks) == 2:
-        return np.arange(int(stacks[0]), int(stacks[1]) + 1, dtype=int)
-    return np.array(sorted(set([int(i) for i in np.array(stacks).ravel()])), dtype=int)
+    return normalize_stack_list(stacks, dstacks)
 
 
 def _parse_args():
     p = argparse.ArgumentParser(description="Extract SCHISM CTD profiles for TEAMS observations.")
+    p.add_argument("--config", help="Optional JSON config overrides.")
     p.add_argument("--obs-npz", help="Override CONFIG['OBS_NPZ']")
     p.add_argument("--out-npz", help="Override output npz path")
+    p.add_argument("--run", help="Override CONFIG['RUN'] and force single-run mode.")
+    p.add_argument("--manifest", help="Optional output JSON summary path.")
     p.add_argument("--sname-template", help="Override per-run output template for multi-run.")
     p.add_argument("--max-lag-hours", type=float, help="Override CONFIG['MAX_TIME_LAG_HOURS']")
     p.add_argument("--time-field", help="Override CONFIG['OBS_FIELDS']['time']")
+    p.add_argument("--stacks", nargs="+", type=int, help="Override stack selection.")
+    p.add_argument("--stack-check-mode", choices=["none", "light", "size", "light+size"])
+    p.add_argument(
+        "--mpi-distribution",
+        choices=["auto", "run", "stack"],
+        help="MPI work split: by run or by stack within run.",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Resolve run/stack/profile counts and exit.")
+    p.add_argument("--verbose", dest="verbose", action="store_true")
+    p.add_argument("--quiet", dest="verbose", action="store_false")
+    p.add_argument("--apply-param-start-time", dest="apply_param_start_time", action="store_true")
+    p.add_argument("--no-apply-param-start-time", dest="apply_param_start_time", action="store_false")
+    p.add_argument("--apply-utc-start", dest="apply_utc_start", action="store_true")
+    p.add_argument("--no-apply-utc-start", dest="apply_utc_start", action="store_false")
+    p.set_defaults(verbose=None, apply_param_start_time=None, apply_utc_start=None)
     return p.parse_args()
 
 
+def _load_json_config(config_path):
+    if config_path is None:
+        return {}
+    with open(str(config_path), "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError(f"--config must contain a JSON object: {config_path}")
+    return obj
+
+
 def _apply_cli(cfg, args):
-    out = dict(cfg)
-    out["OBS_FIELDS"] = dict(cfg["OBS_FIELDS"])
+    out = deep_update_dict(cfg, _load_json_config(args.config), merge_list_of_dicts=True)
+    if args.run:
+        out["RUN"] = args.run
+        out["RUNS"] = None
     if args.obs_npz:
         out["OBS_NPZ"] = args.obs_npz
     if args.out_npz:
@@ -127,6 +195,23 @@ def _apply_cli(cfg, args):
         out["MAX_TIME_LAG_HOURS"] = float(args.max_lag_hours)
     if args.time_field:
         out["OBS_FIELDS"]["time"] = str(args.time_field)
+    if args.stacks is not None:
+        vals = [int(v) for v in args.stacks]
+        out["STACKS"] = vals if len(vals) != 2 else [vals[0], vals[1]]
+    if args.stack_check_mode:
+        out["STACK_CHECK_MODE"] = str(args.stack_check_mode)
+    if args.mpi_distribution:
+        out["MPI_DISTRIBUTION"] = str(args.mpi_distribution).lower()
+    if args.dry_run:
+        out["DRY_RUN"] = True
+    if args.manifest:
+        out["MANIFEST"] = str(args.manifest)
+    if args.verbose is not None:
+        out["VERBOSE"] = bool(args.verbose)
+    if args.apply_param_start_time is not None:
+        out["APPLY_PARAM_START_TIME"] = bool(args.apply_param_start_time)
+    if args.apply_utc_start is not None:
+        out["APPLY_UTC_START"] = bool(args.apply_utc_start)
     return out
 
 
@@ -137,175 +222,55 @@ def _ensure_parent(path):
 
 
 def _parse_run_specs(cfg):
-    runs = cfg.get("RUNS")
-    specs = []
     combined_npz = cfg.get("OUT_NPZ")
-    if runs:
-        template = str(cfg.get("SNAME_TEMPLATE", "./npz/ctd_pairs_{run_name}"))
-        for i, item in enumerate(runs):
-            if isinstance(item, str):
-                item = dict(run_dir=item)
-            if not isinstance(item, dict):
-                raise ValueError(f"RUNS[{i}] must be dict or string")
-            run = item.get("run_dir", item.get("RUN"))
-            if run is None:
-                raise ValueError(f"RUNS[{i}] missing run_dir/RUN")
-            name = item.get("name", item.get("NAME", os.path.basename(os.path.abspath(run))))
-            out_npz = item.get("SNAME", item.get("sname", item.get("out_npz")))
-            if out_npz is None:
-                out_npz = template.format(run_name=name, run=run)
-            specs.append(dict(name=str(name), run_dir=str(run), out_npz=str(out_npz)))
-    else:
-        run = cfg.get("RUN")
-        if run is None:
-            raise ValueError("Either RUNS or RUN must be configured.")
-        name = cfg.get("RUN_NAME") or os.path.basename(os.path.abspath(run))
-        out_npz = cfg.get("SNAME", cfg["OUT_NPZ"])
-        specs.append(dict(name=str(name), run_dir=str(run), out_npz=str(out_npz)))
+    common_specs = common_normalize_run_specs(
+        cfg,
+        run_keys=("RUN", "run_dir", "run"),
+        name_keys=("name", "NAME", "RUN_NAME"),
+        output_keys=("out_npz", "SNAME", "sname"),
+        output_template_key="SNAME_TEMPLATE",
+        default_output_template="./npz/{run_name}_OB_D2",
+    )
+    specs = [
+        {"name": spec["NAME"], "run_dir": spec["RUN"], "out_npz": spec["SNAME"]}
+        for spec in common_specs
+    ]
     return specs, combined_npz
 
 
 def _get_model_start_datenum(run_dir, apply_utc_start=False):
-    pfile = os.path.join(run_dir, "param.nml")
-    if not os.path.exists(pfile):
-        return None, f"param.nml not found in {run_dir}"
-    try:
-        p = read_schism_param(pfile, 1)  # noqa: F403
-    except Exception as exc:
-        return None, f"failed to parse param.nml: {exc}"
-
-    try:
-        sy = int(_to_scalar(p.get("start_year")))
-        sm = int(_to_scalar(p.get("start_month")))
-        sd = int(_to_scalar(p.get("start_day")))
-        sh = float(_to_scalar(p.get("start_hour"), 0.0))
-        us = float(_to_scalar(p.get("utc_start"), 0.0))
-    except Exception as exc:
-        return None, f"invalid start fields in param.nml: {exc}"
-
-    d0 = float(datenum(sy, sm, sd))  # noqa: F403
-    d0 += sh / 24.0
-    if apply_utc_start:
-        d0 -= us / 24.0
-    return d0, f"{sy:04d}-{sm:02d}-{sd:02d} {sh:05.2f}h utc_start={us}"
+    return common_get_model_start_datenum(
+        run_dir,
+        apply_utc_start=bool(apply_utc_start),
+        read_schism_param_func=read_schism_param,  # noqa: F405
+        datenum_func=datenum,  # noqa: F405
+    )
 
 
-def _primary_stack_file(outputs_dir, stack, outfmt):
-    if outfmt == 0:
-        fn = os.path.join(outputs_dir, f"out2d_{stack}.nc")
-        return fn if os.path.exists(fn) else None
-    cand = sorted(glob(os.path.join(outputs_dir, f"schout_*_{stack}.nc")))
-    if cand:
-        return cand[0]
-    fn = os.path.join(outputs_dir, f"schout_{stack}.nc")
-    return fn if os.path.exists(fn) else None
-
-
-def _stack_files_for_check(outputs_dir, stack, outfmt, check_all_files=False):
-    primary = _primary_stack_file(outputs_dir, stack, outfmt)
-    if primary is None:
-        return []
-    if not check_all_files:
-        return [primary]
-    files = sorted(glob(os.path.join(outputs_dir, f"*_{stack}.nc")))
-    if not files:
-        return [primary]
-    if primary not in files:
-        files.insert(0, primary)
-    return files
-
-
-def _header_time_ok(nc_path):
-    c = None
-    try:
-        c = ReadNC(nc_path, 1)  # noqa: F403
-        if "time" not in c.variables:
-            return False, "missing time variable"
-        tvar = c.variables["time"]
-        if hasattr(tvar, "shape") and len(tvar.shape) > 0:
-            nt = int(tvar.shape[0])
-        else:
-            nt = int(len(np.array(tvar)))
-        if nt <= 0:
-            return False, "empty time variable"
-        _ = float(np.array(tvar[0]).ravel()[0])
-        return True, "ok"
-    except Exception as exc:
-        return False, str(exc)
-    finally:
-        if c is not None:
-            try:
-                c.close()
-            except Exception:
-                pass
-
-
-def _size_ok(path, ref_size, ratio_min=0.70, abs_min_bytes=None):
-    try:
-        size = int(os.path.getsize(path))
-    except Exception as exc:
-        return False, f"size check failed: {exc}"
-    if abs_min_bytes is not None and size < int(abs_min_bytes):
-        return False, f"size={size} < abs_min={int(abs_min_bytes)}"
-    thr = float(ratio_min) * float(ref_size)
-    if size < thr:
-        return False, f"size={size} < ratio_min*median={int(thr)}"
-    return True, "ok"
-
-
-def _screen_stacks(outputs_dir, stacks, outfmt, mode="light", check_all_files=False, ratio_min=0.70, abs_min_bytes=None):
-    mode = "none" if mode is None else str(mode).lower()
-    stacks = [int(i) for i in np.array(stacks).ravel()]
-    if len(stacks) == 0:
-        return np.array([], dtype=int), {}
-
-    primary = {}
-    for st in stacks:
-        p = _primary_stack_file(outputs_dir, st, outfmt)
-        if p is not None:
-            primary[st] = p
-
-    ref_size = None
-    sizes = [os.path.getsize(fp) for fp in primary.values() if os.path.exists(fp)]
-    if sizes:
-        ref_size = int(np.median(np.array(sizes, dtype=float)))
-
-    valid = []
-    skipped = {}
-    for st in stacks:
-        files = _stack_files_for_check(outputs_dir, st, outfmt, check_all_files=check_all_files)
-        if not files:
-            skipped[st] = "missing primary stack file"
-            continue
-
-        need_light = mode in {"light", "light+size"}
-        need_size = mode in {"size", "light+size"}
-        ok = True
-        reason = ""
-
-        if need_light:
-            for fn in files:
-                f_ok, f_reason = _header_time_ok(fn)
-                if not f_ok:
-                    ok = False
-                    reason = f"{os.path.basename(fn)}: {f_reason}"
-                    break
-        if ok and need_size and ref_size is not None:
-            for fn in files:
-                s_ok, s_reason = _size_ok(fn, ref_size, ratio_min=ratio_min, abs_min_bytes=abs_min_bytes)
-                if not s_ok:
-                    ok = False
-                    reason = f"{os.path.basename(fn)}: {s_reason}"
-                    break
-
-        if mode == "none":
-            ok = True
-
-        if ok:
-            valid.append(st)
-        else:
-            skipped[st] = reason if reason else "stack check failed"
-    return np.array(valid, dtype=int), skipped
+def _screen_stacks(
+    outputs_dir,
+    stacks,
+    outfmt,
+    mode="light",
+    check_all_files=False,
+    ratio_min=0.70,
+    abs_min_bytes=None,
+    verbose=True,
+    log_limit=10,
+):
+    logger = _log if (RANK == 0 and bool(verbose)) else None
+    return common_screen_stacks(
+        outputs_dir=outputs_dir,
+        stacks=stacks,
+        outfmt=outfmt,
+        mode=mode,
+        check_all_files=check_all_files,
+        ratio_min=ratio_min,
+        abs_min_bytes=abs_min_bytes,
+        readnc=lambda p: ReadNC(p, 1),  # noqa: F403
+        logger=logger,
+        log_limit=int(log_limit),
+    )
 
 
 def _convert_obs_time_to_datenum(time_arr):
@@ -445,19 +410,12 @@ def _time_var_to_days(tvar):
 
 
 def _read_stack_times_abs(nc_path, start_dn):
-    c = ReadNC(nc_path, 1)  # noqa: F403
-    try:
-        if "time" not in c.variables:
-            return np.array([], dtype=float)
-        t_days = _time_var_to_days(c.variables["time"])
-        if start_dn is None:
-            return t_days.astype(float)
-        return (t_days + float(start_dn)).astype(float)
-    finally:
-        try:
-            c.close()
-        except Exception:
-            pass
+    return common_read_stack_times_abs(
+        nc_path,
+        start_datenum=start_dn,
+        readnc=lambda p: ReadNC(p, 1),  # noqa: F403
+        time_to_days=_time_var_to_days,
+    )
 
 
 def _assign_profiles_to_stacks(time_obs, stack_ids, stack_tmin, stack_tmax, stack_tmid):
@@ -559,7 +517,98 @@ def _interp_on_obs_depth(model_depth, model_val, obs_depth):
     return out
 
 
-def _extract_run(run_spec, obs_pack, cfg):
+def _pack_native_lists(native_depth_list, native_temp_list, native_sal_list, nprof):
+    nlev_native = np.zeros(nprof, dtype=int)
+    max_native = 0
+    for i in range(nprof):
+        arr = native_depth_list[i]
+        if arr is None:
+            continue
+        nlev_native[i] = int(len(arr))
+        if nlev_native[i] > max_native:
+            max_native = nlev_native[i]
+
+    mdepth_native = np.full((nprof, max_native), np.nan, dtype=float)
+    mtemp_native = np.full((nprof, max_native), np.nan, dtype=float)
+    msal_native = np.full((nprof, max_native), np.nan, dtype=float)
+    for i in range(nprof):
+        nn = int(nlev_native[i])
+        if nn <= 0:
+            continue
+        mdepth_native[i, :nn] = native_depth_list[i]
+        mtemp_native[i, :nn] = native_temp_list[i]
+        msal_native[i, :nn] = native_sal_list[i]
+    return mdepth_native, mtemp_native, msal_native, nlev_native
+
+
+def _merge_stack_parallel_parts(parts):
+    if len(parts) == 0:
+        return None
+    base = parts[0]
+    nprof, max_lev = base["model_temp"].shape
+    mtemp = np.full((nprof, max_lev), np.nan, dtype=float)
+    msal = np.full((nprof, max_lev), np.nan, dtype=float)
+    mtime = np.full(nprof, np.nan, dtype=float)
+    mlag_h = np.full(nprof, np.nan, dtype=float)
+    mstack = np.full(nprof, -1, dtype=int)
+    qc = np.full(nprof, -1, dtype=int)
+
+    native_depth_list = [None] * nprof
+    native_temp_list = [None] * nprof
+    native_sal_list = [None] * nprof
+
+    for part in parts:
+        tmask = np.isfinite(part["model_time"])
+        mtime[tmask] = part["model_time"][tmask]
+        lmask = np.isfinite(part["model_lag_hours"])
+        mlag_h[lmask] = part["model_lag_hours"][lmask]
+        smask = part["model_stack"] >= 0
+        mstack[smask] = part["model_stack"][smask]
+        qmask = part["qc_flag"] >= 0
+        qc[qmask] = part["qc_flag"][qmask]
+
+        t2 = np.isfinite(part["model_temp"])
+        mtemp[t2] = part["model_temp"][t2]
+        s2 = np.isfinite(part["model_sal"])
+        msal[s2] = part["model_sal"][s2]
+
+        dlist = part.get("native_depth_list", [])
+        tlist = part.get("native_temp_list", [])
+        slist = part.get("native_sal_list", [])
+        for i in range(nprof):
+            if i < len(dlist) and dlist[i] is not None:
+                native_depth_list[i] = np.asarray(dlist[i], dtype=float)
+                native_temp_list[i] = np.asarray(tlist[i], dtype=float)
+                native_sal_list[i] = np.asarray(slist[i], dtype=float)
+
+    mdepth_native, mtemp_native, msal_native, nlev_native = _pack_native_lists(
+        native_depth_list,
+        native_temp_list,
+        native_sal_list,
+        nprof,
+    )
+
+    return dict(
+        run_name=base["run_name"],
+        run_dir=base["run_dir"],
+        model_start=base["model_start"],
+        stack_count=base["stack_count"],
+        model_temp=mtemp,
+        model_sal=msal,
+        model_time=mtime,
+        model_lag_hours=mlag_h,
+        model_stack=mstack,
+        qc_flag=qc,
+        model_depth_native=mdepth_native,
+        model_temp_native=mtemp_native,
+        model_sal_native=msal_native,
+        model_nlev_native=nlev_native,
+        has_interp=base["has_interp"],
+        has_native=base["has_native"],
+    )
+
+
+def _extract_run(run_spec, obs_pack, cfg, stack_parallel=False):
     run_name = run_spec["name"]
     run_dir = run_spec["run_dir"]
     outputs_dir = os.path.join(run_dir, "outputs")
@@ -577,6 +626,8 @@ def _extract_run(run_spec, obs_pack, cfg):
         check_all_files=bool(cfg.get("STACK_CHECK_ALL_FILES", False)),
         ratio_min=float(cfg.get("STACK_SIZE_RATIO_MIN", 0.70)),
         abs_min_bytes=cfg.get("STACK_SIZE_MIN_BYTES"),
+        verbose=bool(cfg.get("VERBOSE", True)),
+        log_limit=int(cfg.get("LOG_SKIP_STACK_DETAILS", 10)),
     )
     if cfg.get("VERBOSE", True):
         _log(f"[{run_name}] candidates={len(candidates)}, valid={len(valid_stacks)}, skipped={len(skipped)}", all_ranks=True)
@@ -603,7 +654,7 @@ def _extract_run(run_spec, obs_pack, cfg):
     stack_tmid = []
     stack_times = {}
     for st in valid_stacks:
-        fp = _primary_stack_file(outputs_dir, int(st), outfmt)
+        fp = primary_stack_file(outputs_dir, int(st), outfmt)
         if fp is None:
             continue
         tabs = _read_stack_times_abs(fp, start_dn)
@@ -646,9 +697,18 @@ def _extract_run(run_spec, obs_pack, cfg):
 
     cvars = ["zcor", "temp", "salt"]
     uniq_st = np.unique(p2s)
+    all_work_st = [int(st) for st in uniq_st if int(st) >= 0]
+    if bool(stack_parallel) and SIZE > 1:
+        work_st = [st for i, st in enumerate(all_work_st) if (i % SIZE) == RANK]
+    else:
+        work_st = all_work_st
+
     if cfg.get("VERBOSE", True):
-        _log(f"[{run_name}] stacks with assigned profiles: {len(uniq_st[uniq_st >= 0])}", all_ranks=True)
-    for ist, st in enumerate(uniq_st):
+        _log(
+            f"[{run_name}] assigned stacks this rank: {len(work_st)}/{len(all_work_st)}",
+            all_ranks=bool(stack_parallel),
+        )
+    for ist, st in enumerate(work_st):
         if st < 0:
             continue
         pidx = np.where(p2s == st)[0]
@@ -704,38 +764,21 @@ def _extract_run(run_spec, obs_pack, cfg):
             qc[iobs] = 0
         if cfg.get("VERBOSE", True):
             log_every = max(1, int(cfg.get("LOG_EVERY_STACK", 1)))
-            if ((ist + 1) % log_every == 0) or (ist == len(uniq_st) - 1):
+            if ((ist + 1) % log_every == 0) or (ist == len(work_st) - 1):
                 _log(
-                    f"[{run_name}] stack {int(st)} done ({ist + 1}/{len(uniq_st)}), "
+                    f"[{run_name}] stack {int(st)} done ({ist + 1}/{len(work_st)}), "
                     f"profiles={len(pidx)}, elapsed={time.time() - t_stack0:.2f}s",
                     all_ranks=True,
                 )
 
-    nlev_native = np.zeros(nprof, dtype=int)
-    mdepth_native = np.full((nprof, 0), np.nan, dtype=float)
-    mtemp_native = np.full((nprof, 0), np.nan, dtype=float)
-    msal_native = np.full((nprof, 0), np.nan, dtype=float)
-    if want_native:
-        max_native = 0
-        for i in range(nprof):
-            arr = native_depth_list[i]
-            if arr is None:
-                continue
-            nlev_native[i] = int(len(arr))
-            if nlev_native[i] > max_native:
-                max_native = nlev_native[i]
-        mdepth_native = np.full((nprof, max_native), np.nan, dtype=float)
-        mtemp_native = np.full((nprof, max_native), np.nan, dtype=float)
-        msal_native = np.full((nprof, max_native), np.nan, dtype=float)
-        for i in range(nprof):
-            nn = int(nlev_native[i])
-            if nn <= 0:
-                continue
-            mdepth_native[i, :nn] = native_depth_list[i]
-            mtemp_native[i, :nn] = native_temp_list[i]
-            msal_native[i, :nn] = native_sal_list[i]
+    mdepth_native, mtemp_native, msal_native, nlev_native = _pack_native_lists(
+        native_depth_list,
+        native_temp_list,
+        native_sal_list,
+        nprof,
+    )
 
-    return dict(
+    local_result = dict(
         run_name=run_name,
         run_dir=os.path.abspath(run_dir),
         model_start=np.nan if start_dn is None else float(start_dn),
@@ -752,7 +795,17 @@ def _extract_run(run_spec, obs_pack, cfg):
         model_nlev_native=nlev_native,
         has_interp=int(want_interp),
         has_native=int(want_native),
+        native_depth_list=native_depth_list,
+        native_temp_list=native_temp_list,
+        native_sal_list=native_sal_list,
     )
+
+    if bool(stack_parallel) and (COMM is not None) and (SIZE > 1):
+        parts = COMM.gather(local_result, root=0)
+        if RANK == 0:
+            return _merge_stack_parallel_parts(parts)
+        return None
+    return local_result
 
 
 def _read_obs_npz(cfg):
@@ -896,14 +949,125 @@ def _build_combined_from_single_files(run_specs):
     return payload
 
 
+def _validate_config(cfg):
+    if cfg.get("RUNS") is None and cfg.get("RUN") is None:
+        raise ValueError("Either RUNS or RUN must be configured.")
+    mode = str(cfg.get("STACK_CHECK_MODE", "light")).lower()
+    if mode not in {"none", "light", "size", "light+size"}:
+        raise ValueError(f"Invalid STACK_CHECK_MODE: {mode}")
+    dmode = str(cfg.get("DEPTH_OUTPUT_MODE", "both")).lower()
+    if dmode not in {"native", "interp", "both"}:
+        raise ValueError(f"Invalid DEPTH_OUTPUT_MODE: {dmode}")
+    mpi_mode = str(cfg.get("MPI_DISTRIBUTION", "auto")).lower()
+    if mpi_mode not in {"auto", "run", "stack"}:
+        raise ValueError(f"Invalid MPI_DISTRIBUTION: {mpi_mode}")
+    max_lag = cfg.get("MAX_TIME_LAG_HOURS")
+    if max_lag is not None and float(max_lag) < 0:
+        raise ValueError("MAX_TIME_LAG_HOURS must be >= 0.")
+
+
+def _dry_run_report(cfg, run_specs):
+    _log(f"[DRY-RUN] Observation NPZ: {cfg['OBS_NPZ']}", all_ranks=False)
+    obs = _read_obs_npz(cfg)
+    profiles, skipped_prof = _build_profiles(obs, min_levels=int(cfg.get("MIN_VALID_LEVELS", 3)))
+    _log(
+        f"[DRY-RUN] profiles={len(profiles)}, "
+        f"too_few_levels={skipped_prof['too_few_levels']}, invalid_location={skipped_prof['invalid_location']}",
+        all_ranks=False,
+    )
+    for spec in run_specs:
+        outputs_dir = os.path.join(spec["run_dir"], "outputs")
+        if not os.path.isdir(outputs_dir):
+            _log(f"[DRY-RUN] {spec['name']}: missing outputs dir -> {outputs_dir}", all_ranks=False)
+            continue
+        try:
+            modules, outfmt, dstacks, dvars, _ = schout_info(outputs_dir, 1)  # noqa: F403
+            _ = modules
+            _ = dvars
+        except Exception as exc:
+            _log(f"[DRY-RUN] {spec['name']}: schout_info failed: {exc}", all_ranks=False)
+            continue
+
+        cand = _as_stack_list(cfg.get("STACKS"), dstacks)
+        valid, skipped = _screen_stacks(
+            outputs_dir=outputs_dir,
+            stacks=cand,
+            outfmt=outfmt,
+            mode=cfg.get("STACK_CHECK_MODE", "light"),
+            check_all_files=bool(cfg.get("STACK_CHECK_ALL_FILES", False)),
+            ratio_min=float(cfg.get("STACK_SIZE_RATIO_MIN", 0.70)),
+            abs_min_bytes=cfg.get("STACK_SIZE_MIN_BYTES"),
+            verbose=False,
+            log_limit=int(cfg.get("LOG_SKIP_STACK_DETAILS", 10)),
+        )
+        _log(
+            f"[DRY-RUN] {spec['name']}: run={spec['run_dir']}, out={spec['out_npz']}, "
+            f"candidates={len(cand)}, valid={len(valid)}, skipped={len(skipped)}",
+            all_ranks=False,
+        )
+
+
+def _resolve_mpi_distribution(cfg, nruns):
+    mode = str(cfg.get("MPI_DISTRIBUTION", "auto")).lower()
+    if mode in {"run", "stack"}:
+        return mode
+    if bool(USE_MPI) and int(SIZE) > 1 and int(nruns) < int(SIZE):
+        return "stack"
+    return "run"
+
+
+def _write_manifest(cfg, run_specs, run_summaries, mpi_distribution):
+    mpath = cfg.get("MANIFEST")
+    if not mpath:
+        return
+    mpath = os.path.abspath(str(mpath))
+    mdir = os.path.dirname(mpath)
+    if mdir and (not os.path.isdir(mdir)):
+        os.makedirs(mdir, exist_ok=True)
+    payload = dict(
+        script=os.path.abspath(__file__),
+        dry_run=bool(cfg.get("DRY_RUN", False)),
+        mpi_distribution=str(mpi_distribution),
+        run_count=int(len(run_specs)),
+        runs=run_summaries,
+    )
+    with open(mpath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    _log(f"Wrote manifest: {mpath}", all_ranks=False)
+
+
 def main():
     args = _parse_args()
     cfg = _apply_cli(CONFIG, args)
+    _validate_config(cfg)
     run_specs, combined_npz = _parse_run_specs(cfg)
 
     if cfg.get("VERBOSE", True):
         _log(f"Observation NPZ: {cfg['OBS_NPZ']}")
         _log(f"Runs (all): {[r['name'] for r in run_specs]}")
+
+    mpi_distribution = _resolve_mpi_distribution(cfg, len(run_specs))
+    if cfg.get("VERBOSE", True):
+        _log(f"MPI distribution mode: {mpi_distribution}")
+
+    if cfg.get("DRY_RUN", False):
+        _dry_run_report(cfg, run_specs)
+        if RANK == 0:
+            _write_manifest(
+                cfg,
+                run_specs,
+                [
+                    dict(
+                        run_name=str(spec["name"]),
+                        run_dir=os.path.abspath(str(spec["run_dir"])),
+                        output=str(spec["out_npz"]),
+                        status="dry_run",
+                    )
+                    for spec in run_specs
+                ],
+                mpi_distribution=mpi_distribution,
+            )
+        return
 
     obs = _read_obs_npz(cfg)
     profiles, skipped_prof = _build_profiles(obs, min_levels=int(cfg.get("MIN_VALID_LEVELS", 3)))
@@ -918,24 +1082,63 @@ def main():
             f"invalid_location={skipped_prof['invalid_location']}"
         )
 
-    local_specs = [spec for i, spec in enumerate(run_specs) if (i % SIZE) == RANK]
-    if (len(local_specs) > 0) or (RANK == 0):
-        _log(f"Assigned runs on this rank: {[r['name'] for r in local_specs]}", all_ranks=True)
+    run_summaries = []
+    if mpi_distribution == "run":
+        local_specs = [spec for i, spec in enumerate(run_specs) if (i % SIZE) == RANK]
+        if (len(local_specs) > 0) or (RANK == 0):
+            _log(f"Assigned runs on this rank: {[r['name'] for r in local_specs]}", all_ranks=True)
 
-    run_results = []
-    for spec in local_specs:
-        _log(f"Processing run: {spec['name']}", all_ranks=True)
-        rr = _extract_run(spec, obs_pack, cfg)
-        run_results.append(rr)
-        single_payload = _build_payload(obs_pack, [rr])
-        _save_payload(spec["out_npz"], single_payload)
+        local_run_summaries = []
+        for spec in local_specs:
+            _log(f"Processing run: {spec['name']}", all_ranks=True)
+            rr = _extract_run(spec, obs_pack, cfg, stack_parallel=False)
+            single_payload = _build_payload(obs_pack, [rr])
+            _save_payload(spec["out_npz"], single_payload)
+            local_run_summaries.append(
+                dict(
+                    run_name=str(spec["name"]),
+                    run_dir=os.path.abspath(str(spec["run_dir"])),
+                    output=str(spec["out_npz"]),
+                    status="written",
+                    stack_count=int(rr.get("stack_count", 0)),
+                )
+            )
 
-    if COMM is not None:
-        COMM.Barrier()
+        if COMM is not None:
+            COMM.Barrier()
+            gathered = COMM.gather(local_run_summaries, root=0)
+            if RANK == 0:
+                for sub in gathered:
+                    run_summaries.extend(sub)
+        else:
+            run_summaries = local_run_summaries
+    else:
+        for spec in run_specs:
+            if cfg.get("VERBOSE", True) and RANK == 0:
+                _log(f"Processing run (stack-MPI): {spec['name']}")
+            rr = _extract_run(spec, obs_pack, cfg, stack_parallel=True)
+            if RANK == 0 and rr is not None:
+                single_payload = _build_payload(obs_pack, [rr])
+                _save_payload(spec["out_npz"], single_payload)
+                run_summaries.append(
+                    dict(
+                        run_name=str(spec["name"]),
+                        run_dir=os.path.abspath(str(spec["run_dir"])),
+                        output=str(spec["out_npz"]),
+                        status="written",
+                        stack_count=int(rr.get("stack_count", 0)),
+                    )
+                )
+            if COMM is not None:
+                COMM.Barrier()
 
     if len(run_specs) > 1 and bool(cfg.get("SAVE_COMBINED_MULTI", False)) and RANK == 0:
         combo_payload = _build_combined_from_single_files(run_specs)
         _save_payload(combined_npz, combo_payload)
+
+    if RANK == 0:
+        run_summaries = sorted(run_summaries, key=lambda r: str(r.get("run_name", "")))
+        _write_manifest(cfg, run_specs, run_summaries, mpi_distribution=mpi_distribution)
 
 
 if __name__ == "__main__":
